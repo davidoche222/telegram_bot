@@ -211,5 +211,5 @@ def main():
     app.run_polling()
 
 
-if name == "main":
+if name == "__main__":
     main()
