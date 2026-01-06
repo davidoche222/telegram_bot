@@ -13,7 +13,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 SSID = os.getenv("SSID", "n5jlYj9XTDjpMpoH/A2DysApxaK_JCsxpm").strip()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN","8365422417:AAEqVxqOuEBMm2PBQUACa5Una5K6O7qNlQQ").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7634818949").strip()
 
 ASSETS = ["EURUSD_otc", "GBPUSD_otc", "AUDUSD_otc", "USDJPY_otc"]
 
