@@ -1,4 +1,3 @@
-+2349045188578, [12/25/2025 4:25 AM]
 import os
 import asyncio
 import logging
@@ -106,8 +105,6 @@ class UpgradedTradingBot:
             candles = await self.client.get_candles(asset, timeframe, count)
             if not candles or len(candles) < 60:
                 return None
-
-+2349045188578, [12/25/2025 4:25 AM]
 o = np.array([c["open"] for c in candles], dtype=float)
             h = np.array([c["high"] for c in candles], dtype=float)
             l = np.array([c["low"] for c in candles], dtype=float)
@@ -211,8 +208,6 @@ o = np.array([c["open"] for c in candles], dtype=float)
                     strength = "strong"
             else:
                 if c[-1] < o[-1] and c[-1] < l[-2] and o[-1] > c[-2]:
-
-+2349045188578, [12/25/2025 4:25 AM]
 is_engulfing = True
                     strength = "strong"
                 upper_wick = h[-1] - max(o[-1], c[-1])
@@ -329,14 +324,99 @@ async def post_init(app: Application):
 
 def main():
     global bot_instance
+pycache/
+*.pyc
+.env
+.venv/
+venv/
+.DS_Store
+.idea/
+.vscode/
+if c[-1] > ema200[-1]:
+            return "buy"
+        if c[-1] < ema200[-1]:
+            return "sell"
 
-+2349045188578, [12/25/2025 4:25 AM]
-if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN is missing. Set it in environment variables.")
-    if not TELEGRAM_CHAT_ID:
-        raise RuntimeError("TELEGRAM_CHAT_ID is missing. Set it in environment variables.")
+        return None
 
-    application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    async def check_entry(self, asset):
+        async with self.asset_locks[asset]:
+            now = datetime.datetime.utcnow()
+            last = self.last_trade_time[asset]
+            if last and (now - last).total_seconds() < COOLDOWN_SECONDS:
+                return
+
+            bias = await self.get_1h_bias(asset)
+            if not bias:
+                return
+
+            if not await self.can_place_trade():
+                return
+
+            direction = OrderDirection.CALL if bias == "buy" else OrderDirection.PUT
+            expiry = MIN_EXPIRY
+
+            order = await self.client.place_order(
+                asset=asset,
+                amount=TRADE_AMOUNT,
+                direction=direction,
+                duration=expiry
+            )
+
+            if order and order.get("status") == "success":
+                self.daily_trades += 1
+                self.last_trade_time[asset] = now
+
+                await self.send_telegram(
+                    f"{'🟢 CALL' if bias=='buy' else '🔴 PUT'} {asset}\n"
+                    f"${TRADE_AMOUNT} | {expiry//60} min"
+                )
+
+    async def on_candle_update(self, candle, asset):
+        if self.client and self.client.connected:
+            await self.check_entry(asset)
+
+    async def run_trading(self):
+        if not await self.connect():
+            return
+
+        for asset in ASSETS:
+            self.client.add_candle_handler(
+                asset,
+                lambda c, a=asset: asyncio.create_task(self.on_candle_update(c, a))
+            )
+
+        await self.send_telegram("🤖 Bot running 24/7")
+
+        while True:
+            await asyncio.sleep(30)
+
+
+bot_instance = None
+
+
+async def start(update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 Bot Ready\n/demo - Demo\n/live - Live"
+    )
+
+
+async def demo(update, context: ContextTypes.DEFAULT_TYPE):
+    bot_instance.is_demo = True
+    await update.message.reply_text("Demo mode selected")
+    asyncio.create_task(bot_instance.run_trading())
+
+
+async def live(update, context: ContextTypes.DEFAULT_TYPE):
+    bot_instance.is_demo = False
+    await update.message.reply_text("⚠️ Live mode selected")
+    asyncio.create_task(bot_instance.run_trading())
+
+
+def main():
+    global bot_instance
+
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
     bot_instance = UpgradedTradingBot(application)
 
     application.add_handler(CommandHandler("start", start))
