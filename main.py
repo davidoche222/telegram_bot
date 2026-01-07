@@ -125,8 +125,7 @@ class TradingBot:
         if self.active_trade:
             return f"🎯 In trade ({self.active_trade_asset})"
         return "🔎 Searching for signal…"
-
-    async def connect(self):
+  async def connect(self):
         self.client = AsyncPocketOptionClient(ssid=SSID, is_demo=self.is_demo)
         await self.client.connect()
 
@@ -147,13 +146,11 @@ if not candles or len(candles) < 60:
             "l": np.array([c["low"] for c in candles]),
             "c": np.array([c["close"] for c in candles]),
         }
-
-    async def get_bias(self, asset):
+ async def get_bias(self, asset):
         data = await self.get_candles(asset, 3600)
         if not data:
             return None
-
-        ema200 = ema_last(data["c"], 200)
+  ema200 = ema_last(data["c"], 200)
         if ema200 is None:
             return None
 
