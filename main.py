@@ -135,7 +135,7 @@ async def connect(self):
     await self.send(f"🚀 Connected\nMode: {mode}\nBalance: ${balance}")
 
     for asset in ASSETS:
-        await self.client.subscribe_candles(asset, 30
+        await self.client.subscribe_candles(asset, 30)
 
     async def get_candles(self, asset, tf, count=220):
         candles = await self.client.get_candles(asset, tf, count)
