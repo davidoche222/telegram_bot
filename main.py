@@ -127,8 +127,6 @@ class TradingBot:
         self.active_trade: bool = False
         self.active_trade_asset: str | None = None
         # ============================================
-
-+2349045188578, [12/25/2025 3:33 AM]
 async def send(self, message: str):
         try:
             await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
@@ -240,8 +238,6 @@ async def send(self, message: str):
         valleys, _ = find_peaks(-l, distance=4)
         if len(peaks) < 2 or len(valleys) < 2:
             return None
-
-+2349045188578, [12/25/2025 3:33 AM]
 bull_structure = h[peaks[-1]] > h[peaks[-2]] and l[valleys[-1]] > l[valleys[-2]]
         bear_structure = h[peaks[-1]] < h[peaks[-2]] and l[valleys[-1]] < l[valleys[-2]]
 
@@ -355,8 +351,6 @@ bull_structure = h[peaks[-1]] > h[peaks[-2]] and l[valleys[-1]] > l[valleys[-2]]
 
             try:
                 balance_before = await self.client.get_balance()
-
-+2349045188578, [12/25/2025 3:33 AM]
 except Exception as e:
                 if _is_auth_error(e):
                     if not self._ssid_alert_sent:
@@ -572,8 +566,6 @@ async def on_settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif data == "SET_LIVE":
         bot_instance.is_demo = False
         await query.edit_message_text("⚠️ Mode set to LIVE (real money).", reply_markup=settings_keyboard())
-
-+2349045188578, [12/25/2025 3:33 AM]
 elif data == "SET_STATUS":
         mode = "DEMO" if bot_instance.is_demo else "LIVE"
         await query.edit_message_text(
