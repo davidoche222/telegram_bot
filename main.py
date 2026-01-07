@@ -139,8 +139,6 @@ class TradingBot:
 
     async def get_candles(self, asset, tf, count=220):
         candles = await self.client.get_candles(asset, tf, count)
-
-+2349045188578, [12/25/2025 4:10 AM]
 if not candles or len(candles) < 60:
             return None
         return {
@@ -273,8 +271,6 @@ def keyboard():
         [InlineKeyboardButton("📊 Status", callback_data="STATUS")],
         [InlineKeyboardButton("💰 Set Stake", callback_data="STAKE")],
     ])
-
-+2349045188578, [12/25/2025 4:10 AM]
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤖 Bot Ready", reply_markup=keyboard())
 
