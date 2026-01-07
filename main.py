@@ -125,7 +125,7 @@ class TradingBot:
         if self.active_trade:
             return f"🎯 In trade ({self.active_trade_asset})"
         return "🔎 Searching for signal…"
-  async def connect(self):
+           async def connect(self):
         self.client = AsyncPocketOptionClient(ssid=SSID, is_demo=self.is_demo)
         await self.client.connect()
 
