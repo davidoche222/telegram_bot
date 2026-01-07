@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 
 # ========================= CONFIG =========================
-SSID = "n5jlYj9XTDjpMpoH/A2DysApxaK_JCsxpm"
+SSID = "QShB6ePZcK6d6Wvc/A7LTxdrOn-DYPaRcg"
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
 TELEGRAM_CHAT_ID = "7634818949"
 
