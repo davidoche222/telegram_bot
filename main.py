@@ -202,7 +202,7 @@ async def live(update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     global bot
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    bot = TradingBot(app)
+    bot = TradingBot()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("demo", demo))
