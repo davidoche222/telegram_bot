@@ -10,7 +10,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ========================= HARDCODED CONFIG =========================
 SSID = "n5jlYj9XTDjpMpoH/A2DysApxaK_JCsxpm"
 
-TELEGRAM_TOKEN = "8365422417:AAEqVxqOuEBMm2PBQUACa5Una5K6O7qNlQQ"
+TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
 TELEGRAM_CHAT_ID = "7634818949"
 
 ASSETS = ["EURUSD_otc", "GBPUSD_otc", "AUDUSD_otc", "USDJPY_otc"]
