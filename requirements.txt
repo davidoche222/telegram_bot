@@ -1,4 +1,10 @@
-numpy>=1.23.0
-scipy>=1.9.0
-python-telegram-bot>=20.0
-pocketoptionapi-async
+python-telegram-bot==21.6
+numpy==1.26.4
+
+# WebSocket / async stack (compatible combo)
+websockets==11.0.3
+aiohttp==3.9.5
+websocket-client==1.8.0
+
+# PocketOption async client
+pocketoptionapi_async
