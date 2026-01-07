@@ -109,6 +109,7 @@ class TradingBot:
     async def send(self, msg):
         await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
 
+    class TradingBot:
     def reset_daily(self):
         today = datetime.date.today()
         if today != self.current_date:
@@ -117,15 +118,14 @@ class TradingBot:
             self.daily_pnl = 0.0
             self.current_date = today
 
-   def status_line(self):
-    if not self.running:
-        return "⏹️ Stopped"
-    if self.paused:
-        return "⏸️ Paused"
-    if self.active_trade:
-        return f"⏱️ In trade ({self.active_trade_asset})"
-    return "🔎 Searching for signal..."
-
+    def status_line(self):
+        if not self.running:
+            return "⏹️ Stopped"
+        if self.paused:
+            return "⏸️ Paused"
+        if self.active_trade:
+            return f"⏱️ In trade ({self.active_trade_asset})"
+        return "🔎 Searching for signal..."
 
 async def connect(self):
     self.client = AsyncPocketOptionClient(ssid=SSID, is_demo=self.is_demo)
