@@ -117,24 +117,26 @@ class TradingBot:
             self.daily_pnl = 0.0
             self.current_date = today
 
-    def status_line(self):
-        if not self.running:
-            return "🛑 Stopped"
-        if self.paused:
-            return "⏸ Paused"
-        if self.active_trade:
-            return f"🎯 In trade ({self.active_trade_asset})"
-        return "🔎 Searching for signal…"
-           async def connect(self):
-        self.client = AsyncPocketOptionClient(ssid=SSID, is_demo=self.is_demo)
-        await self.client.connect()
+   def status_line(self):
+    if not self.running:
+        return "⏹️ Stopped"
+    if self.paused:
+        return "⏸️ Paused"
+    if self.active_trade:
+        return f"⏱️ In trade ({self.active_trade_asset})"
+    return "🔎 Searching for signal..."
 
-        balance = await self.client.get_balance()
-        mode = "DEMO" if self.is_demo else "LIVE"
-        await self.send(f"🚀 Connected\nMode: {mode}\nBalance: ${balance}")
 
-        for asset in ASSETS:
-            await self.client.subscribe_candles(asset, 300)
+async def connect(self):
+    self.client = AsyncPocketOptionClient(ssid=SSID, is_demo=self.is_demo)
+    await self.client.connect()
+
+    balance = await self.client.get_balance()
+    mode = "DEMO" if self.is_demo else "LIVE"
+    await self.send(f"🚀 Connected\nMode: {mode}\nBalance: ${balance}")
+
+    for asset in ASSETS:
+        await self.client.subscribe_candles(asset, 30
 
     async def get_candles(self, asset, tf, count=220):
         candles = await self.client.get_candles(asset, tf, count)
