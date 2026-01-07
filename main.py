@@ -109,7 +109,6 @@ class TradingBot:
     async def send(self, msg):
         await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
 
-    class TradingBot:
     def reset_daily(self):
         today = datetime.date.today()
         if today != self.current_date:
