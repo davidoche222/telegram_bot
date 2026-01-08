@@ -2,257 +2,273 @@ import asyncio
 import datetime
 import logging
 import numpy as np
-
-from pocketoptionapi_async import AsyncPocketOptionClient, OrderDirection
+from deriv_api import DerivAPI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# ========================= CONFIG =========================
-# Copy the FULL string: 42["auth",{"session":"...","isDemo":1,...}]
-DEMO_SSID = "AUzrqQYcmseidQS_7"
-LIVE_SSID = "AE7fchX1LKy3h7hUd"
-
+# ========================= 1. CONFIG (STRICT v3) =========================
+DERIV_TOKEN = "2NFJTH3JgXWFCcv" 
+APP_ID = "1089"        # Default testing ID
+SYMBOL = "R_10"        # Volatility 10 (1s)
+STAKE = 0.35           # Min Stake
+DURATION = 3           # 3 Minutes
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
 TELEGRAM_CHAT_ID = "7634818949"
 
-ASSETS = [
-    "EURUSD_otc", "GBPUSD_otc", "AUDUSD_otc", "USDJPY_otc",
-    "EURGBP_otc", "EURJPY_otc", "GBPJPY_otc", "AUDJPY_otc",
-]
-
-DEFAULT_TRADE_AMOUNT = 1.0
-MIN_EXPIRY = 180  # 3 minutes
-MAX_TRADES_PER_DAY = 10
-MAX_CONSECUTIVE_LOSSES = 3
-# =========================================================
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
-# ================= INDICATORS =================
-def ema_last(values, period):
-    if values is None or len(values) < period:
-        return None
+# ========================= 2. STRATEGY ENGINE =========================
+def get_ema(values, period=50):
+    if len(values) < period: return None
+    values = np.array(values, dtype=float)
     k = 2 / (period + 1)
-    ema_val = float(values[0])
-    for price in values[1:]:
-        ema_val = float(price) * k + ema_val * (1 - k)
-    return float(ema_val)
+    ema = values[0]
+    for p in values[1:]:
+        ema = p * k + ema * (1 - k)
+    return ema
 
-def rsi_last(values, period=14):
-    if values is None or len(values) < period + 1:
-        return None
-    v = values[-(period + 1):]
-    deltas = np.diff(v)
-    gains = np.where(deltas > 0, deltas, 0.0)
-    losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = float(np.mean(gains))
-    avg_loss = float(np.mean(losses))
-    if avg_loss == 0: return 100.0
-    rs = avg_gain / avg_loss
+def get_rsi(prices, period=14):
+    if len(prices) < period + 1: return 50
+    deltas = np.diff(prices)
+    up = deltas[deltas >= 0].sum() / period
+    down = -deltas[deltas < 0].sum() / period
+    if down == 0: return 100
+    rs = up / down
     return 100.0 - (100.0 / (1.0 + rs))
 
-def _fmt_time(dt_obj):
-    return dt_obj.strftime("%H:%M:%S UTC") if dt_obj else "None"
+def check_v3_momentum(candle, prev_3, direction, ema):
+    """Rule 7: Momentum Candle Gate"""
+    o, h, l, c = candle['open'], candle['high'], candle['low'], candle['close']
+    rng = h - l
+    if rng <= 0: return False
+    
+    # 7.1: Touch EMA
+    if not (l <= ema <= h): return False
+    
+    # 7.3: Body vs Avg Body of last 3
+    avg_body = sum([abs(x['close'] - x['open']) for x in prev_3]) / 3
+    curr_body = abs(c - o)
+    if curr_body <= avg_body: return False
+    
+    # 7.4/7.6: Close Position & Trend Confirmation
+    if direction == "CALL":
+        is_top_30 = (h - c) / rng <= 0.30  # Closes in top 30%
+        breaks_prior = c > prev_3[-1]['high']
+        return is_top_30 and breaks_prior and c > o
+    else: 
+        is_bottom_30 = (c - l) / rng <= 0.30 # Closes in bottom 30%
+        breaks_prior = c < prev_3[-1]['low']
+        return is_bottom_30 and breaks_prior and c < o
 
-# ================= CORE BOT CLASS =================
-class TradingBot:
+# ========================= 3. BOT CORE =========================
+class DerivSniperBot:
     def __init__(self):
-        self.app = None
-        self.client = None
-        self.is_demo = True
-        self.trade_amount = float(DEFAULT_TRADE_AMOUNT)
-        self.daily_trades = 0
-        self.consec_losses = 0
-        self.daily_pnl = 0.0
-        self.current_date = datetime.date.today()
+        self.api = None
         self.running = False
-        self.paused = False
-        self.last_scan_time = None
-        self.last_signal_time = None
-        self.last_trade_info = None
-        self.active_trade = False
-        self.active_trade_asset = None
-        self.trade_lock = asyncio.Lock()
-        self.asset_locks = {a: asyncio.Lock() for a in ASSETS}
-        self._runner_task = None
-
-    async def send(self, msg: str):
-        try:
-            if self.app:
-                await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-        except Exception as e:
-            logging.error(f"Telegram error: {e}")
-
-    def status_line(self):
-        if not self.running: return "🛑 Stopped"
-        if self.paused: return "⏸ Paused"
-        if self.active_trade: return f"🎯 In trade ({self.active_trade_asset})"
-        return "🔎 Searching..."
-
-    async def connect(self) -> bool:
-        """Enhanced Connection with Dual SSID Support"""
-        try:
-            ssid = (DEMO_SSID if self.is_demo else LIVE_SSID).strip()
-            if not ssid or "PASTE_" in ssid:
-                await self.send("❌ SSID is not set in the CONFIG section.")
-                return False
-
-            if self.client:
-                try: await self.client.disconnect()
-                except: pass
-
-            self.client = AsyncPocketOptionClient(ssid=ssid, is_demo=self.is_demo)
-            await self.client.connect()
-            await asyncio.sleep(5) # Handshake buffer
-
-            if hasattr(self.client, "connected") and not getattr(self.client, "connected"):
-                await self.send("❌ Connection failed (Check SSID or IP block).")
-                return False
-
-            balance = await self.client.get_balance()
-            mode = "DEMO" if self.is_demo else "LIVE"
-            await self.send(f"✅ Connected to {mode}\nBalance: ${balance}")
-
-            for asset in ASSETS:
-                await self.client.subscribe_candles(asset, 300)
-                # Re-add handlers on every reconnection
-                self.client.add_candle_handler(
-                    asset, lambda candle, a=asset: asyncio.create_task(self.on_candle(candle, a))
-                )
-            return True
-        except Exception as e:
-            await self.send(f"❌ Connection error: {repr(e)}")
-            return False
-
-    async def get_candles(self, asset, tf, count=220):
-        try:
-            candles = await self.client.get_candles(asset, tf, count)
-            if not candles or len(candles) < 210: return None
-            return {"c": np.array([c["close"] for c in candles], dtype=float)}
-        except: return None
-
-    async def check_entry(self, asset):
-        self.last_scan_time = datetime.datetime.utcnow()
-        h1_data = await self.get_candles(asset, 3600)
-        if not h1_data: return
+        self.current_status = "🛑 Stopped"
+        self.active_trade_msg = "None"
         
-        ema200_h1 = ema_last(h1_data["c"], 200)
-        if ema200_h1 is None: return
-        bias = "buy" if h1_data["c"][-1] > ema200_h1 else "sell"
+        # Stats Tracking
+        self.trades_today = 0
+        self.wins_today = 0
+        self.losses_today = 0
+        self.pnl_today = 0.0
+        
+        self.app = None
+        self.last_trade_time = None
+        self.last_ema_level = 0
 
-        m5_data = await self.get_candles(asset, 300)
-        if not m5_data: return
-        c = m5_data["c"]
-        rsi_val = rsi_last(c, 14)
-        ema200_m5 = ema_last(c, 200)
+    async def send(self, msg):
+        if self.app:
+            try: await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+            except: pass
 
-        if rsi_val is None or ema200_m5 is None: return
+    async def connect(self):
+        try:
+            self.api = DerivAPI(app_id=APP_ID)
+            await self.api.authorize(DERIV_TOKEN)
+            return True
+        except: return False
 
-        signal = None
-        if bias == "buy" and c[-1] > ema200_m5 and 45 <= rsi_val <= 65:
-            signal = OrderDirection.CALL
-        elif bias == "sell" and c[-1] < ema200_m5 and 35 <= rsi_val <= 55:
-            signal = OrderDirection.PUT
+    async def get_candles(self, gran, count):
+        data = await self.api.get_candles({"ticks_history": SYMBOL, "granularity": gran, "count": count})
+        return data['candles']
 
-        if signal:
-            self.last_signal_time = datetime.datetime.utcnow()
-            await self.execute_trade(asset, signal)
+    async def run_scanner(self):
+        self.current_status = "🔎 Searching for Signal..."
+        while self.running:
+            try:
+                # RULE 1: Daily Limits (2 trades max)
+                if self.trades_today >= 2:
+                    self.current_status = "🛑 Daily Limit Reached (2/2)"
+                    self.running = False
+                    break
 
-    async def execute_trade(self, asset, direction):
-        async with self.trade_lock:
-            if self.paused or not self.running or self.active_trade: return
+                # RULE 9: Cooldown (45 mins after a loss)
+                if self.last_trade_time and self.losses_today > 0:
+                    elapsed = (datetime.datetime.now() - self.last_trade_time).seconds
+                    if elapsed < 2700:
+                        self.current_status = f"⏳ Cooling down ({45 - (elapsed//60)}m left)"
+                        await asyncio.sleep(30)
+                        continue
+
+                # RULE 3: M5 Bias Check
+                m5 = await self.get_candles(300, 60)
+                m5_closes = [x['close'] for x in m5]
+                m5_ema = get_ema(m5_closes, 50)
+                if not m5_ema: continue
+                m5_bias = "CALL" if m5_closes[-1] > m5_ema else "PUT"
+
+                # RULE 4 & 6: M1 Alignment & RSI
+                m1 = await self.get_candles(60, 60)
+                m1_closes = [x['close'] for x in m1]
+                m1_ema = get_ema(m1_closes, 50)
+                rsi = get_rsi(m1_closes, 14)
+
+                # RSI Exhaustion Filter (Rule 6: 40-60 zone only)
+                if not (40 <= rsi <= 60):
+                    self.current_status = f"🔎 RSI Outside Zone ({round(rsi)})"
+                    await asyncio.sleep(10)
+                    continue
+
+                self.current_status = "🔎 Perfect Conditions... Waiting for Pullback"
+
+                # RULE 5: First Pullback detection
+                # Check if price was significantly away from EMA recently
+                was_away = abs(m1_closes[-6] - m1_ema) > (m1_ema * 0.0004)
+                
+                last_c = m1[-1]
+                prev_3 = m1[-4:-1]
+
+                signal = None
+                if m5_bias == "CALL" and m1_closes[-1] > m1_ema and was_away:
+                    if check_v3_momentum(last_c, prev_3, "CALL", m1_ema):
+                        signal = "CALL"
+                elif m5_bias == "PUT" and m1_closes[-1] < m1_ema and was_away:
+                    if check_v3_momentum(last_c, prev_3, "PUT", m1_ema):
+                        signal = "PUT"
+
+                if signal:
+                    # RULE 8: No re-entry at same EMA level
+                    if abs(m1_ema - self.last_ema_level) > (m1_ema * 0.0002):
+                        await self.execute_trade(signal)
+                        self.last_ema_level = m1_ema
+                        # Cooldown while trade is running
+                        await asyncio.sleep(DURATION * 60 + 5) 
+
+                await asyncio.sleep(5) 
+            except Exception as e:
+                logging.error(f"Scanner Loop Error: {e}")
+                await asyncio.sleep(10)
+
+    async def execute_trade(self, side):
+        try:
+            self.active_trade_msg = f"⏳ Buying {side}..."
+            req = {
+                "buy": 1, "price": STAKE,
+                "parameters": {
+                    "amount": STAKE, "basis": "stake", "contract_type": side,
+                    "currency": "USD", "duration": DURATION, "duration_unit": "m", "symbol": SYMBOL
+                }
+            }
+            resp = await self.api.buy(req)
+            contract_id = resp['buy']['contract_id']
             
-            order = await self.client.place_order(asset, float(self.trade_amount), direction, MIN_EXPIRY)
-            if order:
-                self.active_trade = True
-                self.active_trade_asset = asset
-                self.daily_trades += 1
-                await self.send(f"🚀 Trade Placed ({'DEMO' if self.is_demo else 'LIVE'})\n{direction.name} {asset}")
-                asyncio.create_task(self.finish_trade())
+            self.trades_today += 1
+            self.last_trade_time = datetime.datetime.now()
+            self.active_trade_msg = f"📡 {side} Active (ID: {contract_id})"
+            
+            # Start a background task to check result and update PnL
+            asyncio.create_task(self.check_result(contract_id))
+            
+        except Exception as e:
+            self.active_trade_msg = "None"
+            await self.send(f"❌ Execution failed: {e}")
 
-    async def finish_trade(self):
-        await asyncio.sleep(MIN_EXPIRY + 5)
-        self.active_trade = False
-        self.active_trade_asset = None
+    async def check_result(self, contract_id):
+        """Waits for trade to end and updates stats"""
+        await asyncio.sleep(DURATION * 60 + 2)
+        try:
+            proposal = await self.api.get_profit_table({"limit": 1, "description": 1})
+            last_trade = proposal['profit_table']['transactions'][0]
+            
+            payout = float(last_trade['sell_price'])
+            cost = float(last_trade['buy_price'])
+            profit = payout - cost
+            
+            self.pnl_today += profit
+            if profit > 0:
+                self.wins_today += 1
+            else:
+                self.losses_today += 1
+                
+            self.active_trade_msg = "None"
+            await self.send(f"✅ Trade Closed. Result: {'Win' if profit > 0 else 'Loss'} ({round(profit, 2)})")
+        except:
+            self.active_trade_msg = "None"
 
-    async def on_candle(self, candle, asset):
-        if not self.running or self.paused or self.active_trade: return
-        async with self.asset_locks[asset]:
-            await self.check_entry(asset)
-
-    async def runner(self):
-        ok = await self.connect()
-        if not ok: 
-            self.running = False
-            return
-        while True:
-            await asyncio.sleep(30)
-
-    def start(self):
-        self.running = True
-        self.paused = False
-        if self._runner_task is None or self._runner_task.done():
-            self._runner_task = asyncio.create_task(self.runner())
-
-# ================= TELEGRAM HANDLERS =================
-bot_instance = TradingBot()
-
-def main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ Run Bot", callback_data="PROMPT_MODE"),
-         InlineKeyboardButton("🛑 Stop", callback_data="STOP")],
-        [InlineKeyboardButton("📊 Status", callback_data="STATUS")]
-    ])
-
-def mode_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧪 Start on DEMO", callback_data="START_DEMO")],
-        [InlineKeyboardButton("💎 Start on LIVE", callback_data="START_LIVE")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="BACK")]
-    ])
+# ========================= 4. TELEGRAM UI =========================
+bot = DerivSniperBot()
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("🤖 PocketOption Bot Ready", reply_markup=main_menu())
+    kb = [
+        [InlineKeyboardButton("▶️ RUN SNIPER", callback_data="RUN"),
+         InlineKeyboardButton("🛑 STOP", callback_data="STOP")],
+        [InlineKeyboardButton("📊 VIEW STATUS", callback_data="STATUS")]
+    ]
+    await u.message.reply_text(
+        f"💎 **Deriv Sniper v3**\n`Balance Target: $5` \n\n"
+        f"Strict rules: 2 trades/day max.\nM5 Bias + M1 Momentum logic.",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+    )
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     await q.answer()
-
-    if q.data == "PROMPT_MODE":
-        await q.edit_message_text("Select Account Type:", reply_markup=mode_menu())
     
-    elif q.data == "START_DEMO":
-        bot_instance.is_demo = True
-        await q.edit_message_text("⏳ Initializing Demo...")
-        bot_instance.start()
-
-    elif q.data == "START_LIVE":
-        bot_instance.is_demo = False
-        await q.edit_message_text("⏳ Initializing LIVE...")
-        bot_instance.start()
-
+    if q.data == "RUN":
+        if not bot.running:
+            bot.running = True
+            if await bot.connect():
+                asyncio.create_task(bot.run_scanner())
+                await q.edit_message_text("✅ Sniper Online! Market scan in progress...")
+            else:
+                await q.edit_message_text("❌ Connection Failed. Check Token.")
+    
     elif q.data == "STOP":
-        bot_instance.running = False
-        await q.edit_message_text("⏸ Bot Stopped", reply_markup=main_menu())
-
-    elif q.data == "BACK":
-        await q.edit_message_text("Bot Menu:", reply_markup=main_menu())
+        bot.running = False
+        bot.current_status = "🛑 Stopped"
+        await q.edit_message_text("🛑 Bot Stopped Manually.")
 
     elif q.data == "STATUS":
-        txt = f"📊 {bot_instance.status_line()}\nMode: {'DEMO' if bot_instance.is_demo else 'LIVE'}\nTrades: {bot_instance.daily_trades}"
-        await q.edit_message_text(txt, reply_markup=main_menu())
+        pnl_str = f"+${round(bot.pnl_today, 2)}" if bot.pnl_today >= 0 else f"-${round(abs(bot.pnl_today), 2)}"
+        stat_msg = (
+            f"📊 **LIVE STATUS REPORT**\n"
+            f"----------------------------\n"
+            f"🤖 State: `{bot.current_status}`\n"
+            f"🎯 Active: `{bot.active_trade_msg}`\n\n"
+            f"📈 **Today's Stats:**\n"
+            f"Bullets Used: {bot.trades_today}/2\n"
+            f"Wins: {bot.wins_today} | Losses: {bot.losses_today}\n"
+            f"Net PnL: `{pnl_str}`\n"
+            f"----------------------------"
+        )
+        kb = [[InlineKeyboardButton("🔄 Refresh", callback_data="STATUS")],
+              [InlineKeyboardButton("⬅️ Back", callback_data="BACK")]]
+        await q.edit_message_text(stat_msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+    elif q.data == "BACK":
+        bot_running_label = "Online" if bot.running else "Offline"
+        kb = [[InlineKeyboardButton("▶️ RUN", callback_data="RUN"), InlineKeyboardButton("🛑 STOP", callback_data="STOP")],
+              [InlineKeyboardButton("📊 VIEW STATUS", callback_data="STATUS")]]
+        await q.edit_message_text(f"Bot is {bot_running_label}. Choose an action:", reply_markup=InlineKeyboardMarkup(kb))
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    bot_instance.app = app
+    bot.app = app
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(btn_handler))
-    print("Bot is live...")
+    print("Deriv Sniper v3 is LIVE...")
     app.run_polling()
 
 if __name__ == "__main__":
