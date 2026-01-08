@@ -14,8 +14,8 @@ from telegram.ext import (
 
 # ========================= CONFIG =========================
 # Copy the FULL string: 42["auth",{"session":"...","isDemo":1,...}]
-DEMO_SSID = "Ajl2AOeFMAOE58d4E"
-LIVE_SSID = "Ajl2AOeFMAOE58d4E"
+DEMO_SSID = "AUzrqQYcmseidQS_7"
+LIVE_SSID = "AE7fchX1LKy3h7hUd"
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
 TELEGRAM_CHAT_ID = "7634818949"
