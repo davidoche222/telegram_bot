@@ -16,7 +16,7 @@ APP_ID = 1089
 MARKETS = ["R_10", "R_25", "R_50", "R_100"]
 current_market_idx = 0
 
-STAKE = 0.35
+STAKE = 0.40  # Updated to 0.40
 DURATION = 5  # minutes
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
@@ -116,7 +116,7 @@ class DerivSniperBot:
                 await asyncio.sleep(10)
 
     async def execute_trade(self, side: str):
-        """Fixed: Corrects 'Stake at least 0.35' and 'Missing Currency' errors"""
+        """Includes currency fix, 0.40 stake, and price slippage buffer"""
         if not self.api:
             await self.send("❌ API not connected.")
             return
@@ -124,9 +124,8 @@ class DerivSniperBot:
         async with self.trade_lock:
             if self.active_trade_info: return
 
-            # Ensure stake is a clean float and at least 0.35
-            current_stake = max(float(STAKE), 0.35)
-            current_stake = round(current_stake, 2)
+            # Precise Stake Handling
+            current_stake = round(max(float(STAKE), 0.35), 2)
 
             try:
                 # 1) Get proposal
@@ -145,27 +144,21 @@ class DerivSniperBot:
                 
                 if "error" in prop:
                     err_msg = prop['error'].get('message', "").lower()
-                    
-                    # AUTO-FIX: If market minimum is higher than 0.35
-                    if "at least" in err_msg:
-                        await self.send(f"⚠️ {self.current_symbol} minimum is higher. Retrying with $0.50...")
-                        proposal_req["amount"] = 0.50
-                        prop = await self.api.proposal(proposal_req)
-
-                    if "error" in prop:
-                        err_msg = prop['error'].get('message', "").lower()
-                        if "maximum purchase price" in err_msg:
-                            await self.switch_market()
-                        else:
-                            await self.send(f"❌ Proposal Error:\n`{prop['error'].get('message')}`")
-                        return
+                    if "maximum purchase price" in err_msg:
+                        await self.switch_market()
+                    else:
+                        await self.send(f"❌ Proposal Error:\n`{prop['error'].get('message')}`")
+                    return
 
                 proposal = prop["proposal"]
                 proposal_id = proposal["id"]
-                ask_price = float(proposal.get("ask_price", 0.0))
+                ask_price = float(proposal.get("ask_price", current_stake))
 
-                # 2) Buy using proposal ID
-                buy_req = {"buy": proposal_id, "price": ask_price}
+                # 2) SET SAFE MAX PRICE (Slippage fix: adding $0.01 buffer)
+                max_price = round(max(ask_price, current_stake) + 0.01, 2)
+
+                # 3) Buy using proposal ID + safe price
+                buy_req = {"buy": proposal_id, "price": max_price}
                 resp = await self.api.buy(buy_req)
 
                 if "error" in resp:
@@ -175,7 +168,7 @@ class DerivSniperBot:
                 cid = resp["buy"]["contract_id"]
                 self.active_trade_info = {"side": side, "id": cid}
 
-                await self.send(f"🚀 **TRADE PLACED**\nMarket: `{self.current_symbol}`\nSide: `{side}`\nStake: `${proposal_req['amount']}`")
+                await self.send(f"🚀 **TRADE PLACED**\nMarket: `{self.current_symbol}`\nSide: `{side}`\nStake: `${current_stake}`")
                 asyncio.create_task(self.check_result(cid))
 
             except Exception as e:
