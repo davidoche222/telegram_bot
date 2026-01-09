@@ -1,5 +1,6 @@
 
-deriv-api
+python-deriv-api
 python-telegram-bot==21.1
 numpy
 websockets
+reactivex
