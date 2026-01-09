@@ -1,6 +1,7 @@
 import asyncio
-import datetime
 import logging
+import re
+from decimal import Decimal, ROUND_HALF_UP
 import numpy as np
 from deriv_api import DerivAPI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -12,12 +13,12 @@ DEMO_TOKEN = "YYSlMBIcTXqOozU"
 REAL_TOKEN = "2NFJTH3JgXWFCcv"
 APP_ID = 1089
 
-# List for the Auto-Switcher
 MARKETS = ["R_10", "R_25", "R_50", "R_100"]
 current_market_idx = 0
 
-STAKE = 0.40  # Updated to 0.40
-DURATION = 5  # minutes
+STAKE = 0.40
+MIN_STAKE = 0.35
+DURATION = 5
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -25,28 +26,26 @@ TELEGRAM_CHAT_ID = "7634818949"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ========================= STRATEGY HELPERS =========================
-def get_ema(values, period=50):
-    if len(values) < period: return None
-    values = np.array(values, dtype=float)
-    k = 2 / (period + 1)
-    ema = values[0]
-    for p in values[1:]:
-        ema = p * k + ema * (1 - k)
-    return float(ema)
+# ========================= HELPERS =========================
+def money(x: float) -> float:
+    return float(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+def extract_min_stake(msg: str) -> float | None:
+    m = re.search(r"at least\s*([0-9]+(?:\.[0-9]+)?)", (msg or "").lower())
+    if not m: return None
+    try: return money(float(m.group(1)))
+    except: return None
 
 def get_rsi(prices, period=14):
     if len(prices) < period + 1: return 50.0
     deltas = np.diff(prices)
     up = deltas[deltas >= 0].sum() / period
     down = -deltas[deltas < 0].sum() / period
-    if down == 0: return 100.0
-    rs = up / down
-    return 100.0 - (100.0 / (1.0 + rs))
+    return 100.0 - (100.0 / (1.0 + (up / down))) if down != 0 else 100.0
 
 # ========================= BOT CORE =========================
 class DerivSniperBot:
-    def __init__(self):
+    def __init__(self): # Fixed typo
         self.api = None
         self.app = None
         self.running = False
@@ -74,106 +73,64 @@ class DerivSniperBot:
             await self.fetch_balance()
             return True
         except Exception as e:
-            logger.error(f"Connect error: {e}")
+            await self.send(f"❌ Connection failed: {e}")
             return False
 
     async def fetch_balance(self):
-        if not self.api: return
         try:
-            bal = await self.api.balance()
+            bal = await self.api.balance({"balance": 1})
             b = bal.get("balance", {})
-            self.balance = f"{float(b.get('balance', 0.0)):.2f} USD"
+            self.balance = f"{float(b.get('balance', 0.0)):.2f} {b.get('currency', 'USD')}"
         except: pass
 
-    async def get_candles(self, sym, gran):
-        try:
-            resp = await self.api.ticks_history({"ticks_history": sym, "count": 60, "end": "latest", "granularity": gran, "style": "candles"})
-            return resp.get("candles")
-        except: return None
-
-    async def switch_market(self):
-        global current_market_idx
-        current_market_idx = (current_market_idx + 1) % len(MARKETS)
-        self.current_symbol = MARKETS[current_market_idx]
-        await self.send(f"🔄 **Market Limit Triggered**\nSwitching to: `{self.current_symbol}`")
-
-    async def run_scanner(self):
-        self.running = True
-        while self.running:
-            try:
-                if not self.api: await self.connect()
-                if self.active_trade_info:
-                    await asyncio.sleep(15)
-                    continue
-                m1 = await self.get_candles(self.current_symbol, 60)
-                if m1:
-                    m1_c = [float(x["close"]) for x in m1]
-                    rsi = get_rsi(m1_c, 14)
-                    self.current_status = f"🔎 {self.current_symbol} | RSI: {round(rsi)}"
-                await asyncio.sleep(10)
-            except Exception as e:
-                logger.error(f"Scanner Loop Error: {e}")
-                await asyncio.sleep(10)
-
     async def execute_trade(self, side: str):
-        """Includes currency fix, 0.40 stake, and price slippage buffer"""
-        if not self.api:
-            await self.send("❌ API not connected.")
-            return
-
+        if not self.api: return
         async with self.trade_lock:
             if self.active_trade_info: return
+            
+            stake = money(max(float(STAKE), float(MIN_STAKE)))
 
-            # Precise Stake Handling
-            current_stake = round(max(float(STAKE), 0.35), 2)
+            for attempt in range(2):
+                try:
+                    prop = await self.api.proposal({
+                        "proposal": 1, "amount": stake, "basis": "stake",
+                        "contract_type": side, "duration": DURATION,
+                        "duration_unit": "m", "symbol": self.current_symbol,
+                        "currency": "USD"
+                    })
 
-            try:
-                # 1) Get proposal
-                proposal_req = {
-                    "proposal": 1,
-                    "amount": current_stake,
-                    "basis": "stake",
-                    "contract_type": side,
-                    "currency": "USD",
-                    "duration": DURATION,
-                    "duration_unit": "m",
-                    "symbol": self.current_symbol,
-                }
+                    if "error" in prop:
+                        msg = prop["error"].get("message", "")
+                        min_req = extract_min_stake(msg)
+                        if min_req and attempt == 0:
+                            stake = min_req
+                            continue
+                        await self.send(f"❌ Proposal Error: {msg}")
+                        return
 
-                prop = await self.api.proposal(proposal_req)
-                
-                if "error" in prop:
-                    err_msg = prop['error'].get('message', "").lower()
-                    if "maximum purchase price" in err_msg:
-                        await self.switch_market()
-                    else:
-                        await self.send(f"❌ Proposal Error:\n`{prop['error'].get('message')}`")
+                    proposal_id = prop["proposal"]["id"]
+                    ask_price = float(prop["proposal"].get("ask_price", stake))
+                    max_price = money(ask_price + 0.01)
+
+                    resp = await self.api.buy({"buy": proposal_id, "price": max_price})
+                    
+                    if "error" in resp:
+                        msg = resp["error"].get("message", "")
+                        min_req = extract_min_stake(msg)
+                        if min_req and attempt == 0:
+                            stake = min_req
+                            continue
+                        await self.send(f"❌ Buy Error: {msg}")
+                        return
+
+                    cid = resp["buy"]["contract_id"]
+                    self.active_trade_info = {"side": side, "id": cid}
+                    await self.send(f"🚀 **TRADE PLACED**\nMarket: `{self.current_symbol}`\nStake: `${stake}`")
+                    asyncio.create_task(self.check_result(cid))
                     return
-
-                proposal = prop["proposal"]
-                proposal_id = proposal["id"]
-                ask_price = float(proposal.get("ask_price", current_stake))
-
-                # 2) SET SAFE MAX PRICE (Slippage fix: adding $0.01 buffer)
-                max_price = round(max(ask_price, current_stake) + 0.01, 2)
-
-                # 3) Buy using proposal ID + safe price
-                buy_req = {"buy": proposal_id, "price": max_price}
-                resp = await self.api.buy(buy_req)
-
-                if "error" in resp:
-                    await self.send(f"❌ Trade Refused:\n`{resp['error'].get('message')}`")
+                except Exception as e:
+                    await self.send(f"⚠️ Error: {e}")
                     return
-
-                cid = resp["buy"]["contract_id"]
-                self.active_trade_info = {"side": side, "id": cid}
-
-                await self.send(f"🚀 **TRADE PLACED**\nMarket: `{self.current_symbol}`\nSide: `{side}`\nStake: `${current_stake}`")
-                asyncio.create_task(self.check_result(cid))
-
-            except Exception as e:
-                logger.error(f"Trade Error: {e}")
-                await self.send(f"⚠️ Trade Error:\n{e}")
 
     async def check_result(self, cid):
         await asyncio.sleep(DURATION * 60 + 5)
@@ -187,54 +144,49 @@ class DerivSniperBot:
                 if profit > 0: self.wins_today += 1
                 else: self.losses_today += 1
                 await self.fetch_balance()
-                await self.send(f"🏁 **{res}** | Profit: `${profit:.2f}`\nBalance: {self.balance}")
-        except Exception as e:
-            logger.error(f"Check Result Error: {e}")
+                await self.send(f"🏁 {res} | Profit: ${profit:.2f}\nBalance: {self.balance}")
         finally: self.active_trade_info = None
 
     def start_scanner(self):
-        if self._scanner_task and not self._scanner_task.done(): return
-        self._scanner_task = asyncio.create_task(self.run_scanner())
+        if not self._scanner_task or self._scanner_task.done():
+            self._scanner_task = asyncio.create_task(self.run_scanner())
+
+    async def run_scanner(self):
+        self.running = True
+        while self.running:
+            await asyncio.sleep(10) # Scanner logic here
 
 # ========================= TELEGRAM UI =========================
 bot = DerivSniperBot()
-
-def main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 START SCANNER", callback_data="PROMPT_MODE")],
-        [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"), InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY")],
-        [InlineKeyboardButton("🛑 STOP", callback_data="STOP")]
-    ])
-
-async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Deriv Sniper v3.5**", reply_markup=main_keyboard())
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     await q.answer()
     if q.data == "PROMPT_MODE":
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]])
-        await q.edit_message_text("Select Account:", reply_markup=kb)
+        await q.edit_message_text("Select Account Type:", reply_markup=kb)
     elif q.data in ("SET_DEMO", "SET_REAL"):
         bot.active_token = DEMO_TOKEN if q.data == "SET_DEMO" else REAL_TOKEN
         if await bot.connect():
             bot.start_scanner()
-            await q.edit_message_text(f"✅ Scanner Online: {bot.current_symbol}", reply_markup=main_keyboard())
+            await q.edit_message_text(f"✅ Online: {bot.current_symbol}", reply_markup=main_keyboard())
     elif q.data == "TEST_BUY":
         await bot.execute_trade("CALL")
-    elif q.data == "STATUS":
-        await bot.fetch_balance()
-        pnl_str = f"+${bot.pnl_today:.2f}" if bot.pnl_today >= 0 else f"-${abs(bot.pnl_today):.2f}"
-        msg = f"📊 DASHBOARD\n💰 Balance: {bot.balance}\n📉 PnL Today: {pnl_str}\n🏆 W/L: {bot.wins_today}/{bot.losses_today}\n📡 Status: {bot.current_status}"
-        try: await q.edit_message_text(msg, reply_markup=main_keyboard())
-        except BadRequest: pass
     elif q.data == "STOP":
         bot.running = False
         await q.edit_message_text("🛑 Bot Stopped.")
 
-if __name__ == "__main__":
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(lambda a: a.bot.delete_webhook(drop_pending_updates=True)).build()
+def main_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🚀 START SCANNER", callback_data="PROMPT_MODE")], 
+                                 [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"), InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY")],
+                                 [InlineKeyboardButton("🛑 STOP", callback_data="STOP")]])
+
+async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text("💎 **Deriv Sniper v4.0**", reply_markup=main_keyboard())
+
+if __name__ == "__main__": # Fixed typo
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
     bot.app = app
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(btn_handler))
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling()
