@@ -4,6 +4,7 @@ import logging
 import numpy as np
 from deriv_api import DerivAPI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ========================= 1. CONFIG =========================
@@ -69,7 +70,6 @@ class DerivSniperBot:
         self.app = None
 
     async def notify(self, text):
-        """Sends a loud notification message to Telegram"""
         if self.app:
             await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="Markdown")
 
@@ -93,19 +93,12 @@ class DerivSniperBot:
         while self.running:
             try:
                 if self.trades_today >= 2:
-                    self.current_status = "🛑 Daily Limit Reached"
-                    await self.notify("⚠️ **Daily Limit Reached (2/2).** Bot is shutting down to protect your capital.")
+                    self.current_status = "🛑 Limit Reached"
+                    await self.notify("⚠️ **Daily Limit Reached.** Bot stopped.")
                     self.running = False
                     break
 
-                if self.last_trade_time and self.losses_today > 0:
-                    elapsed = (datetime.datetime.now() - self.last_trade_time).seconds
-                    if elapsed < 2700:
-                        self.current_status = f"⏳ Cooldown ({45 - (elapsed//60)}m)"
-                        await asyncio.sleep(60)
-                        continue
-
-                # Analysis logic
+                # Analysis logic...
                 m5 = await self.api.get_candles({"ticks_history": SYMBOL, "granularity": 300, "count": 60})
                 m5_c = [x['close'] for x in m5['candles']]
                 m5_ema = get_ema(m5_c, 50)
@@ -134,7 +127,6 @@ class DerivSniperBot:
                 if signal and abs(m1_ema - self.last_ema_level) > (m1_ema * 0.0002):
                     await self.execute_trade(signal)
                     self.last_ema_level = m1_ema
-                    # Wait for expiry + buffer
                     await asyncio.sleep(DURATION * 60 + 10) 
 
                 await asyncio.sleep(5)
@@ -146,16 +138,10 @@ class DerivSniperBot:
                    "contract_type": side, "currency": "USD", "duration": DURATION, "duration_unit": "m", "symbol": SYMBOL}}
             resp = await self.api.buy(req)
             self.trades_today += 1
-            self.last_trade_time = datetime.datetime.now()
             self.active_trade_msg = f"📡 {side} Active"
-            
-            # NOTIFICATION
-            await self.notify(f"🚀 **TRADE OPENED!**\nType: `{side}`\nStake: `${STAKE}`\nAccount: `{self.account_mode}`\nBullet: `{self.trades_today}/2`")
-            
+            await self.notify(f"🚀 **AUTOMATIC TRADE OPENED!**\nType: `{side}`\nStake: `${STAKE}`\nAccount: `{self.account_mode}`")
             asyncio.create_task(self.check_result(resp['buy']['contract_id']))
-        except Exception as e:
-            self.active_trade_msg = "None"
-            await self.notify(f"❌ **Failed to open trade:** {e}")
+        except: pass
 
     async def check_result(self, cid):
         await asyncio.sleep(DURATION * 60 + 5)
@@ -164,32 +150,24 @@ class DerivSniperBot:
             last = table['profit_table']['transactions'][0]
             profit = float(last['sell_price']) - float(last['buy_price'])
             self.pnl_today += profit
-            
-            res_text = "✅ **WIN**" if profit > 0 else "❌ **LOSS**"
+            res = "✅ WIN" if profit > 0 else "❌ LOSS"
             if profit > 0: self.wins_today += 1
             else: self.losses_today += 1
-            
             await self.update_balance()
-            await self.notify(f"🏁 **TRADE FINISHED**\nResult: {res_text}\nProfit: `${round(profit, 2)}`\nNew Balance: `${self.balance}`")
+            await self.notify(f"🏁 **TRADE FINISHED**\nResult: {res}\nProfit: `${round(profit, 2)}`")
             self.active_trade_msg = "None"
         except: pass
 
 # ========================= 4. TELEGRAM UI =========================
 bot = DerivSniperBot()
 
-async def get_main_menu():
-    kb = [[InlineKeyboardButton("🚀 START SCANNER", callback_data="PROMPT_MODE")],
-          [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"), 
-           InlineKeyboardButton("💰 BALANCE", callback_data="CHECK_BAL")],
-          [InlineKeyboardButton("🛑 STOP", callback_data="STOP")]]
-    return InlineKeyboardMarkup(kb)
-
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    text = "💎 **Deriv Sniper v3**\n$5 Account Protection Active.\nMode: " + bot.account_mode
-    if u.message:
-        await u.message.reply_text(text, reply_markup=await get_main_menu(), parse_mode="Markdown")
-    else:
-        await u.callback_query.edit_message_text(text, reply_markup=await get_main_menu(), parse_mode="Markdown")
+    kb = [[InlineKeyboardButton("🚀 START SCANNER", callback_data="PROMPT_MODE")],
+          [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"), InlineKeyboardButton("💰 BALANCE", callback_data="CHECK_BAL")],
+          [InlineKeyboardButton("🛑 STOP", callback_data="STOP")]]
+    text = "💎 **Deriv Sniper v3**\n$5 Account Protection ON."
+    if u.message: await u.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    else: await u.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
@@ -204,34 +182,27 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         is_demo = q.data == "SET_DEMO"
         bot.active_token = DEMO_TOKEN if is_demo else REAL_TOKEN
         bot.account_mode = "🧪 DEMO" if is_demo else "💰 REAL"
-        
-        await q.edit_message_text(f"⏳ Connecting to {bot.account_mode}...")
-        
         if await bot.connect(bot.active_token):
             asyncio.create_task(bot.run_scanner())
-            await q.edit_message_text(f"✅ **Scanner Started!**\nAuto-trading enabled on {bot.account_mode}.", 
-                                      reply_markup=await get_main_menu(), parse_mode="Markdown")
-        else:
-            await q.edit_message_text("❌ Connection Failed!", reply_markup=await get_main_menu())
+            await q.edit_message_text(f"✅ **Scanner Started!**\nMode: {bot.account_mode}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 STATUS", callback_data="STATUS")]]))
+        else: await q.edit_message_text("❌ Connection Error.")
 
     elif q.data == "STATUS":
         pnl = f"+${round(bot.pnl_today, 2)}" if bot.pnl_today >= 0 else f"-${round(abs(bot.pnl_today), 2)}"
-        msg = (f"📊 **LIVE STATUS**\nAccount: `{bot.account_mode}`\n"
-               f"State: `{bot.current_status}`\nTrade: `{bot.active_trade_msg}`\n\n"
-               f"Bullets: {bot.trades_today}/2\nWins: {bot.wins_today} | Loss: {bot.losses_today}\nNet PnL: `{pnl}`")
-        kb = [[InlineKeyboardButton("🔄 Refresh", callback_data="STATUS")], [InlineKeyboardButton("⬅️ Back", callback_data="BACK")]]
+        msg = (f"📊 **STATUS**\nMode: `{bot.account_mode}`\nState: `{bot.current_status}`\n"
+               f"Bullets: {bot.trades_today}/2\nWins: {bot.wins_today} | Loss: {bot.losses_today}\nPnL: `{pnl}`")
+        kb = [[InlineKeyboardButton("🔄 Refresh", callback_data="STATUS")], [InlineKeyboardButton("⬅️ BACK", callback_data="BACK")]]
         try: await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        except: pass
+        except BadRequest: pass # SILENCE THE ERROR
 
     elif q.data == "CHECK_BAL":
         await bot.update_balance()
-        await q.edit_message_text(f"💰 **Balance Info**\nType: {bot.account_mode}\nBalance: `${bot.balance}`", 
-                                  reply_markup=await get_main_menu(), parse_mode="Markdown")
+        await q.edit_message_text(f"💰 **Balance**\nAccount: {bot.account_mode}\nBalance: `${bot.balance}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ BACK", callback_data="BACK")]]))
 
     elif q.data == "STOP":
         bot.running = False
         bot.current_status = "🛑 Stopped"
-        await q.edit_message_text("🛑 Bot Stopped.", reply_markup=await get_main_menu())
+        await q.edit_message_text("🛑 Bot Stopped.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 RESTART", callback_data="PROMPT_MODE")]]))
 
     elif q.data == "BACK":
         await start_cmd(u, c)
@@ -243,5 +214,4 @@ def main():
     app.add_handler(CallbackQueryHandler(btn_handler))
     app.run_polling()
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
