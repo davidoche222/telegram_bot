@@ -58,8 +58,8 @@ class DerivSniperBot:
         self.running = False
         self.account_mode = "Disconnected"
         self.active_token = None
-        self.current_status = "🛑 Stopped"
-        self.active_trade_info = None  # Stores details of the open trade
+        self.current_status = "🛑 Stopped" # Default state
+        self.active_trade_info = None  
         self.balance = "0.00"
         self.trades_today = 0
         self.wins_today = 0
@@ -88,12 +88,15 @@ class DerivSniperBot:
 
     async def run_scanner(self):
         self.running = True
+        # IMMEDIATE STATE UPDATE
+        self.current_status = "🔎 Starting Scanner..." 
+        
         while self.running:
             try:
-                # If a trade is currently running, we just wait
+                # If a trade is active, status shows the trade
                 if self.active_trade_info:
-                    self.current_status = f"🚀 TRADE IN PROGRESS ({self.active_trade_info['side']})"
-                    await asyncio.sleep(10)
+                    self.current_status = f"🚀 ACTIVE: {self.active_trade_info['side']}"
+                    await asyncio.sleep(5)
                     continue
 
                 # Analysis logic
@@ -107,7 +110,8 @@ class DerivSniperBot:
                 m1_ema = get_ema(m1_c, 50)
                 rsi = get_rsi(m1_c, 14)
 
-                self.current_status = f"🔎 Searching... (RSI: {round(rsi)} | Bias: {m5_bias})"
+                # UPDATE STATUS EVERY LOOP
+                self.current_status = f"🔎 Searching (RSI: {round(rsi)})"
 
                 if 40 <= rsi <= 60:
                     last_c = m1_data['candles'][-1]
@@ -122,9 +126,9 @@ class DerivSniperBot:
                     if signal:
                         await self.execute_trade(signal)
 
-                await asyncio.sleep(10)
+                await asyncio.sleep(5) # Faster scanning
             except Exception as e:
-                logging.error(f"Scanner Error: {e}")
+                self.current_status = f"⚠️ Error: {str(e)[:20]}"
                 await asyncio.sleep(5)
 
     async def execute_trade(self, side):
@@ -134,14 +138,13 @@ class DerivSniperBot:
             resp = await self.api.buy(req)
             
             self.trades_today += 1
-            # Store active trade info for the Status screen
             self.active_trade_info = {
                 "side": side,
                 "id": resp['buy']['contract_id'],
                 "start": datetime.datetime.now().strftime("%H:%M:%S")
             }
             
-            await self.notify(f"🚀 **TRADE OPENED**\nSide: `{side}`\nID: `{self.active_trade_info['id']}`")
+            await self.notify(f"🚀 **AUTO-TRADE OPENED**\nSide: `{side}`\nID: `{self.active_trade_info['id']}`")
             asyncio.create_task(self.check_result(self.active_trade_info['id']))
         except Exception as e:
             logging.error(f"Trade Execution Failed: {e}")
@@ -159,9 +162,9 @@ class DerivSniperBot:
                     else: self.losses_today += 1
                     
                     await self.update_balance()
-                    await self.notify(f"🏁 **TRADE RESULT**\nOutcome: {res}\nProfit: `${round(profit, 2)}`")
+                    await self.notify(f"🏁 **RESULT**\nOutcome: {res}\nProfit: `${round(profit, 2)}`")
                     break
-            self.active_trade_info = None # Clear active trade
+            self.active_trade_info = None 
         except:
             self.active_trade_info = None
 
@@ -172,7 +175,7 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🚀 START SCANNER", callback_data="PROMPT_MODE")],
           [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"), InlineKeyboardButton("💰 BALANCE", callback_data="CHECK_BAL")],
           [InlineKeyboardButton("🛑 STOP", callback_data="STOP")]]
-    text = "💎 **Deriv Sniper v3**\nSelect an option below to begin."
+    text = "💎 **Deriv Sniper v3**\nBot initialized and ready."
     if u.message: await u.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     else: await u.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
@@ -190,29 +193,26 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot.active_token = DEMO_TOKEN if is_demo else REAL_TOKEN
         bot.account_mode = "🧪 DEMO" if is_demo else "💰 REAL"
         
+        # Ensure the previous loop is killed before starting a new one
+        bot.running = False
+        await asyncio.sleep(1) 
+        
         if await bot.connect(bot.active_token):
             await bot.update_balance()
+            # This triggers the background loop
             asyncio.create_task(bot.run_scanner())
-            await q.edit_message_text(f"✅ **Scanner Online**\nAccount: {bot.account_mode}\nSearching for signals...", 
-                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 STATUS", callback_data="STATUS")]]))
+            await q.edit_message_text(f"✅ **Scanner Online**\nAccount: {bot.account_mode}\n\n*Watching for signals...*", 
+                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 STATUS", callback_data="STATUS")]]), parse_mode="Markdown")
         else:
             await q.edit_message_text("❌ Connection Error.")
 
     elif q.data == "STATUS":
         pnl_str = f"+${round(bot.pnl_today, 2)}" if bot.pnl_today >= 0 else f"-${round(abs(bot.pnl_today), 2)}"
         
-        # Build dynamic status message
-        if bot.active_trade_info:
-            trade_status = (f"🚀 **ACTIVE TRADE**\n"
-                           f"Side: `{bot.active_trade_info['side']}`\n"
-                           f"Started: `{bot.active_trade_info['start']}`\n"
-                           f"ID: `{bot.active_trade_info['id']}`")
-        else:
-            trade_status = f"🔎 **State:** `{bot.current_status}`"
-
-        msg = (f"📊 **BOT DASHBOARD**\n------------------\n"
+        msg = (f"📊 **BOT DASHBOARD**\n"
+               f"------------------\n"
                f"Account: `{bot.account_mode}`\n"
-               f"{trade_status}\n"
+               f"State: `{bot.current_status}`\n"
                f"Wins/Loss: {bot.wins_today}W - {bot.losses_today}L\n"
                f"Total PnL: `{pnl_str}`")
         
@@ -227,7 +227,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif q.data == "STOP":
         bot.running = False
         bot.current_status = "🛑 Stopped"
-        await q.edit_message_text("🛑 Scanner Paused.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 RESTART", callback_data="PROMPT_MODE")]]))
+        await q.edit_message_text("🛑 Bot Stopped.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 RESTART", callback_data="PROMPT_MODE")]]))
 
     elif q.data == "BACK":
         await start_cmd(u, c)
