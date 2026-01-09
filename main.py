@@ -116,7 +116,7 @@ class DerivSniperBot:
                 await asyncio.sleep(10)
 
     async def execute_trade(self, side: str):
-        """Integrated Proposal + Ask Price Logic"""
+        """Fixed: Now includes 'currency' to solve parameter missing error"""
         if not self.api:
             await self.send("❌ API not connected.")
             return
@@ -125,47 +125,44 @@ class DerivSniperBot:
             if self.active_trade_info: return
 
             try:
-                # 1) Get a proposal first to find the exact ask_price
+                # 1) Get proposal - CURRENCY IS REQUIRED HERE
                 proposal_req = {
                     "proposal": 1,
                     "amount": STAKE,
                     "basis": "stake",
                     "contract_type": side,
+                    "currency": "USD",  # Mandatory parameter added
                     "duration": DURATION,
                     "duration_unit": "m",
                     "symbol": self.current_symbol,
                 }
 
                 prop = await self.api.proposal(proposal_req)
+                
                 if "error" in prop:
                     err_msg = prop['error'].get('message', "").lower()
                     if "maximum purchase price" in err_msg:
                         await self.switch_market()
                     else:
-                        await self.send(f"❌ Proposal Error:\n{prop['error'].get('message')}")
+                        await self.send(f"❌ Proposal Error:\n`{prop['error'].get('message')}`")
                     return
 
                 proposal = prop["proposal"]
                 proposal_id = proposal["id"]
                 ask_price = float(proposal.get("ask_price", 0.0))
 
-                if ask_price <= 0:
-                    await self.send("❌ Proposal returned invalid ask_price.")
-                    return
-
-                # 2) Buy using proposal id + correct price (with safety buffer)
-                max_price = round(ask_price + 0.01, 2)
-                buy_req = {"buy": proposal_id, "price": max_price}
+                # 2) Buy using the specific ask_price from proposal
+                buy_req = {"buy": proposal_id, "price": ask_price}
                 resp = await self.api.buy(buy_req)
 
                 if "error" in resp:
-                    await self.send(f"❌ Trade Refused:\n{resp['error'].get('message')}")
+                    await self.send(f"❌ Trade Refused:\n`{resp['error'].get('message')}`")
                     return
 
                 cid = resp["buy"]["contract_id"]
                 self.active_trade_info = {"side": side, "id": cid}
 
-                await self.send(f"🚀 **TRADE PLACED**\nMarket: `{self.current_symbol}`\nSide: `{side}`\nStake: `${STAKE}`\nID: `{cid}`")
+                await self.send(f"🚀 **TRADE PLACED**\nMarket: `{self.current_symbol}`\nSide: `{side}`\nAsk Price: `${ask_price}`\nID: `{cid}`")
                 asyncio.create_task(self.check_result(cid))
 
             except Exception as e:
