@@ -6,9 +6,11 @@ from deriv_api import DerivAPI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# ========================= 1. CONFIG (STRICT v3) =========================
-DERIV_TOKEN = "2NFJTH3JgXWFCcv" 
-APP_ID = "1089"        # Default testing ID
+# ========================= 1. CONFIG =========================
+DEMO_TOKEN = "YYSlMBIcTXqOozU"
+REAL_TOKEN = "2NFJTH3JgXWFCcv"
+APP_ID = "1089" 
+
 SYMBOL = "R_10"        # Volatility 10 (1s)
 STAKE = 0.35           # Min Stake
 DURATION = 3           # 3 Minutes
@@ -37,38 +39,28 @@ def get_rsi(prices, period=14):
     return 100.0 - (100.0 / (1.0 + rs))
 
 def check_v3_momentum(candle, prev_3, direction, ema):
-    """Rule 7: Momentum Candle Gate"""
     o, h, l, c = candle['open'], candle['high'], candle['low'], candle['close']
     rng = h - l
     if rng <= 0: return False
-    
-    # 7.1: Touch EMA
     if not (l <= ema <= h): return False
-    
-    # 7.3: Body vs Avg Body of last 3
     avg_body = sum([abs(x['close'] - x['open']) for x in prev_3]) / 3
-    curr_body = abs(c - o)
-    if curr_body <= avg_body: return False
-    
-    # 7.4/7.6: Close Position & Trend Confirmation
+    if abs(c - o) <= avg_body: return False
     if direction == "CALL":
-        is_top_30 = (h - c) / rng <= 0.30  # Closes in top 30%
-        breaks_prior = c > prev_3[-1]['high']
-        return is_top_30 and breaks_prior and c > o
+        return (h - c) / rng <= 0.30 and c > prev_3[-1]['high'] and c > o
     else: 
-        is_bottom_30 = (c - l) / rng <= 0.30 # Closes in bottom 30%
-        breaks_prior = c < prev_3[-1]['low']
-        return is_bottom_30 and breaks_prior and c < o
+        return (c - l) / rng <= 0.30 and c < prev_3[-1]['low'] and c < o
 
 # ========================= 3. BOT CORE =========================
 class DerivSniperBot:
     def __init__(self):
         self.api = None
         self.running = False
+        self.account_mode = "None"
         self.current_status = "🛑 Stopped"
         self.active_trade_msg = "None"
+        self.balance = "0.00"
         
-        # Stats Tracking
+        # Stats
         self.trades_today = 0
         self.wins_today = 0
         self.losses_today = 0
@@ -78,197 +70,145 @@ class DerivSniperBot:
         self.last_trade_time = None
         self.last_ema_level = 0
 
-    async def send(self, msg):
-        if self.app:
-            try: await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-            except: pass
-
-    async def connect(self):
+    async def connect(self, token):
         try:
             self.api = DerivAPI(app_id=APP_ID)
-            await self.api.authorize(DERIV_TOKEN)
+            account_info = await self.api.authorize(token)
+            self.balance = account_info['authorize']['balance']
             return True
         except: return False
 
-    async def get_candles(self, gran, count):
-        data = await self.api.get_candles({"ticks_history": SYMBOL, "granularity": gran, "count": count})
-        return data['candles']
+    async def update_balance(self):
+        try:
+            account_info = await self.api.authorize(self.active_token)
+            self.balance = account_info['authorize']['balance']
+        except: pass
 
     async def run_scanner(self):
-        self.current_status = "🔎 Searching for Signal..."
         while self.running:
             try:
-                # RULE 1: Daily Limits (2 trades max)
                 if self.trades_today >= 2:
-                    self.current_status = "🛑 Daily Limit Reached (2/2)"
+                    self.current_status = "🛑 Daily Limit Reached"
                     self.running = False
                     break
 
-                # RULE 9: Cooldown (45 mins after a loss)
                 if self.last_trade_time and self.losses_today > 0:
                     elapsed = (datetime.datetime.now() - self.last_trade_time).seconds
                     if elapsed < 2700:
-                        self.current_status = f"⏳ Cooling down ({45 - (elapsed//60)}m left)"
+                        self.current_status = f"⏳ Cooling down ({45 - (elapsed//60)}m)"
                         await asyncio.sleep(30)
                         continue
 
-                # RULE 3: M5 Bias Check
-                m5 = await self.get_candles(300, 60)
-                m5_closes = [x['close'] for x in m5]
-                m5_ema = get_ema(m5_closes, 50)
-                if not m5_ema: continue
-                m5_bias = "CALL" if m5_closes[-1] > m5_ema else "PUT"
+                # Data Fetch
+                m5 = await self.api.get_candles({"ticks_history": SYMBOL, "granularity": 300, "count": 60})
+                m5_c = [x['close'] for x in m5['candles']]
+                m5_ema = get_ema(m5_c, 50)
+                m5_bias = "CALL" if m5_c[-1] > m5_ema else "PUT"
 
-                # RULE 4 & 6: M1 Alignment & RSI
-                m1 = await self.get_candles(60, 60)
-                m1_closes = [x['close'] for x in m1]
-                m1_ema = get_ema(m1_closes, 50)
-                rsi = get_rsi(m1_closes, 14)
+                m1 = await self.api.get_candles({"ticks_history": SYMBOL, "granularity": 60, "count": 60})
+                m1_c = [x['close'] for x in m1['candles']]
+                m1_ema = get_ema(m1_c, 50)
+                rsi = get_rsi(m1_c, 14)
 
-                # RSI Exhaustion Filter (Rule 6: 40-60 zone only)
                 if not (40 <= rsi <= 60):
-                    self.current_status = f"🔎 RSI Outside Zone ({round(rsi)})"
+                    self.current_status = "🔎 RSI Filter Active (Wait)"
                     await asyncio.sleep(10)
                     continue
 
-                self.current_status = "🔎 Perfect Conditions... Waiting for Pullback"
-
-                # RULE 5: First Pullback detection
-                # Check if price was significantly away from EMA recently
-                was_away = abs(m1_closes[-6] - m1_ema) > (m1_ema * 0.0004)
+                self.current_status = "🔎 Searching for First Pullback..."
+                was_away = abs(m1_c[-6] - m1_ema) > (m1_ema * 0.0004)
                 
-                last_c = m1[-1]
-                prev_3 = m1[-4:-1]
-
+                last_c, prev_3 = m1['candles'][-1], m1['candles'][-4:-1]
                 signal = None
-                if m5_bias == "CALL" and m1_closes[-1] > m1_ema and was_away:
-                    if check_v3_momentum(last_c, prev_3, "CALL", m1_ema):
-                        signal = "CALL"
-                elif m5_bias == "PUT" and m1_closes[-1] < m1_ema and was_away:
-                    if check_v3_momentum(last_c, prev_3, "PUT", m1_ema):
-                        signal = "PUT"
+                if m5_bias == "CALL" and m1_c[-1] > m1_ema and was_away:
+                    if check_v3_momentum(last_c, prev_3, "CALL", m1_ema): signal = "CALL"
+                elif m5_bias == "PUT" and m1_c[-1] < m1_ema and was_away:
+                    if check_v3_momentum(last_c, prev_3, "PUT", m1_ema): signal = "PUT"
 
-                if signal:
-                    # RULE 8: No re-entry at same EMA level
-                    if abs(m1_ema - self.last_ema_level) > (m1_ema * 0.0002):
-                        await self.execute_trade(signal)
-                        self.last_ema_level = m1_ema
-                        # Cooldown while trade is running
-                        await asyncio.sleep(DURATION * 60 + 5) 
+                if signal and abs(m1_ema - self.last_ema_level) > (m1_ema * 0.0002):
+                    await self.execute_trade(signal)
+                    self.last_ema_level = m1_ema
+                    await asyncio.sleep(DURATION * 60 + 5) 
 
-                await asyncio.sleep(5) 
-            except Exception as e:
-                logging.error(f"Scanner Loop Error: {e}")
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
+            except: await asyncio.sleep(10)
 
     async def execute_trade(self, side):
         try:
-            self.active_trade_msg = f"⏳ Buying {side}..."
-            req = {
-                "buy": 1, "price": STAKE,
-                "parameters": {
-                    "amount": STAKE, "basis": "stake", "contract_type": side,
-                    "currency": "USD", "duration": DURATION, "duration_unit": "m", "symbol": SYMBOL
-                }
-            }
+            req = {"buy": 1, "price": STAKE, "parameters": {"amount": STAKE, "basis": "stake", 
+                   "contract_type": side, "currency": "USD", "duration": DURATION, "duration_unit": "m", "symbol": SYMBOL}}
             resp = await self.api.buy(req)
-            contract_id = resp['buy']['contract_id']
-            
             self.trades_today += 1
             self.last_trade_time = datetime.datetime.now()
-            self.active_trade_msg = f"📡 {side} Active (ID: {contract_id})"
-            
-            # Start a background task to check result and update PnL
-            asyncio.create_task(self.check_result(contract_id))
-            
-        except Exception as e:
-            self.active_trade_msg = "None"
-            await self.send(f"❌ Execution failed: {e}")
+            self.active_trade_msg = f"📡 {side} Active"
+            asyncio.create_task(self.check_result(resp['buy']['contract_id']))
+        except: self.active_trade_msg = "None"
 
-    async def check_result(self, contract_id):
-        """Waits for trade to end and updates stats"""
-        await asyncio.sleep(DURATION * 60 + 2)
+    async def check_result(self, cid):
+        await asyncio.sleep(DURATION * 60 + 5)
         try:
-            proposal = await self.api.get_profit_table({"limit": 1, "description": 1})
-            last_trade = proposal['profit_table']['transactions'][0]
-            
-            payout = float(last_trade['sell_price'])
-            cost = float(last_trade['buy_price'])
-            profit = payout - cost
-            
+            table = await self.api.get_profit_table({"limit": 1})
+            last = table['profit_table']['transactions'][0]
+            profit = float(last['sell_price']) - float(last['buy_price'])
             self.pnl_today += profit
-            if profit > 0:
-                self.wins_today += 1
-            else:
-                self.losses_today += 1
-                
+            if profit > 0: self.wins_today += 1
+            else: self.losses_today += 1
+            await self.update_balance()
             self.active_trade_msg = "None"
-            await self.send(f"✅ Trade Closed. Result: {'Win' if profit > 0 else 'Loss'} ({round(profit, 2)})")
-        except:
-            self.active_trade_msg = "None"
+        except: pass
 
 # ========================= 4. TELEGRAM UI =========================
 bot = DerivSniperBot()
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("▶️ RUN SNIPER", callback_data="RUN"),
-         InlineKeyboardButton("🛑 STOP", callback_data="STOP")],
-        [InlineKeyboardButton("📊 VIEW STATUS", callback_data="STATUS")]
-    ]
-    await u.message.reply_text(
-        f"💎 **Deriv Sniper v3**\n`Balance Target: $5` \n\n"
-        f"Strict rules: 2 trades/day max.\nM5 Bias + M1 Momentum logic.",
-        reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
-    )
+    kb = [[InlineKeyboardButton("🚀 START BOT", callback_data="PROMPT_MODE")],
+          [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"), InlineKeyboardButton("🛑 STOP", callback_data="STOP")]]
+    await u.message.reply_text("💎 **Deriv Sniper v3**\n$5 Survival Strategy Loaded.", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     await q.answer()
     
-    if q.data == "RUN":
-        if not bot.running:
+    if q.data == "PROMPT_MODE":
+        kb = [[InlineKeyboardButton("🧪 DEMO ACCOUNT", callback_data="SET_DEMO")],
+              [InlineKeyboardButton("💰 LIVE ACCOUNT", callback_data="SET_REAL")]]
+        await q.edit_message_text("💳 **Select Account:**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+    elif q.data in ["SET_DEMO", "SET_REAL"]:
+        is_demo = q.data == "SET_DEMO"
+        token = DEMO_TOKEN if is_demo else REAL_TOKEN
+        bot.active_token = token
+        bot.account_mode = "🧪 DEMO" if is_demo else "💰 REAL"
+        
+        if await bot.connect(token):
             bot.running = True
-            if await bot.connect():
-                asyncio.create_task(bot.run_scanner())
-                await q.edit_message_text("✅ Sniper Online! Market scan in progress...")
-            else:
-                await q.edit_message_text("❌ Connection Failed. Check Token.")
-    
+            asyncio.create_task(bot.run_scanner())
+            await q.edit_message_text(f"✅ Bot Started\nMode: {bot.account_mode}\nBalance: ${bot.balance}")
+        else:
+            await q.edit_message_text("❌ Connection Failed. Check Keys.")
+
+    elif q.data == "STATUS":
+        pnl = f"+${round(bot.pnl_today, 2)}" if bot.pnl_today >= 0 else f"-${round(abs(bot.pnl_today), 2)}"
+        await bot.update_balance() # Fetch latest balance for status
+        msg = (f"📊 **LIVE STATUS**\n------------------\nAccount: `{bot.account_mode}`\n"
+               f"Balance: `${bot.balance}`\nState: `{bot.current_status}`\nActive: `{bot.active_trade_msg}`\n\n"
+               f"Stats: {bot.trades_today}/2 Trades\nWins: {bot.wins_today} | Loss: {bot.losses_today}\nNet PnL: `{pnl}`")
+        kb = [[InlineKeyboardButton("🔄 Refresh", callback_data="STATUS")], [InlineKeyboardButton("⬅️ Back", callback_data="BACK")]]
+        await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
     elif q.data == "STOP":
         bot.running = False
         bot.current_status = "🛑 Stopped"
-        await q.edit_message_text("🛑 Bot Stopped Manually.")
-
-    elif q.data == "STATUS":
-        pnl_str = f"+${round(bot.pnl_today, 2)}" if bot.pnl_today >= 0 else f"-${round(abs(bot.pnl_today), 2)}"
-        stat_msg = (
-            f"📊 **LIVE STATUS REPORT**\n"
-            f"----------------------------\n"
-            f"🤖 State: `{bot.current_status}`\n"
-            f"🎯 Active: `{bot.active_trade_msg}`\n\n"
-            f"📈 **Today's Stats:**\n"
-            f"Bullets Used: {bot.trades_today}/2\n"
-            f"Wins: {bot.wins_today} | Losses: {bot.losses_today}\n"
-            f"Net PnL: `{pnl_str}`\n"
-            f"----------------------------"
-        )
-        kb = [[InlineKeyboardButton("🔄 Refresh", callback_data="STATUS")],
-              [InlineKeyboardButton("⬅️ Back", callback_data="BACK")]]
-        await q.edit_message_text(stat_msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await q.edit_message_text("🛑 Bot Stopped.")
 
     elif q.data == "BACK":
-        bot_running_label = "Online" if bot.running else "Offline"
-        kb = [[InlineKeyboardButton("▶️ RUN", callback_data="RUN"), InlineKeyboardButton("🛑 STOP", callback_data="STOP")],
-              [InlineKeyboardButton("📊 VIEW STATUS", callback_data="STATUS")]]
-        await q.edit_message_text(f"Bot is {bot_running_label}. Choose an action:", reply_markup=InlineKeyboardMarkup(kb))
+        await start_cmd(u, c)
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     bot.app = app
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(btn_handler))
-    print("Deriv Sniper v3 is LIVE...")
     app.run_polling()
 
 if __name__ == "__main__":
