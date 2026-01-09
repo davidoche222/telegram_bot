@@ -1,4 +1,5 @@
-deriv-api==0.1.6
+
+deriv-api
 python-telegram-bot==21.1
-numpy==1.26.4
-websockets==12.0
+numpy
+websockets
