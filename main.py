@@ -12,9 +12,9 @@ DEMO_TOKEN = "YYSlMBIcTXqOozU"
 REAL_TOKEN = "2NFJTH3JgXWFCcv"
 APP_ID = "1089" 
 
-SYMBOL = "R_100"      # Changed to R_100 for better limits
-STAKE = 0.35          # Minimum stake
-DURATION = 5          # Increased to 5m to avoid "Max Purchase Price" errors
+SYMBOL = "R_100"      
+STAKE = 0.35          
+DURATION = 5          
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
 TELEGRAM_CHAT_ID = "7634818949"
 
@@ -44,14 +44,9 @@ def check_v3_momentum(candle, prev_3, direction, ema):
         o, h, l, c = float(candle['open']), float(candle['high']), float(candle['low']), float(candle['close'])
         rng = h - l
         if rng <= 0: return False
-        
-        # Rule: Candle must be touching or crossing the EMA
         if not (l <= ema <= h): return False
-        
-        # Rule: Candle body must be significant
         avg_body = sum([abs(float(x['close']) - float(x['open'])) for x in prev_3]) / 3
         if abs(c - o) <= avg_body: return False
-        
         if direction == "CALL":
             return (h - c) / rng <= 0.30 and c > float(prev_3[-1]['high']) and c > o
         else: 
@@ -80,13 +75,6 @@ class DerivSniperBot:
             return True
         except: return False
 
-    async def update_balance(self):
-        if self.api:
-            try:
-                info = await self.api.authorize(self.active_token)
-                self.balance = info['authorize']['balance']
-            except: pass
-
     async def run_scanner(self):
         self.running = True
         while self.running:
@@ -97,9 +85,9 @@ class DerivSniperBot:
                     await asyncio.sleep(10)
                     continue
 
-                # Data Fetching using proper ticks_history
-                m5_resp = await self.api.ticks_history({"ticks_history": SYMBOL, "count": 60, "granularity": 300, "style": "candles"})
-                m1_resp = await self.api.ticks_history({"ticks_history": SYMBOL, "count": 60, "granularity": 60, "style": "candles"})
+                # FIXED: Added "end": "latest" to both calls
+                m5_resp = await self.api.ticks_history({"ticks_history": SYMBOL, "count": 60, "end": "latest", "granularity": 300, "style": "candles"})
+                m1_resp = await self.api.ticks_history({"ticks_history": SYMBOL, "count": 60, "end": "latest", "granularity": 60, "style": "candles"})
                 
                 m5_c = [float(x['close']) for x in m5_resp['candles']]
                 m1_c = [float(x['close']) for x in m1_resp['candles']]
@@ -136,7 +124,7 @@ class DerivSniperBot:
                 return
 
             self.active_trade_info = {"side": side, "id": resp['buy']['contract_id'], "start": datetime.datetime.now().strftime("%H:%M:%S")}
-            await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🚀 **TRADE PLACED**\nSide: `{side}`\nStake: `${STAKE}`", parse_mode="Markdown")
+            await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🚀 **TRADE PLACED**\nSide: `{side}`", parse_mode="Markdown")
             asyncio.create_task(self.check_result(self.active_trade_info['id']))
         except Exception as e:
             await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⚠️ **Trade Error:** {e}")
@@ -152,7 +140,6 @@ class DerivSniperBot:
                     res = "✅ WIN" if profit > 0 else "❌ LOSS"
                     if profit > 0: self.wins_today += 1
                     else: self.losses_today += 1
-                    await self.update_balance()
                     await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🏁 **RESULT**: {res}\nProfit: `${round(profit, 2)}`", parse_mode="Markdown")
             self.active_trade_info = None 
         except: self.active_trade_info = None
@@ -167,7 +154,7 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🧪 TEST BUY (CALL)", callback_data="TEST_BUY")],
         [InlineKeyboardButton("🛑 STOP", callback_data="STOP")]
     ]
-    text = "💎 **Deriv Sniper v3**\nLogic: M5 Trend + M1 EMA Bounce."
+    text = "💎 **Deriv Sniper v3**\nFixed parameters and conflict protection."
     if u.message: await u.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     else: await u.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
@@ -185,38 +172,29 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot.running = False
         await asyncio.sleep(1) 
         if await bot.connect():
-            await bot.update_balance()
             asyncio.create_task(bot.run_scanner())
-            await q.edit_message_text(f"✅ **Scanner Online**\nAccount: {bot.account_mode}\nBalance: ${bot.balance}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 STATUS", callback_data="STATUS")]]))
+            await q.edit_message_text(f"✅ **Scanner Online**\nAccount: {bot.account_mode}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 STATUS", callback_data="STATUS")]]))
         else: await q.edit_message_text("❌ Connection Error.")
 
     elif q.data == "TEST_BUY":
-        if not bot.api:
-            await q.edit_message_text("❌ Start scanner first!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ BACK", callback_data="BACK")]]))
-        else:
-            await bot.execute_trade("CALL")
+        if not bot.api: await q.edit_message_text("❌ Start scanner first!")
+        else: await bot.execute_trade("CALL")
 
     elif q.data == "STATUS":
         pnl_str = f"+${round(bot.pnl_today, 2)}" if bot.pnl_today >= 0 else f"-${round(abs(bot.pnl_today), 2)}"
-        msg = f"📊 **DASHBOARD**\nAccount: `{bot.account_mode}`\nState: `{bot.current_status}`\nPnL: `{pnl_str}`\nWins: {bot.wins_today} | Loss: {bot.losses_today}"
+        msg = f"📊 **DASHBOARD**\nAccount: `{bot.account_mode}`\nState: `{bot.current_status}`\nPnL: `{pnl_str}`"
         kb = [[InlineKeyboardButton("🔄 Refresh", callback_data="STATUS")], [InlineKeyboardButton("⬅️ BACK", callback_data="BACK")]]
         try: await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         except BadRequest: pass
 
-    elif q.data == "CHECK_BAL":
-        await bot.update_balance()
-        await q.edit_message_text(f"💰 **Balance**: `${bot.balance}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ BACK", callback_data="BACK")]]))
+    elif q.data == "BACK": await start_cmd(u, c)
 
-    elif q.data == "STOP":
-        bot.running = False
-        bot.current_status = "🛑 Stopped"
-        await q.edit_message_text("🛑 Bot Paused.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 RESTART", callback_data="PROMPT_MODE")]]))
-
-    elif q.data == "BACK":
-        await start_cmd(u, c)
+async def post_init(application: Application):
+    """Clears old connections to fix the 'Conflict' error"""
+    await application.bot.delete_webhook()
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     bot.app = app
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(btn_handler))
