@@ -40,16 +40,17 @@ def get_rsi(prices, period=14):
     return 100.0 - (100.0 / (1.0 + rs))
 
 def check_v3_momentum(candle, prev_3, direction, ema):
-    o, h, l, c = candle['open'], candle['high'], candle['low'], candle['close']
+    # candle format from ticks_history: {'open', 'high', 'low', 'close', 'epoch'}
+    o, h, l, c = float(candle['open']), float(candle['high']), float(candle['low']), float(candle['close'])
     rng = h - l
     if rng <= 0: return False
     if not (l <= ema <= h): return False
-    avg_body = sum([abs(x['close'] - x['open']) for x in prev_3]) / 3
+    avg_body = sum([abs(float(x['close']) - float(x['open'])) for x in prev_3]) / 3
     if abs(c - o) <= avg_body: return False
     if direction == "CALL":
-        return (h - c) / rng <= 0.30 and c > prev_3[-1]['high'] and c > o
+        return (h - c) / rng <= 0.30 and c > float(prev_3[-1]['high']) and c > o
     else: 
-        return (c - l) / rng <= 0.30 and c < prev_3[-1]['low'] and c < o
+        return (c - l) / rng <= 0.30 and c < float(prev_3[-1]['low']) and c < o
 
 # ========================= 3. BOT CORE =========================
 class DerivSniperBot:
@@ -67,12 +68,13 @@ class DerivSniperBot:
         self.app = None
 
     async def connect(self):
-        """Standard connection helper"""
         try:
             self.api = DerivAPI(app_id=APP_ID)
             await self.api.authorize(self.active_token)
             return True
-        except: return False
+        except Exception as e:
+            logging.error(f"Connect failed: {e}")
+            return False
 
     async def run_scanner(self):
         self.running = True
@@ -80,34 +82,37 @@ class DerivSniperBot:
         
         while self.running:
             try:
-                # HEARTBEAT: Check if API is still authorized
-                if not self.api:
-                    await self.connect()
+                if not self.api: await self.connect()
 
-                # If a trade is active, don't scan
                 if self.active_trade_info:
                     self.current_status = f"🚀 ACTIVE: {self.active_trade_info['side']}"
                     await asyncio.sleep(10)
                     continue
 
-                # Fetch Candles
-                m5_data = await self.api.get_candles({"ticks_history": SYMBOL, "granularity": 300, "count": 60})
-                m1_data = await self.api.get_candles({"ticks_history": SYMBOL, "granularity": 60, "count": 60})
-                
-                m5_c = [x['close'] for x in m5_data['candles']]
-                m1_c = [x['close'] for x in m1_data['candles']]
-                
+                # CORRECT METHOD: ticks_history
+                # Fetch M5
+                m5_resp = await self.api.ticks_history({
+                    "ticks_history": SYMBOL, "adjust_start_time": 1, "count": 60, "end": "latest", "granularity": 300, "style": "candles"
+                })
+                m5_candles = m5_resp['candles']
+                m5_c = [float(x['close']) for x in m5_candles]
                 m5_ema = get_ema(m5_c, 50)
+                
+                # Fetch M1
+                m1_resp = await self.api.ticks_history({
+                    "ticks_history": SYMBOL, "adjust_start_time": 1, "count": 60, "end": "latest", "granularity": 60, "style": "candles"
+                })
+                m1_candles = m1_resp['candles']
+                m1_c = [float(x['close']) for x in m1_candles]
                 m1_ema = get_ema(m1_c, 50)
                 rsi = get_rsi(m1_c, 14)
 
                 self.current_status = f"🔎 Scanning (RSI: {round(rsi)})"
 
-                # Check Signal
                 m5_bias = "CALL" if m5_c[-1] > m5_ema else "PUT"
-                if 40 <= rsi <= 60:
-                    last_c = m1_data['candles'][-1]
-                    prev_3 = m1_data['candles'][-4:-1]
+                if 35 <= rsi <= 65: # Slightly wider RSI for testing
+                    last_c = m1_candles[-1]
+                    prev_3 = m1_candles[-4:-1]
                     
                     signal = None
                     if m5_bias == "CALL" and m1_c[-1] > m1_ema:
@@ -120,10 +125,9 @@ class DerivSniperBot:
 
                 await asyncio.sleep(10)
             except Exception as e:
-                logging.error(f"API Error: {e}")
-                self.current_status = "⚠️ Reconnecting API..."
-                await self.connect() # Try to re-auth
-                await asyncio.sleep(5)
+                logging.error(f"Logic Error: {e}")
+                self.current_status = "⚠️ API Data Error"
+                await asyncio.sleep(10)
 
     async def execute_trade(self, side):
         try:
@@ -138,7 +142,7 @@ class DerivSniperBot:
     async def check_result(self, cid):
         await asyncio.sleep(DURATION * 60 + 5)
         try:
-            table = await self.api.get_profit_table({"limit": 5})
+            table = await self.api.profit_table({"limit": 5})
             for trans in table['profit_table']['transactions']:
                 if str(trans['contract_id']) == str(cid):
                     profit = float(trans['sell_price']) - float(trans['buy_price'])
@@ -157,7 +161,7 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🚀 START SCANNER", callback_data="PROMPT_MODE")],
           [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"), InlineKeyboardButton("💰 BALANCE", callback_data="CHECK_BAL")],
           [InlineKeyboardButton("🛑 STOP", callback_data="STOP")]]
-    text = "💎 **Deriv Sniper v3**\nSelect an option to begin."
+    text = "💎 **Deriv Sniper v3**\nLogic Updated (Ticks History)."
     if u.message: await u.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     else: await u.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
@@ -173,16 +177,14 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif q.data in ["SET_DEMO", "SET_REAL"]:
         bot.active_token = DEMO_TOKEN if q.data == "SET_DEMO" else REAL_TOKEN
         bot.account_mode = "🧪 DEMO" if q.data == "SET_DEMO" else "💰 REAL"
-        
         bot.running = False
         await asyncio.sleep(1) 
-        
         if await bot.connect():
             asyncio.create_task(bot.run_scanner())
             await q.edit_message_text(f"✅ **Scanner Online**\nMode: {bot.account_mode}", 
                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 STATUS", callback_data="STATUS")]]))
         else:
-            await q.edit_message_text("❌ Connection Error. Check your API token.")
+            await q.edit_message_text("❌ Connection Error.")
 
     elif q.data == "STATUS":
         pnl_str = f"+${round(bot.pnl_today, 2)}" if bot.pnl_today >= 0 else f"-${round(abs(bot.pnl_today), 2)}"
@@ -197,7 +199,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             info = await bot.api.authorize(bot.active_token)
             bot.balance = info['authorize']['balance']
             await q.edit_message_text(f"💰 **Balance**: `${bot.balance}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ BACK", callback_data="BACK")]]))
-        except: await q.edit_message_text("❌ Could not fetch balance.")
+        except: await q.edit_message_text("❌ Balance Error.")
 
     elif q.data == "STOP":
         bot.running = False
