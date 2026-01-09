@@ -40,17 +40,18 @@ def get_rsi(prices, period=14):
     return 100.0 - (100.0 / (1.0 + rs))
 
 def check_v3_momentum(candle, prev_3, direction, ema):
-    # candle format from ticks_history: {'open', 'high', 'low', 'close', 'epoch'}
-    o, h, l, c = float(candle['open']), float(candle['high']), float(candle['low']), float(candle['close'])
-    rng = h - l
-    if rng <= 0: return False
-    if not (l <= ema <= h): return False
-    avg_body = sum([abs(float(x['close']) - float(x['open'])) for x in prev_3]) / 3
-    if abs(c - o) <= avg_body: return False
-    if direction == "CALL":
-        return (h - c) / rng <= 0.30 and c > float(prev_3[-1]['high']) and c > o
-    else: 
-        return (c - l) / rng <= 0.30 and c < float(prev_3[-1]['low']) and c < o
+    try:
+        o, h, l, c = float(candle['open']), float(candle['high']), float(candle['low']), float(candle['close'])
+        rng = h - l
+        if rng <= 0: return False
+        if not (l <= ema <= h): return False
+        avg_body = sum([abs(float(x['close']) - float(x['open'])) for x in prev_3]) / 3
+        if abs(c - o) <= avg_body: return False
+        if direction == "CALL":
+            return (h - c) / rng <= 0.30 and c > float(prev_3[-1]['high']) and c > o
+        else: 
+            return (c - l) / rng <= 0.30 and c < float(prev_3[-1]['low']) and c < o
+    except: return False
 
 # ========================= 3. BOT CORE =========================
 class DerivSniperBot:
@@ -72,62 +73,42 @@ class DerivSniperBot:
             self.api = DerivAPI(app_id=APP_ID)
             await self.api.authorize(self.active_token)
             return True
-        except Exception as e:
-            logging.error(f"Connect failed: {e}")
-            return False
+        except: return False
 
     async def run_scanner(self):
         self.running = True
-        self.current_status = "🔎 Initializing..."
-        
         while self.running:
             try:
                 if not self.api: await self.connect()
-
                 if self.active_trade_info:
                     self.current_status = f"🚀 ACTIVE: {self.active_trade_info['side']}"
                     await asyncio.sleep(10)
                     continue
 
-                # CORRECT METHOD: ticks_history
-                # Fetch M5
-                m5_resp = await self.api.ticks_history({
-                    "ticks_history": SYMBOL, "adjust_start_time": 1, "count": 60, "end": "latest", "granularity": 300, "style": "candles"
-                })
-                m5_candles = m5_resp['candles']
-                m5_c = [float(x['close']) for x in m5_candles]
-                m5_ema = get_ema(m5_c, 50)
+                m5_resp = await self.api.ticks_history({"ticks_history": SYMBOL, "count": 60, "end": "latest", "granularity": 300, "style": "candles"})
+                m1_resp = await self.api.ticks_history({"ticks_history": SYMBOL, "count": 60, "end": "latest", "granularity": 60, "style": "candles"})
                 
-                # Fetch M1
-                m1_resp = await self.api.ticks_history({
-                    "ticks_history": SYMBOL, "adjust_start_time": 1, "count": 60, "end": "latest", "granularity": 60, "style": "candles"
-                })
-                m1_candles = m1_resp['candles']
-                m1_c = [float(x['close']) for x in m1_candles]
+                m5_c = [float(x['close']) for x in m5_resp['candles']]
+                m1_c = [float(x['close']) for x in m1_resp['candles']]
                 m1_ema = get_ema(m1_c, 50)
+                m5_ema = get_ema(m5_c, 50)
                 rsi = get_rsi(m1_c, 14)
 
                 self.current_status = f"🔎 Scanning (RSI: {round(rsi)})"
 
                 m5_bias = "CALL" if m5_c[-1] > m5_ema else "PUT"
-                if 35 <= rsi <= 65: # Slightly wider RSI for testing
-                    last_c = m1_candles[-1]
-                    prev_3 = m1_candles[-4:-1]
-                    
+                if 30 <= rsi <= 70:
+                    last_c, prev_3 = m1_resp['candles'][-1], m1_resp['candles'][-4:-1]
                     signal = None
                     if m5_bias == "CALL" and m1_c[-1] > m1_ema:
                         if check_v3_momentum(last_c, prev_3, "CALL", m1_ema): signal = "CALL"
                     elif m5_bias == "PUT" and m1_c[-1] < m1_ema:
                         if check_v3_momentum(last_c, prev_3, "PUT", m1_ema): signal = "PUT"
-
-                    if signal:
-                        await self.execute_trade(signal)
+                    
+                    if signal: await self.execute_trade(signal)
 
                 await asyncio.sleep(10)
-            except Exception as e:
-                logging.error(f"Logic Error: {e}")
-                self.current_status = "⚠️ API Data Error"
-                await asyncio.sleep(10)
+            except: await asyncio.sleep(10)
 
     async def execute_trade(self, side):
         try:
@@ -135,9 +116,10 @@ class DerivSniperBot:
                    "contract_type": side, "currency": "USD", "duration": DURATION, "duration_unit": "m", "symbol": SYMBOL}}
             resp = await self.api.buy(req)
             self.active_trade_info = {"side": side, "id": resp['buy']['contract_id'], "start": datetime.datetime.now().strftime("%H:%M:%S")}
-            await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🚀 **AUTO-TRADE OPENED**\nSide: `{side}`", parse_mode="Markdown")
+            await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🚀 **TRADE PLACED**\nSide: `{side}`", parse_mode="Markdown")
             asyncio.create_task(self.check_result(self.active_trade_info['id']))
-        except: pass
+        except Exception as e:
+            await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"❌ **Trade Failed**: {e}")
 
     async def check_result(self, cid):
         await asyncio.sleep(DURATION * 60 + 5)
@@ -158,10 +140,13 @@ class DerivSniperBot:
 bot = DerivSniperBot()
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton("🚀 START SCANNER", callback_data="PROMPT_MODE")],
-          [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"), InlineKeyboardButton("💰 BALANCE", callback_data="CHECK_BAL")],
-          [InlineKeyboardButton("🛑 STOP", callback_data="STOP")]]
-    text = "💎 **Deriv Sniper v3**\nLogic Updated (Ticks History)."
+    kb = [
+        [InlineKeyboardButton("🚀 START SCANNER", callback_data="PROMPT_MODE")],
+        [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"), InlineKeyboardButton("💰 BALANCE", callback_data="CHECK_BAL")],
+        [InlineKeyboardButton("🧪 TEST BUY (CALL)", callback_data="TEST_BUY")],
+        [InlineKeyboardButton("🛑 STOP", callback_data="STOP")]
+    ]
+    text = "💎 **Deriv Sniper v3**\nReady for testing."
     if u.message: await u.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     else: await u.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
@@ -170,26 +155,27 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     
     if q.data == "PROMPT_MODE":
-        kb = [[InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")],
-              [InlineKeyboardButton("⬅️ BACK", callback_data="BACK")]]
-        await q.edit_message_text("💳 **Mode Selection:**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        kb = [[InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")], [InlineKeyboardButton("⬅️ BACK", callback_data="BACK")]]
+        await q.edit_message_text("💳 **Mode Selection:**", reply_markup=InlineKeyboardMarkup(kb))
 
     elif q.data in ["SET_DEMO", "SET_REAL"]:
         bot.active_token = DEMO_TOKEN if q.data == "SET_DEMO" else REAL_TOKEN
         bot.account_mode = "🧪 DEMO" if q.data == "SET_DEMO" else "💰 REAL"
-        bot.running = False
-        await asyncio.sleep(1) 
         if await bot.connect():
             asyncio.create_task(bot.run_scanner())
-            await q.edit_message_text(f"✅ **Scanner Online**\nMode: {bot.account_mode}", 
-                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 STATUS", callback_data="STATUS")]]))
+            await q.edit_message_text(f"✅ **Scanner Online**\nMode: {bot.account_mode}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 STATUS", callback_data="STATUS")]]))
+        else: await q.edit_message_text("❌ Connection Error.")
+
+    elif q.data == "TEST_BUY":
+        if not bot.api:
+            await q.edit_message_text("❌ Start the Demo/Live mode first!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ BACK", callback_data="BACK")]]))
         else:
-            await q.edit_message_text("❌ Connection Error.")
+            await bot.execute_trade("CALL")
+            await q.edit_message_text("⚡ **Test Trade Sent!**\nCheck your Deriv app/website.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 STATUS", callback_data="STATUS")]]))
 
     elif q.data == "STATUS":
         pnl_str = f"+${round(bot.pnl_today, 2)}" if bot.pnl_today >= 0 else f"-${round(abs(bot.pnl_today), 2)}"
-        msg = (f"📊 **DASHBOARD**\nAccount: `{bot.account_mode}`\nState: `{bot.current_status}`\n"
-               f"Wins/Loss: {bot.wins_today}W - {bot.losses_today}L\nTotal PnL: `{pnl_str}`")
+        msg = f"📊 **DASHBOARD**\nAccount: `{bot.account_mode}`\nState: `{bot.current_status}`\nPnL: `{pnl_str}`"
         kb = [[InlineKeyboardButton("🔄 Refresh", callback_data="STATUS")], [InlineKeyboardButton("⬅️ BACK", callback_data="BACK")]]
         try: await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         except BadRequest: pass
@@ -197,14 +183,13 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif q.data == "CHECK_BAL":
         try:
             info = await bot.api.authorize(bot.active_token)
-            bot.balance = info['authorize']['balance']
-            await q.edit_message_text(f"💰 **Balance**: `${bot.balance}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ BACK", callback_data="BACK")]]))
-        except: await q.edit_message_text("❌ Balance Error.")
+            await q.edit_message_text(f"💰 **Balance**: `${info['authorize']['balance']}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ BACK", callback_data="BACK")]]))
+        except: await q.edit_message_text("❌ Error fetching balance.")
 
     elif q.data == "STOP":
         bot.running = False
         bot.current_status = "🛑 Stopped"
-        await q.edit_message_text("🛑 Bot Stopped.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 RESTART", callback_data="PROMPT_MODE")]]))
+        await q.edit_message_text("🛑 Stopped.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 RESTART", callback_data="PROMPT_MODE")]]))
 
     elif q.data == "BACK":
         await start_cmd(u, c)
