@@ -65,9 +65,7 @@ class DerivSniperBot:
             await self.api.authorize(self.active_token)
             await self.fetch_balance()
             return True
-        except Exception as e:
-            logger.error(f"Connect failed: {e}")
-            return False
+        except: return False
 
     async def fetch_balance(self):
         try:
@@ -78,34 +76,50 @@ class DerivSniperBot:
     async def background_scanner(self):
         logger.info("🔍 Scanner active...")
         while self.is_scanning:
-            # 🔥 SAFETY CHECK: Don't run if API is not connected
             if not self.api:
-                logger.warning("Scanner waiting for API connection...")
                 await asyncio.sleep(5)
                 continue
 
             try:
+                # 1. Fetch History
                 ticks_data = await self.api.ticks_history({
                     "ticks_history": self.current_symbol,
-                    "end": "latest", "count": 50, "style": "ticks"
+                    "end": "latest", "count": 60, "style": "ticks"
                 })
-                prices = [float(t['quote']) for t in ticks_data['history']['prices']]
                 
-                cur_price = prices[-1]
-                ema_val = calculate_ema_manual(prices, EMA_PERIOD)
-                rsi_val = calculate_rsi_manual(prices, RSI_PERIOD)
+                # 🔥 THE FIX: Flexible Data Extraction
+                raw_prices = ticks_data.get('history', {}).get('prices', [])
+                
+                clean_prices = []
+                for p in raw_prices:
+                    if isinstance(p, dict):
+                        clean_prices.append(float(p.get('quote', 0)))
+                    else:
+                        clean_prices.append(float(p))
 
-                logger.info(f"📊 {self.current_symbol} | RSI: {rsi_val:.1f} | EMA: {ema_val:.2f}")
+                if not clean_prices:
+                    logger.warning("No price data received.")
+                    await asyncio.sleep(5)
+                    continue
 
+                cur_price = clean_prices[-1]
+                ema_val = calculate_ema_manual(clean_prices, EMA_PERIOD)
+                rsi_val = calculate_rsi_manual(clean_prices, RSI_PERIOD)
+
+                logger.info(f"📊 {self.current_symbol} | Price: {cur_price:.2f} | RSI: {rsi_val:.1f} | EMA: {ema_val:.2f}")
+
+                # 2. STRATEGY TRIGGER
                 if cur_price > ema_val and rsi_val < 40:
                     await self.execute_trade("CALL", "AUTO-SIGNAL")
                     await asyncio.sleep(305) 
                 elif cur_price < ema_val and rsi_val > 60:
                     await self.execute_trade("PUT", "AUTO-SIGNAL")
                     await asyncio.sleep(305)
+                    
             except Exception as e:
                 logger.error(f"Scanner Loop Error: {e}")
-            await asyncio.sleep(15)
+            
+            await asyncio.sleep(10)
 
     async def execute_trade(self, side: str, source="MANUAL"):
         if not self.api or self.active_trade_info: return
@@ -116,9 +130,7 @@ class DerivSniperBot:
                     "contract_type": side, "currency": "USD",
                     "duration": DURATION, "duration_unit": "m", "symbol": self.current_symbol
                 })
-                if "error" in proposal: 
-                    logger.error(f"Proposal Error: {proposal['error']['message']}")
-                    return
+                if "error" in proposal: return
 
                 buy = await self.api.buy({"buy": proposal["proposal"]["id"], "price": 10.0})
                 self.active_trade_info = buy["buy"]["contract_id"]
@@ -128,8 +140,7 @@ class DerivSniperBot:
                     f"🚀 **{source}**\n{side} on {self.current_symbol}\nStake: ${buy['buy']['buy_price']}"
                 )
                 asyncio.create_task(self.check_result(self.active_trade_info))
-            except Exception as e:
-                logger.error(f"Trade Execution Error: {e}")
+            except: pass
 
     async def check_result(self, cid):
         await asyncio.sleep((DURATION * 60) + 10)
@@ -160,13 +171,11 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if q.data in ("SET_DEMO", "SET_REAL"):
         bot_logic.active_token = DEMO_TOKEN if q.data == "SET_DEMO" else REAL_TOKEN
         if await bot_logic.connect():
-            await q.edit_message_text(f"✅ Connected to Deriv!\nBalance: {bot_logic.balance}", reply_markup=main_keyboard())
-        else:
-            await q.edit_message_text("❌ Connection Failed. Check Token.", reply_markup=main_keyboard())
+            await q.edit_message_text(f"✅ Connected!\nBal: {bot_logic.balance}", reply_markup=main_keyboard())
     elif q.data == "START_SCAN":
         bot_logic.is_scanning = True
         asyncio.create_task(bot_logic.background_scanner())
-        await q.edit_message_text("🔍 **SCANNER ACTIVE**\nStrategy: RSI(14) + EMA(20)\nMode: No-Library (Stable)", reply_markup=main_keyboard(), parse_mode="Markdown")
+        await q.edit_message_text("🔍 **SCANNER ACTIVE**\nWatching RSI & EMA...", reply_markup=main_keyboard())
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
         await q.edit_message_text("🛑 **SCANNER STOPPED**", reply_markup=main_keyboard())
@@ -174,16 +183,15 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await bot_logic.execute_trade("CALL", "MANUAL-TEST")
     elif q.data == "STATUS":
         await bot_logic.fetch_balance()
-        txt = f"📊 **DAILY STATS**\n💰 Bal: {bot_logic.balance}\n🏆 W/L: {bot_logic.wins_today}/{bot_logic.losses_today}\n💵 PnL: ${bot_logic.pnl_today:.2f}"
+        txt = f"📊 **STATS**\n💰 Bal: {bot_logic.balance}\n🏆 W/L: {bot_logic.wins_today}/{bot_logic.losses_today}\n💵 PnL: ${bot_logic.pnl_today:.2f}"
         await q.edit_message_text(txt, reply_markup=main_keyboard(), parse_mode="Markdown")
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper v5.0 (Stable)**", reply_markup=main_keyboard(), parse_mode="Markdown")
+    await u.message.reply_text("💎 **Sniper v5.1 (Data Fix)**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     bot_logic.app = app
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(btn_handler))
-    print("Bot is running...")
     app.run_polling(drop_pending_updates=True)
