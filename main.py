@@ -1,7 +1,7 @@
 import asyncio
 import logging
-import re
-from decimal import Decimal, ROUND_HALF_UP
+import pandas as pd
+import numpy as np
 from deriv_api import DerivAPI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -12,8 +12,9 @@ REAL_TOKEN = "2NFJTH3JgXWFCcv"
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50", "R_100"]
-STAKE = 0.50 
-DURATION = 5
+DURATION = 5 
+EMA_PERIOD = 20
+RSI_PERIOD = 14
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -21,15 +22,18 @@ TELEGRAM_CHAT_ID = "7634818949"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ========================= HELPERS =========================
-def clean_money(amount):
-    """Forces number to exactly 2 decimal places to stop the 0.35 error"""
-    return float(Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-
-def find_min_stake(error_msg):
-    """Regex to find the number Deriv is asking for in the error message"""
-    match = re.search(r"at least\s*(\d+\.?\d*)", error_msg.lower())
-    return float(match.group(1)) if match else None
+# ========================= STRATEGY =========================
+def calculate_indicators(ticks):
+    df = pd.DataFrame(ticks)
+    # EMA
+    df['ema'] = df['quote'].ewm(span=EMA_PERIOD, adjust=False).mean()
+    # RSI
+    delta = df['quote'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    return df.iloc[-1]
 
 # ========================= BOT CORE =========================
 class DerivSniperBot:
@@ -38,12 +42,14 @@ class DerivSniperBot:
         self.app = None
         self.active_token = None
         self.current_symbol = MARKETS[0]
+        self.is_scanning = False
+        self.active_trade_info = None
+        self.trade_lock = asyncio.Lock()
+        
         self.balance = "0.00"
         self.pnl_today = 0.0
         self.wins_today = 0
         self.losses_today = 0
-        self.active_trade_info = None
-        self.trade_lock = asyncio.Lock()
 
     async def connect(self) -> bool:
         try:
@@ -51,120 +57,116 @@ class DerivSniperBot:
             await self.api.authorize(self.active_token)
             await self.fetch_balance()
             return True
-        except Exception as e:
-            logger.error(f"Connect failed: {e}")
-            return False
+        except: return False
 
     async def fetch_balance(self):
         try:
             bal = await self.api.balance({"balance": 1})
-            b = bal.get("balance", {})
-            self.balance = f"{float(b.get('balance', 0.0)):.2f} {b.get('currency', 'USD')}"
+            self.balance = f"{float(bal['balance']['balance']):.2f} USD"
         except: pass
 
-    async def execute_trade(self, side: str):
-        if not self.api: return
+    async def background_scanner(self):
+        logger.info("🔍 Scanner starting...")
+        while self.is_scanning:
+            try:
+                ticks_data = await self.api.ticks_history({
+                    "ticks_history": self.current_symbol,
+                    "end": "latest", "count": 50, "style": "ticks"
+                })
+                prices = [{"quote": float(t['quote'])} for t in ticks_data['history']['prices']]
+                latest = calculate_indicators(prices)
+                
+                # Signal Logic
+                if latest['quote'] > latest['ema'] and latest['rsi'] < 40:
+                    await self.execute_trade("CALL", "AUTO-STRATEGY")
+                    await asyncio.sleep(305) # Prevent double trades
+                elif latest['quote'] < latest['ema'] and latest['rsi'] > 60:
+                    await self.execute_trade("PUT", "AUTO-STRATEGY")
+                    await asyncio.sleep(305)
+            except Exception as e:
+                logger.error(f"Scanner Loop Error: {e}")
+            await asyncio.sleep(15)
+
+    async def execute_trade(self, side: str, source="MANUAL"):
+        if not self.api or self.active_trade_info: return
         async with self.trade_lock:
-            if self.active_trade_info: return
-            
-            # Use clean_money to ensure we send exactly 0.50
-            current_stake = clean_money(STAKE)
-
-            for attempt in range(2):
-                try:
-                    # 1. Proposal
-                    prop_req = {
-                        "proposal": 1,
-                        "amount": current_stake,
-                        "basis": "stake",
-                        "contract_type": side,
-                        "currency": "USD",
-                        "duration": int(DURATION),
-                        "duration_unit": "m",
-                        "symbol": self.current_symbol
-                    }
-                    
-                    prop = await self.api.proposal(prop_req)
-
-                    if "error" in prop:
-                        msg = prop["error"].get("message", "")
-                        # If broker says 'at least X', grab X and retry once
-                        required_min = find_min_stake(msg)
-                        if required_min and attempt == 0:
-                            current_stake = clean_money(required_min + 0.01)
-                            logger.info(f"Retrying with higher stake: {current_stake}")
-                            continue
-                        
-                        await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Stake Error: {msg}")
-                        return
-
-                    # 2. Buy
-                    proposal_id = prop["proposal"]["id"]
-                    ask_price = float(prop["proposal"]["ask_price"])
-                    
-                    # Buffer to prevent 'Price has changed' error
-                    buy_price = clean_money(ask_price + 0.10)
-                    
-                    buy_res = await self.api.buy({"buy": proposal_id, "price": buy_price})
-                    
-                    if "error" in buy_res:
-                        await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Buy Error: {buy_res['error'].get('message')}")
-                        return
-
-                    self.active_trade_info = buy_res["buy"]["contract_id"]
-                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **TRADE PLACED**\nStake: `${current_stake}`\nMarket: `{self.current_symbol}`")
-                    asyncio.create_task(self.check_result(self.active_trade_info))
+            try:
+                # Use Payout basis so Deriv decides the stake
+                proposal = await self.api.proposal({
+                    "proposal": 1, "amount": 1.00, "basis": "payout",
+                    "contract_type": side, "currency": "USD",
+                    "duration": DURATION, "duration_unit": "m", "symbol": self.current_symbol
+                })
+                
+                if "error" in proposal:
+                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Error: {proposal['error']['message']}")
                     return
 
-                except Exception as e:
-                    logger.error(f"Trade process error: {e}")
-                    return
+                buy = await self.api.buy({"buy": proposal["proposal"]["id"], "price": 10.0})
+                self.active_trade_info = buy["buy"]["contract_id"]
+                
+                await self.app.bot.send_message(
+                    TELEGRAM_CHAT_ID, 
+                    f"🚀 **{source} TRADE**\nSide: {side}\nStake: ${buy['buy']['buy_price']}\nMarket: {self.current_symbol}"
+                )
+                asyncio.create_task(self.check_result(self.active_trade_info))
+            except Exception as e:
+                logger.error(f"Trade Execution Error: {e}")
 
     async def check_result(self, cid):
         await asyncio.sleep((DURATION * 60) + 10)
         try:
-            poc = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
-            c = poc.get("proposal_open_contract", {})
-            if c.get("is_sold"):
-                profit = float(c.get("profit", 0.0))
-                self.pnl_today += profit
-                res = "✅ WIN" if profit > 0 else "❌ LOSS"
-                if profit > 0: self.wins_today += 1
-                else: self.losses_today += 1
-                await self.fetch_balance()
-                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 Result: {res} (${profit:.2f})")
+            res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
+            c = res['proposal_open_contract']
+            profit = float(c.get('profit', 0))
+            self.pnl_today += profit
+            if profit > 0: self.wins_today += 1 
+            else: self.losses_today += 1
+            await self.fetch_balance()
+            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 **FINISH**\nResult: {'✅ WIN' if profit > 0 else '❌ LOSS'} (${profit:.2f})")
         finally:
             self.active_trade_info = None
 
-# ========================= TELEGRAM UI =========================
+# ========================= UI =========================
 bot_logic = DerivSniperBot()
+
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")],
+        [InlineKeyboardButton("▶️ START SCANNER", callback_data="START_SCAN"), InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
+        [InlineKeyboardButton("🧪 TEST BUY (CALL)", callback_data="TEST_BUY"), InlineKeyboardButton("📊 STATUS", callback_data="STATUS")]
+    ])
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     await q.answer()
-    if q.data == "PROMPT_MODE":
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]])
-        await q.edit_message_text("Select Account:", reply_markup=kb)
-    elif q.data in ("SET_DEMO", "SET_REAL"):
+    
+    if q.data in ("SET_DEMO", "SET_REAL"):
         bot_logic.active_token = DEMO_TOKEN if q.data == "SET_DEMO" else REAL_TOKEN
         if await bot_logic.connect():
             await q.edit_message_text(f"✅ Connected!\nBal: {bot_logic.balance}", reply_markup=main_keyboard())
+    
+    elif q.data == "START_SCAN":
+        bot_logic.is_scanning = True
+        asyncio.create_task(bot_logic.background_scanner())
+        await q.edit_message_text("🔍 **SCANNER ON** (RSI/EMA)", reply_markup=main_keyboard())
+
+    elif q.data == "STOP_SCAN":
+        bot_logic.is_scanning = False
+        await q.edit_message_text("🛑 **SCANNER OFF**", reply_markup=main_keyboard())
+
     elif q.data == "TEST_BUY":
-        await bot_logic.execute_trade("CALL")
+        await bot_logic.execute_trade("CALL", "MANUAL-TEST")
+
     elif q.data == "STATUS":
         await bot_logic.fetch_balance()
-        status = f"📊 Bal: {bot_logic.balance}\n🏆 W/L: {bot_logic.wins_today}/{bot_logic.losses_today}\n💵 PnL: ${bot_logic.pnl_today:.2f}"
-        await q.edit_message_text(status, reply_markup=main_keyboard())
-
-def main_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🚀 START", callback_data="PROMPT_MODE")], 
-                                 [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"), InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY")]])
+        txt = f"📊 **STATUS**\n💰 Bal: {bot_logic.balance}\n🏆 W/L: {bot_logic.wins_today}/{bot_logic.losses_today}\n💵 PnL: ${bot_logic.pnl_today:.2f}"
+        await q.edit_message_text(txt, reply_markup=main_keyboard())
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 Sniper v4.4", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper v4.8 Strategy + Manual**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
-    # drop_pending_updates=True stops the "Conflict" error
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     bot_logic.app = app
     app.add_handler(CommandHandler("start", start_cmd))
