@@ -55,49 +55,44 @@ class DerivSniperBot:
         async with self.trade_lock:
             if self.active_trade_info: return
             
-            # 🔥 THE FIX: Convert 0.50 to exactly "0.50" (String) 
-            # This bypasses all Python floating point math bugs.
-            clean_stake = "{:.2f}".format(float(STAKE)) 
-
             try:
-                # 1. Get Proposal
-                prop_req = {
+                # 🛑 NUCLEAR FIX: Using hard-coded values and explicit types
+                # Stripping any hidden spaces from symbol and side
+                proposal_data = {
                     "proposal": 1,
-                    "amount": float(clean_stake), # Ensure it's exactly 0.50
+                    "amount": float(0.50),            # Explicit 0.50
                     "basis": "stake",
-                    "contract_type": side,
+                    "contract_type": str(side).strip(), 
                     "currency": "USD",
-                    "duration": int(DURATION),
+                    "duration": int(5),               # Explicit 5
                     "duration_unit": "m",
-                    "symbol": self.current_symbol
+                    "symbol": str(self.current_symbol).strip()
                 }
-                
-                logger.info(f"Sending Proposal: {prop_req}")
-                prop = await self.api.proposal(prop_req)
+
+                logger.info(f"🚀 SENDING PROPOSAL: {proposal_data}")
+                prop = await self.api.proposal(proposal_data)
 
                 if "error" in prop:
-                    msg = prop["error"].get("message")
-                    logger.error(f"Proposal Error: {msg}")
-                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Stake Error: {msg}\nCheck if your Demo account is USD.")
+                    msg = prop["error"].get("message", "Unknown Error")
+                    logger.error(f"❌ PROPOSAL REJECTED: {msg}")
+                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Broker Error: {msg}")
                     return
 
-                # 2. Buy
+                # If successful, buy with a very high price limit to bypass 'Price Changed'
                 pid = prop["proposal"]["id"]
-                # Give a huge $0.50 price buffer so the trade ALWAYS goes through
-                max_buy_price = float(prop["proposal"]["ask_price"]) + 0.50 
-                
-                buy_res = await self.api.buy({"buy": pid, "price": max_buy_price})
+                buy_res = await self.api.buy({"buy": pid, "price": 10.0})
                 
                 if "error" in buy_res:
+                    logger.error(f"❌ BUY ERROR: {buy_res['error'].get('message')}")
                     await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Buy Error: {buy_res['error'].get('message')}")
                     return
 
                 self.active_trade_info = buy_res["buy"]["contract_id"]
-                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 Trade Placed: ${clean_stake}")
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, "✅ SUCCESS! Trade placed at $0.50")
                 asyncio.create_task(self.check_result(self.active_trade_info))
 
             except Exception as e:
-                logger.error(f"Execution Exception: {e}")
+                logger.error(f"⚠️ CRITICAL SYSTEM ERROR: {e}")
 
     async def check_result(self, cid):
         await asyncio.sleep((DURATION * 60) + 10)
@@ -139,11 +134,14 @@ def main_keyboard():
                                  [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"), InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY")]])
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 Sniper v4.3", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 Sniper v4.5", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     bot_logic.app = app
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(btn_handler))
-    app.run_polling(drop_pending_updates=True)
+    
+    # drop_pending_updates=True clears old conflict errors immediately
+    print("Bot is starting...")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
