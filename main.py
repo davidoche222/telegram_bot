@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from decimal import Decimal, ROUND_HALF_UP
 from deriv_api import DerivAPI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -21,7 +22,7 @@ TELEGRAM_CHAT_ID = "7634818949"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ========================= MANUAL MATH BRAIN =========================
+# ========================= MATH BRAIN =========================
 def calculate_ema_manual(prices, period):
     if len(prices) < period: return prices[-1]
     multiplier = 2 / (period + 1)
@@ -54,7 +55,14 @@ class DerivSniperBot:
         self.active_token = None
         self.current_symbol = MARKETS[0]
         self.is_scanning = False
-        self.active_trade_info = None
+        
+        # Live Tracking
+        self.active_trade_info = None # Stores the Contract ID
+        self.trade_start_time = 0
+        self.last_rsi = 0
+        self.last_ema = 0
+        self.last_price = 0
+        
         self.trade_lock = asyncio.Lock()
         self.balance = "0.00"
         self.pnl_today, self.wins_today, self.losses_today = 0.0, 0, 0
@@ -70,55 +78,36 @@ class DerivSniperBot:
     async def fetch_balance(self):
         try:
             bal = await self.api.balance({"balance": 1})
-            self.balance = f"{float(bal['balance']['balance']):.2f} USD"
+            self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
         except: pass
 
     async def background_scanner(self):
-        logger.info("🔍 Scanner active...")
         while self.is_scanning:
             if not self.api:
                 await asyncio.sleep(5)
                 continue
-
             try:
-                # 1. Fetch History
                 ticks_data = await self.api.ticks_history({
                     "ticks_history": self.current_symbol,
                     "end": "latest", "count": 60, "style": "ticks"
                 })
-                
-                # 🔥 THE FIX: Flexible Data Extraction
                 raw_prices = ticks_data.get('history', {}).get('prices', [])
-                
-                clean_prices = []
-                for p in raw_prices:
-                    if isinstance(p, dict):
-                        clean_prices.append(float(p.get('quote', 0)))
-                    else:
-                        clean_prices.append(float(p))
+                clean_prices = [float(p.get('quote', p)) if isinstance(p, dict) else float(p) for p in raw_prices]
 
-                if not clean_prices:
-                    logger.warning("No price data received.")
-                    await asyncio.sleep(5)
-                    continue
+                if clean_prices:
+                    self.last_price = clean_prices[-1]
+                    self.last_ema = calculate_ema_manual(clean_prices, EMA_PERIOD)
+                    self.last_rsi = calculate_rsi_manual(clean_prices, RSI_PERIOD)
 
-                cur_price = clean_prices[-1]
-                ema_val = calculate_ema_manual(clean_prices, EMA_PERIOD)
-                rsi_val = calculate_rsi_manual(clean_prices, RSI_PERIOD)
-
-                logger.info(f"📊 {self.current_symbol} | Price: {cur_price:.2f} | RSI: {rsi_val:.1f} | EMA: {ema_val:.2f}")
-
-                # 2. STRATEGY TRIGGER
-                if cur_price > ema_val and rsi_val < 40:
-                    await self.execute_trade("CALL", "AUTO-SIGNAL")
-                    await asyncio.sleep(305) 
-                elif cur_price < ema_val and rsi_val > 60:
-                    await self.execute_trade("PUT", "AUTO-SIGNAL")
-                    await asyncio.sleep(305)
-                    
+                    # STRATEGY TRIGGER
+                    if self.last_price > self.last_ema and self.last_rsi < 40:
+                        await self.execute_trade("CALL", "AUTO")
+                        await asyncio.sleep(305) 
+                    elif self.last_price < self.last_ema and self.last_rsi > 60:
+                        await self.execute_trade("PUT", "AUTO")
+                        await asyncio.sleep(305)
             except Exception as e:
-                logger.error(f"Scanner Loop Error: {e}")
-            
+                logger.error(f"Scanner Error: {e}")
             await asyncio.sleep(10)
 
     async def execute_trade(self, side: str, source="MANUAL"):
@@ -130,15 +119,12 @@ class DerivSniperBot:
                     "contract_type": side, "currency": "USD",
                     "duration": DURATION, "duration_unit": "m", "symbol": self.current_symbol
                 })
-                if "error" in proposal: return
-
                 buy = await self.api.buy({"buy": proposal["proposal"]["id"], "price": 10.0})
-                self.active_trade_info = buy["buy"]["contract_id"]
                 
-                await self.app.bot.send_message(
-                    TELEGRAM_CHAT_ID, 
-                    f"🚀 **{source}**\n{side} on {self.current_symbol}\nStake: ${buy['buy']['buy_price']}"
-                )
+                self.active_trade_info = buy["buy"]["contract_id"]
+                self.trade_start_time = time.time()
+                
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **TRADE PLACED**\nType: {side}\nMarket: {self.current_symbol}")
                 asyncio.create_task(self.check_result(self.active_trade_info))
             except: pass
 
@@ -151,43 +137,61 @@ class DerivSniperBot:
             if profit > 0: self.wins_today += 1 
             else: self.losses_today += 1
             await self.fetch_balance()
-            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 **FINISH**\nResult: {'✅ WIN' if profit > 0 else '❌ LOSS'} (${profit:.2f})")
+            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 **RESULT**: {'✅ WIN' if profit > 0 else '❌ LOSS'} (${profit:.2f})")
         finally:
             self.active_trade_info = None
+            self.trade_start_time = 0
 
 # ========================= UI =========================
 bot_logic = DerivSniperBot()
 
 def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧪 CONNECT DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 CONNECT LIVE", callback_data="SET_REAL")],
         [InlineKeyboardButton("▶️ START SCANNER", callback_data="START_SCAN"), InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
-        [InlineKeyboardButton("🧪 TEST BUY (CALL)", callback_data="TEST_BUY"), InlineKeyboardButton("📊 STATUS", callback_data="STATUS")]
+        [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY"), InlineKeyboardButton("📊 STATUS", callback_data="STATUS")],
+        [InlineKeyboardButton("🧪 CONNECT DEMO", callback_data="SET_DEMO")]
     ])
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     await q.answer()
-    if q.data in ("SET_DEMO", "SET_REAL"):
-        bot_logic.active_token = DEMO_TOKEN if q.data == "SET_DEMO" else REAL_TOKEN
-        if await bot_logic.connect():
-            await q.edit_message_text(f"✅ Connected!\nBal: {bot_logic.balance}", reply_markup=main_keyboard())
+    
+    if q.data == "STATUS":
+        await bot_logic.fetch_balance()
+        
+        # 📊 INDICATOR BLOCK
+        ind_text = f"📉 **MARKET**: `{bot_logic.current_symbol}`\n"
+        ind_text += f"💵 **Price**: `{bot_logic.last_price:.2f}`\n"
+        ind_text += f"⚡ **RSI**: `{bot_logic.last_rsi:.1f}` | **EMA**: `{bot_logic.last_ema:.2f}`\n"
+        
+        # 🕒 ACTIVE TRADE BLOCK
+        trade_text = "✨ **Active Trade**: `None`"
+        if bot_logic.active_trade_info:
+            elapsed = int(time.time() - bot_logic.trade_start_time)
+            remaining = max(0, (DURATION * 60) - elapsed)
+            trade_text = f"⏳ **Active Trade**: `{bot_logic.active_trade_info}`\n⏱️ **Remaining**: `{remaining}s`"
+
+        # 💰 SUMMARY BLOCK
+        summary = f"\n--- --- ---\n💰 **Balance**: `{bot_logic.balance}`\n🏆 **W/L**: `{bot_logic.wins_today}/{bot_logic.losses_today}`\n💵 **PnL Today**: `${bot_logic.pnl_today:.2f}`"
+        
+        full_text = f"📊 **LIVE STATUS**\n{ind_text}\n{trade_text}\n{summary}"
+        await q.edit_message_text(full_text, reply_markup=main_keyboard(), parse_mode="Markdown")
+
     elif q.data == "START_SCAN":
         bot_logic.is_scanning = True
         asyncio.create_task(bot_logic.background_scanner())
-        await q.edit_message_text("🔍 **SCANNER ACTIVE**\nWatching RSI & EMA...", reply_markup=main_keyboard())
-    elif q.data == "STOP_SCAN":
-        bot_logic.is_scanning = False
-        await q.edit_message_text("🛑 **SCANNER STOPPED**", reply_markup=main_keyboard())
+        await q.edit_message_text("🔍 Scanner active. Check /status for live updates.", reply_markup=main_keyboard())
+
+    elif q.data in ("SET_DEMO", "SET_REAL"):
+        bot_logic.active_token = DEMO_TOKEN
+        if await bot_logic.connect():
+            await q.edit_message_text(f"✅ Connected!\nBal: {bot_logic.balance}", reply_markup=main_keyboard())
+            
     elif q.data == "TEST_BUY":
-        await bot_logic.execute_trade("CALL", "MANUAL-TEST")
-    elif q.data == "STATUS":
-        await bot_logic.fetch_balance()
-        txt = f"📊 **STATS**\n💰 Bal: {bot_logic.balance}\n🏆 W/L: {bot_logic.wins_today}/{bot_logic.losses_today}\n💵 PnL: ${bot_logic.pnl_today:.2f}"
-        await q.edit_message_text(txt, reply_markup=main_keyboard(), parse_mode="Markdown")
+        await bot_logic.execute_trade("CALL", "MANUAL")
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper v5.1 (Data Fix)**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper v5.2 Live Status**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
