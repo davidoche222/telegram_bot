@@ -13,7 +13,7 @@ APP_ID = 1089
 
 MARKET = "R_10"  # Locking to R_10 for best trend stability
 DURATION = 5 
-EMA_PERIOD = 50  # Changed to 50 for stronger trend filtering
+EMA_PERIOD = 50  # 50 EMA for strong trend filtering
 RSI_PERIOD = 14
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
@@ -86,15 +86,15 @@ class DerivSniperBot:
 
     async def background_scanner(self):
         while self.is_scanning:
-            # CHECK LIMITS FIRST
+            # 🛑 CHECK SURVIVAL LIMITS (3 Trades or 3 Losses)
             if self.trades_today >= 3 or self.losses_today >= 3:
                 self.is_scanning = False
                 self.scanner_status = "🛑 DAILY LIMIT REACHED"
-                await self.app.bot.send_message(TELEGRAM_CHAT_ID, "🏁 **Daily Session Complete.** (3 Trades/Losses Hit). Stopping bot.")
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, "🏁 **Daily Session Complete.** (3 Trades/Losses Hit). Stopping bot for safety.")
                 break
 
             try:
-                # 1. GET M5 TREND (Using 500 ticks to approximate last few M5 candles)
+                # 1. GET M5 TREND (Filter)
                 m5_data = await self.api.ticks_history({"ticks_history": MARKET, "end": "latest", "count": 100, "style": "ticks"})
                 m5_prices = [float(p) for p in m5_data['history']['prices']]
                 m5_ema = calculate_ema_manual(m5_prices, EMA_PERIOD)
@@ -109,12 +109,12 @@ class DerivSniperBot:
 
                 # 3. SIGNAL LOGIC (80% Price Action Pullback / 20% RSI)
                 if self.m5_trend == "CALL":
-                    # Trend is UP, wait for pullback to M1 EMA and RSI to be "Warm"
+                    # Pullback to EMA + RSI in warm range
                     if curr_p <= (m1_ema * 1.0005) and 45 <= self.last_rsi <= 60:
                         await self.execute_trade("CALL", "AUTO")
                 
                 elif self.m5_trend == "PUT":
-                    # Trend is DOWN, wait for bounce to M1 EMA and RSI to be "Cool"
+                    # Bounce to EMA + RSI in cool range
                     if curr_p >= (m1_ema * 0.9995) and 40 <= self.last_rsi <= 55:
                         await self.execute_trade("PUT", "AUTO")
 
@@ -137,24 +137,29 @@ class DerivSniperBot:
                 
                 self.active_trade_info = buy["buy"]["contract_id"]
                 self.trade_start_time = time.time()
-                self.trades_today += 1
                 
-                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **{side} TRADE EXECUTED**\nTrend: {self.m5_trend}\nMarket: {MARKET}")
-                asyncio.create_task(self.check_result(self.active_trade_info))
-                await asyncio.sleep(305) # Prevent double trigger
+                # Only increment daily trade count for AUTO/REAL trades, not manual tests
+                if source == "AUTO":
+                    self.trades_today += 1
+                
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **{side} TRADE EXECUTED ({source})**\nTrend: {self.m5_trend}\nMarket: {MARKET}")
+                asyncio.create_task(self.check_result(self.active_trade_info, source))
+                await asyncio.sleep(305) # Prevent overlapping trades
             except Exception as e:
                 logger.error(f"Execution Error: {e}")
 
-    async def check_result(self, cid):
+    async def check_result(self, cid, source):
         await asyncio.sleep((DURATION * 60) + 10)
         try:
             res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
             profit = float(res['proposal_open_contract'].get('profit', 0))
-            self.pnl_today += profit
-            if profit <= 0: self.losses_today += 1
+            
+            if source == "AUTO":
+                self.pnl_today += profit
+                if profit <= 0: self.losses_today += 1
             
             await self.fetch_balance()
-            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 **TRADE FINISHED**\nResult: {'✅ WIN' if profit > 0 else '❌ LOSS'} (${profit:.2f})\nToday: {self.trades_today}/3 trades.")
+            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 **TRADE FINISHED**\nResult: {'✅ WIN' if profit > 0 else '❌ LOSS'} (${profit:.2f})\nSession: {self.trades_today}/3 trades.")
         finally:
             self.active_trade_info = None
 
@@ -164,7 +169,7 @@ bot_logic = DerivSniperBot()
 def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("▶️ START SCANNER", callback_data="START_SCAN"), InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
-        [InlineKeyboardButton("📊 STATUS", callback_data="STATUS")],
+        [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY"), InlineKeyboardButton("📊 STATUS", callback_data="STATUS")],
         [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
     ])
 
@@ -185,7 +190,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             return
         bot_logic.is_scanning = True
         asyncio.create_task(bot_logic.background_scanner())
-        await q.edit_message_text("🔍 **SCANNER INITIALIZED**\nStrategy: M5 Trend + M1 Pullback", reply_markup=main_keyboard(), parse_mode="Markdown")
+        await q.edit_message_text("🔍 **SCANNER ACTIVE**\nStrategy: M5 Trend + M1 EMA Pullback", reply_markup=main_keyboard(), parse_mode="Markdown")
 
     elif q.data == "SET_DEMO":
         bot_logic.active_token = DEMO_TOKEN
@@ -199,13 +204,16 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             bot_logic.account_type = "LIVE 💰"
             await q.edit_message_text(f"⚠️ **CONNECTED TO LIVE**\nBal: {bot_logic.balance}", reply_markup=main_keyboard(), parse_mode="Markdown")
             
+    elif q.data == "TEST_BUY":
+        await bot_logic.execute_trade("CALL", "MANUAL-TEST")
+
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
-        bot_logic.scanner_status = "停 Offline"
+        bot_logic.scanner_status = "💤 Offline"
         await q.edit_message_text("🛑 Scanner stopped.", reply_markup=main_keyboard())
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper v5.5 (Survival Mode)**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper v5.6 (Survival Mode)**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
