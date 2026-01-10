@@ -37,8 +37,8 @@ STOP_AFTER_LOSSES = 5  # UPDATED: Stop only after 5 consecutive losses
 
 MIN_CANDLES_REQUIRED = 220
 
-TELEGRAM_TOKEN = "PASTE_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "PASTE_TELEGRAM_CHAT_ID"
+TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
+TELEGRAM_CHAT_ID = "7634818949"
 # =========================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
