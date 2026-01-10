@@ -17,7 +17,7 @@ APP_ID = 1089
 
 SYMBOL = "R_10"
 CANDLE_SECONDS = 30
-EXPIRY_CANDLES = 5  # 2.5 minutes
+EXPIRY_CANDLES = 5  
 DURATION_MINUTES = (CANDLE_SECONDS * EXPIRY_CANDLES) / 60.0
 
 STAKE = 0.35
@@ -32,8 +32,7 @@ PSAR_STEP = 0.02
 PSAR_MAX = 0.2
 
 COOLDOWN_SECONDS = 10 * 60
-MAX_TRADES_PER_DAY = 20
-STOP_AFTER_LOSSES = 5  # UPDATED: Stop only after 5 consecutive losses
+STOP_AFTER_LOSSES = 5  # <--- Still stops ONLY after 5 consecutive losses
 
 MIN_CANDLES_REQUIRED = 220
 
@@ -44,7 +43,7 @@ TELEGRAM_CHAT_ID = "7634818949"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ========================= INDICATORS =========================
+# --- INDICATORS (From First Code) ---
 def ema(values: np.ndarray, period: int) -> np.ndarray:
     if len(values) < period: return np.array([])
     k = 2.0 / (period + 1.0)
@@ -74,14 +73,12 @@ def psar(high: np.ndarray, low: np.ndarray, step=0.02, max_step=0.2) -> np.ndarr
         ps_i = ps[i - 1] + af * (ep - ps[i - 1])
         if up:
             ps_i = min(ps_i, low[i - 1], low[i - 2] if i >= 2 else low[i - 1])
-            if low[i] < ps_i:
-                up, ps_i, af, ep = False, ep, step, low[i]
+            if low[i] < ps_i: up, ps_i, af, ep = False, ep, step, low[i]
             else:
                 if high[i] > ep: ep, af = high[i], min(max_step, af + step)
         else:
             ps_i = max(ps_i, high[i - 1], high[i - 2] if i >= 2 else high[i - 1])
-            if high[i] > ps_i:
-                up, ps_i, af, ep = True, ep, step, high[i]
+            if high[i] > ps_i: up, ps_i, af, ep = True, ep, step, high[i]
             else:
                 if low[i] < ep: ep, af = low[i], min(max_step, af + step)
         ps[i] = ps_i
@@ -121,40 +118,23 @@ def ticks_to_candles_30s(ticks: List[Tuple[int, float]], step_sec: int = 30) -> 
     return candles
 
 # ========================= BOT CORE =========================
-class DerivStrictSecondSARBot:
+class DerivSniperBotMerged:
     def __init__(self):
         self.api = None
         self.app = None
         self.active_token = None
         self.account_type = "None"
-        self.running = False
-        self.status = "💤 Offline"
+        self.is_scanning = False
+        self.scanner_status = "💤 Offline"
         self.active_contract_id = None
-        self.trade_open_time = 0.0
+        self.trade_start_time = 0
         self.trades_today = 0
-        self.losses_today = 0 # This now tracks CONSECUTIVE losses
-        self.pnl_today = 0.0
+        self.losses_today = 0  # CONSECUTIVE LOSSES
         self.balance = "0.00"
         self.cooldown_until = 0.0
         self.trade_lock = asyncio.Lock()
-        self.buy_stage = 0
-        self.sell_stage = 0
-        self.last_reason = "Waiting..."
-        self.last_scan_time = None
-        self.day = datetime.date.today()
+        self.buy_stage = self.sell_stage = 0
         self._scanner_task = None
-
-    def _reset_daily(self):
-        today = datetime.date.today()
-        if today != self.day:
-            self.day, self.trades_today, self.losses_today = today, 0, 0
-            self.pnl_today, self.buy_stage, self.sell_stage = 0.0, 0, 0
-            self.cooldown_until = 0.0
-
-    async def send(self, text: str):
-        if not self.app: return
-        try: await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="Markdown")
-        except: pass
 
     async def connect(self) -> bool:
         try:
@@ -168,21 +148,11 @@ class DerivStrictSecondSARBot:
         if not self.api: return
         try:
             bal = await self.api.balance({"balance": 1})
-            b = bal.get("balance", {})
-            self.balance = f"{float(b.get('balance', 0.0)):.2f} {b.get('currency', CURRENCY)}"
+            self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
         except: pass
 
-    async def _get_recent_ticks(self, count: int = 1500) -> List[Tuple[int, float]]:
-        resp = await self.api.ticks_history({"ticks_history": SYMBOL, "end": "latest", "count": count, "style": "ticks"})
-        h = resp.get("history", {})
-        ticks = list(zip(h.get("times", []), h.get("prices", [])))
-        ticks.sort(key=lambda x: x[0])
-        return [(int(t), float(p)) for t, p in ticks]
-
     def _signal_logic(self, candles: List[Candle]) -> Optional[str]:
-        if len(candles) < MIN_CANDLES_REQUIRED:
-            self.last_reason = f"Need more candles"
-            return None
+        if len(candles) < MIN_CANDLES_REQUIRED: return None
         c = np.array([x.close for x in candles], dtype=float)
         o = np.array([x.open for x in candles], dtype=float)
         h = np.array([x.high for x in candles], dtype=float)
@@ -190,133 +160,129 @@ class DerivStrictSecondSARBot:
 
         ema100 = ema(c, EMA_PERIOD)
         slope = ema100[-1] - ema100[-6]
-        slope_thr = max(1e-6, float(np.std(c[-60:])) * 0.001)
-
-        if abs(slope) < slope_thr:
-            self.buy_stage = self.sell_stage = 0
-            self.last_reason = "Flat EMA (Chop)"
-            return None
-
         ps = psar(h, l, PSAR_STEP, PSAR_MAX)
         _, _, hist = macd_hist(c)
         bodies = np.abs(c - o)
-        ps_above, ps_below = ps[-1] > h[-1], ps[-1] < l[-1]
-        flipped_to_above = (not (ps[-2] > h[-2])) and ps_above
-        flipped_to_below = (not (ps[-2] < l[-2])) and ps_below
-
-        avg_range = max(float(np.mean(h[-20:] - l[-20:])), 1e-6)
-        sar_far = abs(ps[-1] - c[-1]) >= 0.6 * avg_range
-
-        # SELL Logic
-        if slope < 0 and c[-1] < ema100[-1]:
-            if flipped_to_above: self.sell_stage, self.buy_stage = 1, 0
-            elif self.sell_stage == 1 and ps_above: self.sell_stage = 2
-            elif self.sell_stage == 2:
-                if sar_far and hist[-1] < hist[-2] and c[-1] < o[-1] and candle_body_strength(o[-1], c[-1], bodies):
-                    return "PUT"
-        # BUY Logic
+        
+        # Original Buy/Sell Logic
         if slope > 0 and c[-1] > ema100[-1]:
-            if flipped_to_below: self.buy_stage, self.sell_stage = 1, 0
-            elif self.buy_stage == 1 and ps_below: self.buy_stage = 2
-            elif self.buy_stage == 2:
-                if sar_far and hist[-1] > hist[-2] and c[-1] > o[-1] and candle_body_strength(o[-1], c[-1], bodies):
-                    return "CALL"
+             if ps[-1] < l[-1] and hist[-1] > hist[-2] and c[-1] > o[-1] and candle_body_strength(o[-1], c[-1], bodies):
+                 return "CALL"
+        if slope < 0 and c[-1] < ema100[-1]:
+             if ps[-1] > h[-1] and hist[-1] < hist[-2] and c[-1] < o[-1] and candle_body_strength(o[-1], c[-1], bodies):
+                 return "PUT"
         return None
 
-    async def _place_trade(self, side: str):
+    async def execute_trade(self, side: str, source="AUTO"):
         async with self.trade_lock:
-            if self.active_contract_id: return
-            self._reset_daily()
-            if self.losses_today >= STOP_AFTER_LOSSES: return
-            
+            if self.active_contract_id or self.losses_today >= STOP_AFTER_LOSSES: return
             try:
                 prop = await self.api.proposal({"proposal": 1, "amount": float(STAKE), "basis": "stake", "contract_type": side, "currency": CURRENCY, "duration": int(round(DURATION_MINUTES)), "duration_unit": "m", "symbol": SYMBOL})
-                buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": round(float(prop["proposal"]["ask_price"]) + 0.01, 2)})
+                buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": 10.0})
                 self.active_contract_id = int(buy["buy"]["contract_id"])
-                self.trade_open_time = time.time()
+                self.trade_start_time = time.time()
                 self.trades_today += 1
-                self.buy_stage = self.sell_stage = 0
-                asyncio.create_task(self._check_result(self.active_contract_id))
-            except Exception as e: logger.error(f"Trade Error: {e}")
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **{side} TRADE EXECUTED ({source})**\nMarket: {SYMBOL}")
+                asyncio.create_task(self.check_result(self.active_contract_id))
+            except: pass
 
-    async def _check_result(self, cid: int):
+    async def check_result(self, cid):
         await asyncio.sleep((CANDLE_SECONDS * EXPIRY_CANDLES) + 8)
         try:
             res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
             profit = float(res["proposal_open_contract"].get("profit", 0.0))
-            self.pnl_today += profit
+            if profit <= 0: self.losses_today += 1
+            else: self.losses_today = 0 # Reset on Win
             
-            # CONSECUTIVE LOSS LOGIC
-            if profit <= 0:
-                self.losses_today += 1
-            else:
-                self.losses_today = 0 # Reset on win!
-                
             await self.fetch_balance()
             status_msg = "✅ WIN" if profit > 0 else "❌ LOSS"
-            await self.send(f"🏁 TRADE CLOSED\nResult: {status_msg}\nConsecutive Losses: {self.losses_today}/{STOP_AFTER_LOSSES}\nBalance: {self.balance}")
+            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 **TRADE FINISHED**\nResult: {status_msg} (${profit:.2f})\nConsecutive Losses: {self.losses_today}/{STOP_AFTER_LOSSES}")
             
             if self.losses_today >= STOP_AFTER_LOSSES:
-                self.running = False
-                await self.send(f"🛑 STOPPED: {STOP_AFTER_LOSSES} Consecutive losses hit.")
+                self.is_scanning = False
+                self.scanner_status = "🛑 STOPPED: STREAK HIT"
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🛑 **CRITICAL STOP**: {STOP_AFTER_LOSSES} consecutive losses hit.")
         finally:
             self.active_contract_id = None
             self.cooldown_until = time.time() + COOLDOWN_SECONDS
 
     async def scanner_loop(self):
         if not self.api and not await self.connect(): return
-        self.running = True
-        while self.running:
+        self.is_scanning = True
+        self.scanner_status = "📡 Scanning"
+        while self.is_scanning:
             try:
-                self._reset_daily()
-                if self.active_contract_id or time.time() < self.cooldown_until:
-                    await asyncio.sleep(2)
-                    continue
-                ticks = await self._get_recent_ticks()
-                sig = self._signal_logic(ticks_to_candles_30s(ticks))
-                if sig: await self._place_trade(sig)
+                if not self.active_contract_id and time.time() >= self.cooldown_until:
+                    resp = await self.api.ticks_history({"ticks_history": SYMBOL, "end": "latest", "count": 1000, "style": "ticks"})
+                    h = resp.get("history", {})
+                    ticks = sorted(list(zip(h.get("times", []), h.get("prices", []))), key=lambda x: x[0])
+                    sig = self._signal_logic(ticks_to_candles_30s([(int(t), float(p)) for t, p in ticks]))
+                    if sig: await self.execute_trade(sig, "AUTO")
             except: pass
-            await asyncio.sleep(3)
+            await asyncio.sleep(10)
 
-    def start(self):
-        if not self._scanner_task or self._scanner_task.done():
-            self._scanner_task = asyncio.create_task(self.scanner_loop())
+# ========================= UI (New Style) =========================
+bot_logic = DerivSniperBotMerged()
 
-    def stop(self): self.running = False
-
-# ========================= TELEGRAM UI =========================
-bot_logic = DerivStrictSecondSARBot()
-
-def keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("▶️ START", callback_data="START"), InlineKeyboardButton("⏹️ STOP", callback_data="STOP")], [InlineKeyboardButton("📊 STATUS", callback_data="STATUS")], [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]])
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ START SCANNER", callback_data="START_SCAN"), InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
+        [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY"), InlineKeyboardButton("📊 STATUS", callback_data="STATUS")],
+        [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
+    ])
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     await q.answer()
+    
     if q.data == "STATUS":
-        live_trade_info = ""
+        await bot_logic.fetch_balance()
+        status_header = f"🤖 **Bot State**: `{bot_logic.scanner_status}`\n🔑 **Account**: `{bot_logic.account_type}`\n"
+        
+        trade_text = ""
         if bot_logic.active_contract_id:
             try:
                 res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_contract_id})
-                pnl = float(res['proposal_open_contract'].get('profit', 0))
-                rem = max(0, int((DURATION_MINUTES * 60) - (time.time() - bot_logic.trade_open_time)))
-                live_trade_info = f"\n⏳ **Active Trade**: `${pnl:.2f}`\n⏱️ **Time Left**: `{rem//60:02d}:{rem%60:02d}`"
-            except: pass
-        
-        await bot_logic.fetch_balance()
-        msg = f"📊 STATUS\nAccount: {bot_logic.account_type}\nConsecutive Losses: {bot_logic.losses_today}/{STOP_AFTER_LOSSES}\nBalance: {bot_logic.balance}{live_trade_info}"
-        await q.edit_message_text(msg, reply_markup=keyboard(), parse_mode="Markdown")
-    elif q.data == "START": bot_logic.start()
-    elif q.data == "STOP": bot_logic.stop()
-    elif "SET_" in q.data:
-        bot_logic.active_token = DEMO_TOKEN if "DEMO" in q.data else REAL_TOKEN
-        bot_logic.account_type = "DEMO" if "DEMO" in q.data else "LIVE"
-        await bot_logic.connect()
-        await q.edit_message_text(f"Connected to {bot_logic.account_type}", reply_markup=keyboard())
+                current_pnl = float(res['proposal_open_contract'].get('profit', 0))
+                elapsed = int(time.time() - bot_logic.trade_start_time)
+                remaining = max(0, int(DURATION_MINUTES * 60) - elapsed)
+                trade_text = f"\n⏳ **Live Trade**: `${current_pnl:.2f}`\n⏱️ **Remaining**: `{remaining//60:02d}:{remaining%60:02d}`\n"
+            except: trade_text = "\n⏳ **Trade Status**: `Updating...`\n"
+
+        summary = f"\n💰 **Balance**: `{bot_logic.balance}`\n🎯 **Streak**: `{bot_logic.losses_today}/{STOP_AFTER_LOSSES}`"
+        await q.edit_message_text(f"📊 **DETAILED STATUS**\n{status_header}{trade_text}{summary}", reply_markup=main_keyboard(), parse_mode="Markdown")
+
+    elif q.data == "START_SCAN":
+        if not bot_logic.api:
+            await q.edit_message_text("❌ Connect Account First!", reply_markup=main_keyboard())
+            return
+        bot_logic.is_scanning = True
+        asyncio.create_task(bot_logic.scanner_loop())
+        await q.edit_message_text("🔍 **SCANNER ACTIVE**\nStrategy: Parabolic SAR + MACD", reply_markup=main_keyboard(), parse_mode="Markdown")
+
+    elif q.data == "SET_DEMO":
+        bot_logic.active_token = DEMO_TOKEN
+        if await bot_logic.connect():
+            bot_logic.account_type = "DEMO"
+            await q.edit_message_text(f"✅ Connected to DEMO\nBal: {bot_logic.balance}", reply_markup=main_keyboard())
+            
+    elif q.data == "SET_REAL":
+        bot_logic.active_token = REAL_TOKEN
+        if await bot_logic.connect():
+            bot_logic.account_type = "LIVE 💰"
+            await q.edit_message_text(f"⚠️ **CONNECTED TO LIVE**\nBal: {bot_logic.balance}", reply_markup=main_keyboard(), parse_mode="Markdown")
+            
+    elif q.data == "TEST_BUY":
+        await bot_logic.execute_trade("CALL", "MANUAL-TEST")
+
+    elif q.data == "STOP_SCAN":
+        bot_logic.is_scanning = False
+        bot_logic.scanner_status = "💤 Offline"
+        await q.edit_message_text("🛑 Scanner stopped.", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     bot_logic.app = app
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("🤖 Bot Ready", reply_markup=keyboard())))
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("💎 **Sniper v5.7 (Live Status Edition)**", reply_markup=main_keyboard())))
     app.add_handler(CallbackQueryHandler(btn_handler))
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
