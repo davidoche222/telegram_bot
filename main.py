@@ -2,7 +2,6 @@ import asyncio
 import logging
 import time
 import numpy as np
-from datetime import datetime
 from deriv_api import DerivAPI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -13,13 +12,8 @@ REAL_TOKEN = "2hsJzopRHG5wUEb"
 APP_ID = 1089
 
 MARKET = "R_10"
-CANDLE_SEC = 30
-EXPIRY_CANDLES = 5
-DURATION_MINUTES = (CANDLE_SEC * EXPIRY_CANDLES) / 60.0 # 2.5m
-
-STAKE = 0.35
 EMA_PERIOD = 100
-COOLDOWN_SEC = 600 # 10 Minutes
+COOLDOWN_SEC = 600  # 10 Minutes mandatory cooldown
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -27,34 +21,28 @@ TELEGRAM_CHAT_ID = "7634818949"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ========================= MATH & INDICATORS =========================
-def get_ema(values, period):
-    if len(values) < period: return np.array([])
-    return np.array([sum(values[i-period:i])/period if i==period else 0 for i in range(len(values))]) # Simple init then EMA logic below
-
+# ========================= STRATEGY MATH =========================
 def calculate_indicators(candles):
     c = np.array([x['c'] for x in candles])
     h = np.array([x['h'] for x in candles])
     l = np.array([x['l'] for x in candles])
     o = np.array([x['o'] for x in candles])
-    
+
     # EMA 100
-    ema_vals = [c[0]]
+    ema = [c[0]]
     k = 2 / (EMA_PERIOD + 1)
-    for i in range(1, len(c)):
-        ema_vals.append(c[i] * k + ema_vals[-1] * (1 - k))
-    ema100 = np.array(ema_vals)
+    for price in c[1:]:
+        ema.append(price * k + ema[-1] * (1 - k))
+    ema100 = np.array(ema)
 
     # MACD (12, 26, 9)
-    def ema_func(data, p):
-        res = [data[0]]
-        alpha = 2/(p+1)
-        for val in data[1:]: res.append(val*alpha + res[-1]*(1-alpha))
+    def get_ema(data, p):
+        res = [data[0]]; alpha = 2/(p+1)
+        for v in data[1:]: res.append(v*alpha + res[-1]*(1-alpha))
         return np.array(res)
-    
-    macd_line = ema_func(c, 12) - ema_func(c, 26)
-    signal_line = ema_func(macd_line, 9)
-    hist = macd_line - signal_line
+    macd_line = get_ema(c, 12) - get_ema(c, 26)
+    sig_line = get_ema(macd_line, 9)
+    hist = macd_line - sig_line
 
     # PSAR (0.02, 0.2)
     psar = np.zeros(len(c))
@@ -62,14 +50,14 @@ def calculate_indicators(candles):
     for i in range(1, len(c)):
         psar[i] = psar[i-1] + af * (ep - psar[i-1])
         if up:
-            psar[i] = min(psar[i], l[i-1], l[max(0, i-2)])
+            psar[i] = min(psar[i], l[max(0, i-1)], l[max(0, i-2)])
             if l[i] < psar[i]: up = False; psar[i] = ep; af = 0.02; ep = l[i]
             elif h[i] > ep: ep = h[i]; af = min(0.2, af + 0.02)
         else:
-            psar[i] = max(psar[i], h[i-1], h[max(0, i-2)])
+            psar[i] = max(psar[i], h[max(0, i-1)], h[max(0, i-2)])
             if h[i] > psar[i]: up = True; psar[i] = ep; af = 0.02; ep = h[i]
             elif l[i] < ep: ep = l[i]; af = min(0.2, af + 0.02)
-            
+
     return ema100, psar, hist, o, h, l, c
 
 # ========================= BOT CORE =========================
@@ -82,22 +70,24 @@ class DerivSniperBot:
         self.is_scanning = False
         self.scanner_status = "💤 Offline"
         
-        self.active_trade_id = None
+        # Live Tracking
+        self.active_trade_info = None 
+        self.trade_start_time = 0
         self.cooldown_until = 0
         self.last_reason = "Waiting for data..."
         
-        # Stages
+        # Strategy Stages
         self.buy_stage = 0
         self.sell_stage = 0
         
-        # Stats
+        # Risk Management
         self.trades_today = 0
         self.consecutive_losses = 0
         self.pnl_today = 0.0
         self.balance = "0.00"
         self.trade_lock = asyncio.Lock()
 
-    async def connect(self):
+    async def connect(self) -> bool:
         try:
             self.api = DerivAPI(app_id=APP_ID)
             await self.api.authorize(self.active_token)
@@ -114,21 +104,20 @@ class DerivSniperBot:
     async def background_scanner(self):
         while self.is_scanning:
             if self.consecutive_losses >= 5:
-                self.is_scanning = False; self.scanner_status = "🛑 STOPPED (5 LOSSES)"
-                await self.app.bot.send_message(TELEGRAM_CHAT_ID, "🛑 **Bot Stopped**: 5 consecutive losses reached.")
+                self.is_scanning = False
+                self.scanner_status = "🛑 STOPPED (5 LOSSES)"
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, "🛑 **Safety Stop**: 5 consecutive losses reached. Bot deactivated.")
                 break
             
             if self.trades_today >= 20:
-                self.is_scanning = False; self.scanner_status = "🛑 DAILY LIMIT (20)"
+                self.is_scanning = False
+                self.scanner_status = "🛑 DAILY LIMIT (20) REACHED"
                 break
 
-            if self.active_trade_id or time.time() < self.cooldown_until:
-                await asyncio.sleep(5); continue
-
             try:
-                # 1. Get Ticks and build 30s Candles
-                resp = await self.api.ticks_history({"ticks_history": MARKET, "end": "latest", "count": 2000, "style": "ticks"})
-                ticks = list(zip(resp['history']['times'], resp['history']['prices']))
+                # 1. Build 30s Candles from Ticks
+                data = await self.api.ticks_history({"ticks_history": MARKET, "end": "latest", "count": 1500, "style": "ticks"})
+                ticks = list(zip(data['history']['times'], data['history']['prices']))
                 
                 candles = []
                 curr_t0 = ticks[0][0] - (ticks[0][0] % 30)
@@ -146,76 +135,88 @@ class DerivSniperBot:
                 # 2. Indicators
                 ema100, psar, hist, op, hi, lo, cl = calculate_indicators(candles)
                 
-                # 3. Trend & Slope
+                # 3. Trend Slope & Filters
                 slope = ema100[-1] - ema100[-6]
-                slope_threshold = max(1e-5, np.std(cl[-20:]) * 0.01)
-                
-                # 4. Strength Filters
+                slope_threshold = 0.00005 # Strict trend filter
                 avg_range = np.mean(hi[-20:] - lo[-20:])
-                sar_dist = abs(psar[-1] - cl[-1])
                 body = abs(cl[-1] - op[-1])
                 avg_body = np.mean(np.abs(cl[-6:-1] - op[-6:-1]))
 
-                # 5. SAR Flip Logic
+                # 4. Flip Detection
                 ps_above = psar[-1] > hi[-1]
                 ps_below = psar[-1] < lo[-1]
                 prev_ps_above = psar[-2] > hi[-2]
                 prev_ps_below = psar[-2] < lo[-2]
 
-                # --- SELL (PUT) LOGIC ---
+                # --- SELL Logic ---
                 if slope < -slope_threshold and cl[-1] < ema100[-1]:
                     if (not prev_ps_above) and ps_above:
-                        self.sell_stage = 1; self.buy_stage = 0; self.last_reason = "SELL: Stage 1 (1st Dot)"
+                        self.sell_stage = 1; self.buy_stage = 0; self.last_reason = "SELL: Flip 1 detected"
                     elif self.sell_stage == 1 and ps_above:
-                        self.sell_stage = 2; self.last_reason = "SELL: Stage 2 (Confirmed)"
+                        self.sell_stage = 2; self.last_reason = "SELL: Stage 2 confirmed"
                     
-                    if self.sell_stage == 2:
-                        if sar_dist >= 0.6 * avg_range and hist[-1] < 0 and hist[-1] < hist[-2] and cl[-1] < op[-1] and body >= avg_body:
-                            await self.execute_trade("PUT"); self.sell_stage = 0
-                        else: self.last_reason = "SELL: Waiting for MACD/Strong Candle"
-                else: self.sell_stage = 0
+                    if self.sell_stage == 2 and time.time() >= self.cooldown_until:
+                        if abs(psar[-1] - cl[-1]) >= 0.6 * avg_range and hist[-1] < hist[-2] and cl[-1] < op[-1] and body >= avg_body:
+                            await self.execute_trade("PUT", "AUTO"); self.sell_stage = 0
+                        else: self.last_reason = "SELL: Waiting for Momentum/Body"
+                else: 
+                    if cl[-1] > ema100[-1] or slope > 0: self.sell_stage = 0
 
-                # --- BUY (CALL) LOGIC ---
+                # --- BUY Logic ---
                 if slope > slope_threshold and cl[-1] > ema100[-1]:
                     if (not prev_ps_below) and ps_below:
-                        self.buy_stage = 1; self.sell_stage = 0; self.last_reason = "BUY: Stage 1 (1st Dot)"
+                        self.buy_stage = 1; self.sell_stage = 0; self.last_reason = "BUY: Flip 1 detected"
                     elif self.buy_stage == 1 and ps_below:
-                        self.buy_stage = 2; self.last_reason = "BUY: Stage 2 (Confirmed)"
+                        self.buy_stage = 2; self.last_reason = "BUY: Stage 2 confirmed"
                     
-                    if self.buy_stage == 2:
-                        if sar_dist >= 0.6 * avg_range and hist[-1] > 0 and hist[-1] > hist[-2] and cl[-1] > op[-1] and body >= avg_body:
-                            await self.execute_trade("CALL"); self.buy_stage = 0
-                        else: self.last_reason = "BUY: Waiting for MACD/Strong Candle"
-                else: self.buy_stage = 0
+                    if self.buy_stage == 2 and time.time() >= self.cooldown_until:
+                        if abs(psar[-1] - cl[-1]) >= 0.6 * avg_range and hist[-1] > hist[-2] and cl[-1] > op[-1] and body >= avg_body:
+                            await self.execute_trade("CALL", "AUTO"); self.buy_stage = 0
+                        else: self.last_reason = "BUY: Waiting for Momentum/Body"
+                else:
+                    if cl[-1] < ema100[-1] or slope < 0: self.buy_stage = 0
 
-                self.scanner_status = "📡 Scanning..."
-            except Exception as e: logger.error(f"Scanner Error: {e}")
-            await asyncio.sleep(10)
+                self.scanner_status = "📡 Scanning Market..."
+            except Exception as e:
+                logger.error(f"Scanner Error: {e}")
+            
+            await asyncio.sleep(15)
 
-    async def execute_trade(self, side):
+    async def execute_trade(self, side: str, source="MANUAL"):
+        if not self.api or self.active_trade_info: return
         async with self.trade_lock:
             try:
-                prop = await self.api.proposal({"proposal": 1, "amount": STAKE, "basis": "stake", "contract_type": side, "currency": "USD", "duration": int(EXPIRY_CANDLES * 30), "duration_unit": "s", "symbol": MARKET})
-                buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"]) + 0.01})
-                self.active_trade_id = buy["buy"]["contract_id"]
-                self.trades_today += 1
-                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **{side} Entered** (Second SAR Confirmed)\nDaily Trade: {self.trades_today}/20")
-                asyncio.create_task(self.check_result(self.active_trade_id))
-            except Exception as e: logger.error(f"Trade Error: {e}")
+                # Using 1.00 stake pattern from your first code
+                proposal = await self.api.proposal({
+                    "proposal": 1, "amount": 1.00, "basis": "stake",
+                    "contract_type": side, "currency": "USD",
+                    "duration": 150, "duration_unit": "s", "symbol": MARKET
+                })
+                buy = await self.api.buy({"buy": proposal["proposal"]["id"], "price": float(proposal["proposal"]["ask_price"]) + 0.02})
+                
+                self.active_trade_info = buy["buy"]["contract_id"]
+                self.trade_start_time = time.time()
+                if source == "AUTO": self.trades_today += 1
+                
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **{side} TRADE EXECUTED ({source})**\nStage 2 PSAR Confirmation\nMarket: {MARKET}")
+                asyncio.create_task(self.check_result(self.active_trade_info, source))
+            except Exception as e:
+                logger.error(f"Execution Error: {e}")
 
-    async def check_result(self, cid):
+    async def check_result(self, cid, source):
         await asyncio.sleep(160)
         try:
             res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
             profit = float(res['proposal_open_contract'].get('profit', 0))
-            self.pnl_today += profit
-            if profit <= 0: self.consecutive_losses += 1
-            else: self.consecutive_losses = 0
+            if source == "AUTO":
+                self.pnl_today += profit
+                if profit <= 0: self.consecutive_losses += 1
+                else: self.consecutive_losses = 0
             
             await self.fetch_balance()
-            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 **Finish**: {'✅ WIN' if profit > 0 else '❌ LOSS'} (${profit:.2f})\nStreak: {self.consecutive_losses}/5")
+            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 **TRADE FINISHED**\nResult: {'✅ WIN' if profit > 0 else '❌ LOSS'} (${profit:.2f})\nStreak: {self.consecutive_losses}/5 losses.")
         finally:
-            self.active_trade_id = None
+            self.active_trade_info = None
             self.cooldown_until = time.time() + COOLDOWN_SEC
 
 # ========================= UI =========================
@@ -223,39 +224,57 @@ bot_logic = DerivSniperBot()
 
 def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ START", callback_data="START"), InlineKeyboardButton("⏹️ STOP", callback_data="STOP")],
-        [InlineKeyboardButton("📊 STATUS", callback_data="STATUS")],
-        [InlineKeyboardButton("🧪 DEMO", callback_data="DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="REAL")]
+        [InlineKeyboardButton("▶️ START SCANNER", callback_data="START_SCAN"), InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
+        [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY"), InlineKeyboardButton("📊 STATUS", callback_data="STATUS")],
+        [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
     ])
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
+    
     if q.data == "STATUS":
+        await bot_logic.fetch_balance()
+        status_header = f"🤖 **Bot State**: `{bot_logic.scanner_status}`\n🔑 **Account**: `{bot_logic.account_type}`\n"
+        
+        trade_text = ""
+        if bot_logic.active_trade_info:
+            try:
+                res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
+                current_pnl = float(res['proposal_open_contract'].get('profit', 0))
+                pnl_icon = "🟢" if current_pnl >= 0 else "🔴"
+                elapsed = int(time.time() - bot_logic.trade_start_time)
+                remaining = max(0, 150 - elapsed)
+                trade_text = f"\n⏳ **Live Trade**: {pnl_icon} `${current_pnl:.2f}`\n⏱️ **Remaining**: `{remaining}s`\n"
+            except: trade_text = "\n⏳ **Trade Status**: `Updating...`\n"
+        
         cd = max(0, int(bot_logic.cooldown_until - time.time()))
-        msg = (f"📊 **STATUS**\nState: `{bot_logic.scanner_status}`\n"
-               f"Account: `{bot_logic.account_type}`\n"
-               f"Stages: B:{bot_logic.buy_stage} S:{bot_logic.sell_stage}\n"
-               f"Cooldown: `{cd}s`\n"
-               f"Last Reason: `{bot_logic.last_reason}`\n"
-               f"Today: {bot_logic.trades_today}/20 | Streak: {bot_logic.consecutive_losses}/5\n"
-               f"PnL: ${bot_logic.pnl_today:.2f} | Bal: {bot_logic.balance}")
-        await q.edit_message_text(msg, reply_markup=main_keyboard(), parse_mode="Markdown")
-    elif q.data == "START":
-        if not bot_logic.api: await q.message.reply_text("Connect first!"); return
+        summary = f"\n💰 **Balance**: `{bot_logic.balance}`\n🎯 **Today**: `{bot_logic.trades_today}/20` | **Streak**: `{bot_logic.consecutive_losses}/5`"
+        details = f"\n📈 **Stages**: `B:{bot_logic.buy_stage} S:{bot_logic.sell_stage}`\n⏱️ **Cooldown**: `{cd}s`\n💬 **Last**: `{bot_logic.last_reason}`"
+        
+        await q.edit_message_text(f"📊 **DETAILED STATUS**\n{status_header}{trade_text}{details}{summary}", reply_markup=main_keyboard(), parse_mode="Markdown")
+
+    elif q.data == "START_SCAN":
+        if not bot_logic.api: await q.edit_message_text("❌ Connect Account First!", reply_markup=main_keyboard()); return
         bot_logic.is_scanning = True; asyncio.create_task(bot_logic.background_scanner())
-        await q.edit_message_text("🔍 **Scanner Started**", reply_markup=main_keyboard())
-    elif q.data == "STOP":
-        bot_logic.is_scanning = False; await q.edit_message_text("🛑 **Stopped**", reply_markup=main_keyboard())
-    elif q.data == "DEMO":
+        await q.edit_message_text("🔍 **SCANNER ACTIVE**\nStrategy: Strict Second SAR Confirmation", reply_markup=main_keyboard(), parse_mode="Markdown")
+
+    elif q.data == "SET_DEMO":
         bot_logic.active_token = DEMO_TOKEN; await bot_logic.connect(); bot_logic.account_type = "DEMO"
-        await q.edit_message_text(f"Connected DEMO. Bal: {bot_logic.balance}", reply_markup=main_keyboard())
-    elif q.data == "REAL":
-        bot_logic.active_token = REAL_TOKEN; await bot_logic.connect(); bot_logic.account_type = "REAL"
-        await q.edit_message_text(f"Connected REAL. Bal: {bot_logic.balance}", reply_markup=main_keyboard())
+        await q.edit_message_text(f"✅ Connected to DEMO\nBal: {bot_logic.balance}", reply_markup=main_keyboard())
+            
+    elif q.data == "SET_REAL":
+        bot_logic.active_token = REAL_TOKEN; await bot_logic.connect(); bot_logic.account_type = "LIVE 💰"
+        await q.edit_message_text(f"⚠️ **CONNECTED TO LIVE**\nBal: {bot_logic.balance}", reply_markup=main_keyboard(), parse_mode="Markdown")
+            
+    elif q.data == "TEST_BUY": await bot_logic.execute_trade("CALL", "MANUAL-TEST")
+    elif q.data == "STOP_SCAN": bot_logic.is_scanning = False; bot_logic.scanner_status = "💤 Offline"
+
+async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text("💎 **Sniper v6.2 (Strict SAR Edition)**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     bot_logic.app = app
-    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("🤖 Second SAR Bot", reply_markup=main_keyboard())))
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(btn_handler))
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
