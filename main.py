@@ -57,7 +57,7 @@ class DerivSniperBot:
         self.is_scanning = False
         
         # Live Tracking
-        self.active_trade_info = None # Stores the Contract ID
+        self.active_trade_info = None 
         self.trade_start_time = 0
         self.last_rsi = 0
         self.last_ema = 0
@@ -69,11 +69,14 @@ class DerivSniperBot:
 
     async def connect(self) -> bool:
         try:
+            # Re-initialize API to ensure a fresh connection for the new token
             self.api = DerivAPI(app_id=APP_ID)
             await self.api.authorize(self.active_token)
             await self.fetch_balance()
             return True
-        except: return False
+        except Exception as e:
+            logger.error(f"Connect failed: {e}")
+            return False
 
     async def fetch_balance(self):
         try:
@@ -99,7 +102,6 @@ class DerivSniperBot:
                     self.last_ema = calculate_ema_manual(clean_prices, EMA_PERIOD)
                     self.last_rsi = calculate_rsi_manual(clean_prices, RSI_PERIOD)
 
-                    # STRATEGY TRIGGER
                     if self.last_price > self.last_ema and self.last_rsi < 40:
                         await self.execute_trade("CALL", "AUTO")
                         await asyncio.sleep(305) 
@@ -126,7 +128,8 @@ class DerivSniperBot:
                 
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **TRADE PLACED**\nType: {side}\nMarket: {self.current_symbol}")
                 asyncio.create_task(self.check_result(self.active_trade_info))
-            except: pass
+            except Exception as e:
+                logger.error(f"Execution Error: {e}")
 
     async def check_result(self, cid):
         await asyncio.sleep((DURATION * 60) + 10)
@@ -146,10 +149,11 @@ class DerivSniperBot:
 bot_logic = DerivSniperBot()
 
 def main_keyboard():
+    # 🔥 UPDATED: Added LIVE and DEMO buttons side by side
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("▶️ START SCANNER", callback_data="START_SCAN"), InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
         [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY"), InlineKeyboardButton("📊 STATUS", callback_data="STATUS")],
-        [InlineKeyboardButton("🧪 CONNECT DEMO", callback_data="SET_DEMO")]
+        [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
     ])
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -158,40 +162,49 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     
     if q.data == "STATUS":
         await bot_logic.fetch_balance()
-        
-        # 📊 INDICATOR BLOCK
         ind_text = f"📉 **MARKET**: `{bot_logic.current_symbol}`\n"
         ind_text += f"💵 **Price**: `{bot_logic.last_price:.2f}`\n"
         ind_text += f"⚡ **RSI**: `{bot_logic.last_rsi:.1f}` | **EMA**: `{bot_logic.last_ema:.2f}`\n"
         
-        # 🕒 ACTIVE TRADE BLOCK
         trade_text = "✨ **Active Trade**: `None`"
         if bot_logic.active_trade_info:
             elapsed = int(time.time() - bot_logic.trade_start_time)
             remaining = max(0, (DURATION * 60) - elapsed)
             trade_text = f"⏳ **Active Trade**: `{bot_logic.active_trade_info}`\n⏱️ **Remaining**: `{remaining}s`"
 
-        # 💰 SUMMARY BLOCK
         summary = f"\n--- --- ---\n💰 **Balance**: `{bot_logic.balance}`\n🏆 **W/L**: `{bot_logic.wins_today}/{bot_logic.losses_today}`\n💵 **PnL Today**: `${bot_logic.pnl_today:.2f}`"
         
-        full_text = f"📊 **LIVE STATUS**\n{ind_text}\n{trade_text}\n{summary}"
-        await q.edit_message_text(full_text, reply_markup=main_keyboard(), parse_mode="Markdown")
+        await q.edit_message_text(f"📊 **LIVE STATUS**\n{ind_text}\n{trade_text}\n{summary}", reply_markup=main_keyboard(), parse_mode="Markdown")
 
     elif q.data == "START_SCAN":
+        if not bot_logic.api:
+            await q.edit_message_text("❌ Connect to Demo or Live first!", reply_markup=main_keyboard())
+            return
         bot_logic.is_scanning = True
         asyncio.create_task(bot_logic.background_scanner())
         await q.edit_message_text("🔍 Scanner active. Check /status for live updates.", reply_markup=main_keyboard())
 
-    elif q.data in ("SET_DEMO", "SET_REAL"):
+    elif q.data == "SET_DEMO":
         bot_logic.active_token = DEMO_TOKEN
         if await bot_logic.connect():
-            await q.edit_message_text(f"✅ Connected!\nBal: {bot_logic.balance}", reply_markup=main_keyboard())
+            await q.edit_message_text(f"✅ Connected to DEMO!\nBal: {bot_logic.balance}", reply_markup=main_keyboard())
+            
+    elif q.data == "SET_REAL":
+        bot_logic.active_token = REAL_TOKEN
+        if await bot_logic.connect():
+            await q.edit_message_text(f"⚠️ **CONNECTED TO LIVE**\nBal: {bot_logic.balance}", reply_markup=main_keyboard(), parse_mode="Markdown")
+        else:
+            await q.edit_message_text("❌ Live Connection Failed. Check Token.", reply_markup=main_keyboard())
             
     elif q.data == "TEST_BUY":
         await bot_logic.execute_trade("CALL", "MANUAL")
 
+    elif q.data == "STOP_SCAN":
+        bot_logic.is_scanning = False
+        await q.edit_message_text("🛑 Scanner stopped.", reply_markup=main_keyboard())
+
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper v5.2 Live Status**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper v5.3 (Live/Demo Enabled)**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
