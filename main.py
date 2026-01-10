@@ -11,8 +11,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ========================= CONFIG =========================
-DEMO_TOKEN = "PASTE_DEMO_TOKEN"
-REAL_TOKEN = "PASTE_REAL_TOKEN"
+DEMO_TOKEN = "YYSlMBIcTXqOozU"
+REAL_TOKEN = "2NFJTH3JgXWFCcv"
 APP_ID = 1089
 
 SYMBOL = "R_10"
