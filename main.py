@@ -86,7 +86,6 @@ class DerivSniperBot:
 
     async def background_scanner(self):
         while self.is_scanning:
-            # 🛑 CHECK SURVIVAL LIMITS (3 Trades or 3 Losses)
             if self.trades_today >= 3 or self.losses_today >= 3:
                 self.is_scanning = False
                 self.scanner_status = "🛑 DAILY LIMIT REACHED"
@@ -94,27 +93,21 @@ class DerivSniperBot:
                 break
 
             try:
-                # 1. GET M5 TREND (Filter)
                 m5_data = await self.api.ticks_history({"ticks_history": MARKET, "end": "latest", "count": 100, "style": "ticks"})
                 m5_prices = [float(p) for p in m5_data['history']['prices']]
                 m5_ema = calculate_ema_manual(m5_prices, EMA_PERIOD)
                 self.m5_trend = "CALL" if m5_prices[-1] > m5_ema else "PUT"
 
-                # 2. GET M1 DATA (Entry Timing)
                 m1_data = await self.api.ticks_history({"ticks_history": MARKET, "end": "latest", "count": 60, "style": "ticks"})
                 m1_prices = [float(p) for p in m1_data['history']['prices']]
                 self.last_rsi = calculate_rsi_manual(m1_prices, RSI_PERIOD)
                 curr_p = m1_prices[-1]
                 m1_ema = calculate_ema_manual(m1_prices, EMA_PERIOD)
 
-                # 3. SIGNAL LOGIC (80% Price Action Pullback / 20% RSI)
                 if self.m5_trend == "CALL":
-                    # Pullback to EMA + RSI in warm range
                     if curr_p <= (m1_ema * 1.0005) and 45 <= self.last_rsi <= 60:
                         await self.execute_trade("CALL", "AUTO")
-                
                 elif self.m5_trend == "PUT":
-                    # Bounce to EMA + RSI in cool range
                     if curr_p >= (m1_ema * 0.9995) and 40 <= self.last_rsi <= 55:
                         await self.execute_trade("PUT", "AUTO")
 
@@ -137,14 +130,11 @@ class DerivSniperBot:
                 
                 self.active_trade_info = buy["buy"]["contract_id"]
                 self.trade_start_time = time.time()
-                
-                # Only increment daily trade count for AUTO/REAL trades, not manual tests
-                if source == "AUTO":
-                    self.trades_today += 1
+                if source == "AUTO": self.trades_today += 1
                 
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **{side} TRADE EXECUTED ({source})**\nTrend: {self.m5_trend}\nMarket: {MARKET}")
                 asyncio.create_task(self.check_result(self.active_trade_info, source))
-                await asyncio.sleep(305) # Prevent overlapping trades
+                await asyncio.sleep(305)
             except Exception as e:
                 logger.error(f"Execution Error: {e}")
 
@@ -153,11 +143,9 @@ class DerivSniperBot:
         try:
             res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
             profit = float(res['proposal_open_contract'].get('profit', 0))
-            
             if source == "AUTO":
                 self.pnl_today += profit
                 if profit <= 0: self.losses_today += 1
-            
             await self.fetch_balance()
             await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 **TRADE FINISHED**\nResult: {'✅ WIN' if profit > 0 else '❌ LOSS'} (${profit:.2f})\nSession: {self.trades_today}/3 trades.")
         finally:
@@ -181,8 +169,26 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await bot_logic.fetch_balance()
         status_header = f"🤖 **Bot State**: `{bot_logic.scanner_status}`\n🔑 **Account**: `{bot_logic.account_type}`\n"
         ind_text = f"📈 **M5 Trend**: `{bot_logic.m5_trend}`\n⚡ **RSI**: `{bot_logic.last_rsi:.1f}`\n"
+        
+        # --- NEW LIVE TRACKING LOGIC ---
+        trade_text = ""
+        if bot_logic.active_trade_info:
+            try:
+                # Ask Deriv for current status of the open contract
+                res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
+                current_pnl = float(res['proposal_open_contract'].get('profit', 0))
+                pnl_icon = "🟢" if current_pnl >= 0 else "🔴"
+                
+                elapsed = int(time.time() - bot_logic.trade_start_time)
+                remaining = max(0, (DURATION * 60) - elapsed)
+                mins, secs = divmod(remaining, 60)
+                
+                trade_text = f"\n⏳ **Live Trade**: {pnl_icon} `${current_pnl:.2f}`\n⏱️ **Time Remaining**: `{mins:02d}:{secs:02d}`\n"
+            except:
+                trade_text = "\n⏳ **Trade Status**: `Updating...`\n"
+
         summary = f"\n💰 **Balance**: `{bot_logic.balance}`\n🎯 **Trades**: `{bot_logic.trades_today}/3` | **Losses**: `{bot_logic.losses_today}/3`"
-        await q.edit_message_text(f"📊 **DETAILED STATUS**\n{status_header}{ind_text}{summary}", reply_markup=main_keyboard(), parse_mode="Markdown")
+        await q.edit_message_text(f"📊 **DETAILED STATUS**\n{status_header}{ind_text}{trade_text}{summary}", reply_markup=main_keyboard(), parse_mode="Markdown")
 
     elif q.data == "START_SCAN":
         if not bot_logic.api:
@@ -213,7 +219,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("🛑 Scanner stopped.", reply_markup=main_keyboard())
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper v5.6 (Survival Mode)**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper v5.7 (Live Status Edition)**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
