@@ -1,7 +1,6 @@
 import asyncio
 import logging
-import pandas as pd
-import numpy as np
+from decimal import Decimal, ROUND_HALF_UP
 from deriv_api import DerivAPI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -22,18 +21,38 @@ TELEGRAM_CHAT_ID = "7634818949"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ========================= STRATEGY =========================
-def calculate_indicators(ticks):
-    df = pd.DataFrame(ticks)
-    # EMA
-    df['ema'] = df['quote'].ewm(span=EMA_PERIOD, adjust=False).mean()
-    # RSI
-    delta = df['quote'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-    return df.iloc[-1]
+# ========================= MANUAL MATH BRAIN =========================
+def calculate_ema_manual(prices, period):
+    """Calculates Exponential Moving Average using pure math"""
+    if len(prices) < period: return prices[-1]
+    multiplier = 2 / (period + 1)
+    ema = sum(prices[:period]) / period  # Start with SMA
+    for price in prices[period:]:
+        ema = (price - ema) * multiplier + ema
+    return ema
+
+def calculate_rsi_manual(prices, period):
+    """Calculates Relative Strength Index using pure math"""
+    if len(prices) < period + 1: return 50
+    gains = []
+    losses = []
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i-1]
+        gains.append(max(0, change))
+        losses.append(max(0, -change))
+    
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    
+    if avg_loss == 0: return 100
+    
+    # Smoothing RSI
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        
+    rs = avg_gain / avg_loss if avg_loss != 0 else 0
+    return 100 - (100 / (1 + rs))
 
 # ========================= BOT CORE =========================
 class DerivSniperBot:
@@ -66,21 +85,25 @@ class DerivSniperBot:
         except: pass
 
     async def background_scanner(self):
-        logger.info("🔍 Scanner starting...")
+        logger.info("🔍 Library-free Scanner starting...")
         while self.is_scanning:
             try:
                 ticks_data = await self.api.ticks_history({
                     "ticks_history": self.current_symbol,
                     "end": "latest", "count": 50, "style": "ticks"
                 })
-                prices = [{"quote": float(t['quote'])} for t in ticks_data['history']['prices']]
-                latest = calculate_indicators(prices)
+                # Extract simple list of numbers
+                prices = [float(t['quote']) for t in ticks_data['history']['prices']]
                 
-                # Signal Logic
-                if latest['quote'] > latest['ema'] and latest['rsi'] < 40:
+                cur_price = prices[-1]
+                ema_val = calculate_ema_manual(prices, EMA_PERIOD)
+                rsi_val = calculate_rsi_manual(prices, RSI_PERIOD)
+
+                # Signal Logic (Trend + Oversold/Overbought)
+                if cur_price > ema_val and rsi_val < 40:
                     await self.execute_trade("CALL", "AUTO-STRATEGY")
-                    await asyncio.sleep(305) # Prevent double trades
-                elif latest['quote'] < latest['ema'] and latest['rsi'] > 60:
+                    await asyncio.sleep(305) 
+                elif cur_price < ema_val and rsi_val > 60:
                     await self.execute_trade("PUT", "AUTO-STRATEGY")
                     await asyncio.sleep(305)
             except Exception as e:
@@ -91,34 +114,28 @@ class DerivSniperBot:
         if not self.api or self.active_trade_info: return
         async with self.trade_lock:
             try:
-                # Use Payout basis so Deriv decides the stake
                 proposal = await self.api.proposal({
                     "proposal": 1, "amount": 1.00, "basis": "payout",
                     "contract_type": side, "currency": "USD",
                     "duration": DURATION, "duration_unit": "m", "symbol": self.current_symbol
                 })
-                
-                if "error" in proposal:
-                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Error: {proposal['error']['message']}")
-                    return
+                if "error" in proposal: return
 
                 buy = await self.api.buy({"buy": proposal["proposal"]["id"], "price": 10.0})
                 self.active_trade_info = buy["buy"]["contract_id"]
                 
                 await self.app.bot.send_message(
                     TELEGRAM_CHAT_ID, 
-                    f"🚀 **{source} TRADE**\nSide: {side}\nStake: ${buy['buy']['buy_price']}\nMarket: {self.current_symbol}"
+                    f"🚀 **{source}**\n{side} on {self.current_symbol}\nStake: ${buy['buy']['buy_price']}"
                 )
                 asyncio.create_task(self.check_result(self.active_trade_info))
-            except Exception as e:
-                logger.error(f"Trade Execution Error: {e}")
+            except: pass
 
     async def check_result(self, cid):
         await asyncio.sleep((DURATION * 60) + 10)
         try:
             res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
-            c = res['proposal_open_contract']
-            profit = float(c.get('profit', 0))
+            profit = float(res['proposal_open_contract'].get('profit', 0))
             self.pnl_today += profit
             if profit > 0: self.wins_today += 1 
             else: self.losses_today += 1
@@ -140,31 +157,26 @@ def main_keyboard():
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     await q.answer()
-    
     if q.data in ("SET_DEMO", "SET_REAL"):
         bot_logic.active_token = DEMO_TOKEN if q.data == "SET_DEMO" else REAL_TOKEN
         if await bot_logic.connect():
             await q.edit_message_text(f"✅ Connected!\nBal: {bot_logic.balance}", reply_markup=main_keyboard())
-    
     elif q.data == "START_SCAN":
         bot_logic.is_scanning = True
         asyncio.create_task(bot_logic.background_scanner())
-        await q.edit_message_text("🔍 **SCANNER ON** (RSI/EMA)", reply_markup=main_keyboard())
-
+        await q.edit_message_text("🔍 **SCANNER ON** (No-Library Mode)", reply_markup=main_keyboard())
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
         await q.edit_message_text("🛑 **SCANNER OFF**", reply_markup=main_keyboard())
-
     elif q.data == "TEST_BUY":
         await bot_logic.execute_trade("CALL", "MANUAL-TEST")
-
     elif q.data == "STATUS":
         await bot_logic.fetch_balance()
         txt = f"📊 **STATUS**\n💰 Bal: {bot_logic.balance}\n🏆 W/L: {bot_logic.wins_today}/{bot_logic.losses_today}\n💵 PnL: ${bot_logic.pnl_today:.2f}"
         await q.edit_message_text(txt, reply_markup=main_keyboard())
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper v4.8 Strategy + Manual**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper v4.9 (Zero-Library)**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
