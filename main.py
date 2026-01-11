@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 import numpy as np
+from datetime import datetime
 from deriv_api import DerivAPI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -11,7 +12,6 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "2hsJzopRHG5wUEb"
 APP_ID = 1089
 
-# UPDATED: 5 MARKETS & $0.52 STAKE
 MARKETS = ["R_10", "R_25", "R_50", "R_75", "R_100"] 
 BASE_STAKE = 0.52
 MARTINGALE_MULTIPLIER = 2.1
@@ -70,18 +70,18 @@ class DerivSniperBot:
         self.scanner_status = "💤 Offline"
         self.active_trade_info = None 
         self.cooldown_until = 0
-        self.last_reason = "Ready"
-        
-        # New: Tracking current stake for Martingale
+        self.last_reason = "System Initialized"
         self.current_stake = BASE_STAKE
-        
-        # Tracking stages for 5 markets
         self.stages = {m: {"buy": 0, "sell": 0} for m in MARKETS}
-        
         self.trades_today = 0
         self.consecutive_losses = 0
         self.balance = "0.00"
         self.trade_lock = asyncio.Lock()
+        
+        # Weekly Reporting Stats
+        self.weekly_wins = 0
+        self.weekly_losses = 0
+        self.weekly_profit = 0.0
 
     async def connect(self):
         try:
@@ -97,6 +97,29 @@ class DerivSniperBot:
             self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
         except: pass
 
+    async def report_scheduler(self):
+        """Checks every hour if it's Sunday night to send the report."""
+        while True:
+            now = datetime.now()
+            # If Sunday and 23:00 - 23:59
+            if now.weekday() == 6 and now.hour == 23:
+                report = (
+                    f"📅 **WEEKLY PROFIT REPORT**\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"✅ Wins: `{self.weekly_wins}`\n"
+                    f"❌ Losses: `{self.weekly_losses}`\n"
+                    f"💰 Net Profit: `${self.weekly_profit:.2f}`\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"Resetting stats for the new week..."
+                )
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, report, parse_mode="Markdown")
+                # Reset weekly counters
+                self.weekly_wins = 0
+                self.weekly_losses = 0
+                self.weekly_profit = 0.0
+                await asyncio.sleep(3600) # Sleep 1 hour so it doesn't double-send
+            await asyncio.sleep(1800) # Check every 30 mins
+
     async def background_scanner(self):
         while self.is_scanning:
             for symbol in MARKETS:
@@ -108,7 +131,6 @@ class DerivSniperBot:
 
                 self.scanner_status = f"📡 Scanning {symbol}..."
                 try:
-                    # Fetch 1000 ticks for building candles
                     data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 1000, "style": "ticks"})
                     ticks = list(zip(data['history']['times'], data['history']['prices']))
                     
@@ -125,7 +147,6 @@ class DerivSniperBot:
                     if len(candles) < 110: continue
                     ema100, psar, hist, op, hi, lo, cl = calculate_indicators(candles)
                     
-                    # Faster Entry Tweaks (Reduced Slope Requirement)
                     vol_factor = 10.0 if "100" in symbol else (5.0 if "75" in symbol else 1.0)
                     slope = ema100[-1] - ema100[-5]
                     slope_threshold = 0.005 * vol_factor 
@@ -136,7 +157,6 @@ class DerivSniperBot:
                     prev_ps_above = psar[-2] > hi[-2]
                     prev_ps_below = psar[-2] < lo[-2]
 
-                    # Logic: Sell
                     if cl[-1] < ema100[-1] and slope < -slope_threshold:
                         if (not prev_ps_above) and ps_above: self.stages[symbol]["sell"] = 1
                         elif self.stages[symbol]["sell"] == 1 and ps_above:
@@ -145,7 +165,6 @@ class DerivSniperBot:
                                 self.stages[symbol]["sell"] = 0
                     else: self.stages[symbol]["sell"] = 0
 
-                    # Logic: Buy
                     if cl[-1] > ema100[-1] and slope > slope_threshold:
                         if (not prev_ps_below) and ps_below: self.stages[symbol]["buy"] = 1
                         elif self.stages[symbol]["buy"] == 1 and ps_below:
@@ -161,7 +180,6 @@ class DerivSniperBot:
         if self.active_trade_info: return
         async with self.trade_lock:
             try:
-                # Use current_stake (which might be Martingaled)
                 prop = await self.api.proposal({"proposal": 1, "amount": self.current_stake, "basis": "stake", "contract_type": side, "currency": "USD", "duration": 150, "duration_unit": "s", "symbol": symbol})
                 buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])})
                 self.active_trade_info = buy["buy"]["contract_id"]
@@ -176,13 +194,15 @@ class DerivSniperBot:
             res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
             profit = float(res['proposal_open_contract'].get('profit', 0))
             
+            # Update Weekly stats
+            self.weekly_profit += profit
             if profit <= 0:
+                self.weekly_losses += 1
                 self.consecutive_losses += 1
-                # MARTINGALE: Multiply stake for next trade
                 self.current_stake = round(self.current_stake * MARTINGALE_MULTIPLIER, 2)
             else:
+                self.weekly_wins += 1
                 self.consecutive_losses = 0
-                # RESET: Back to base stake
                 self.current_stake = BASE_STAKE
             
             await self.fetch_balance()
@@ -196,13 +216,36 @@ class DerivSniperBot:
 bot_logic = DerivSniperBot()
 
 def main_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("▶️ START SCANNER", callback_data="START_SCAN"), InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")], [InlineKeyboardButton("📊 STATUS", callback_data="STATUS")], [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ START SCANNER", callback_data="START_SCAN"), InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
+        [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY"), InlineKeyboardButton("📊 STATUS", callback_data="STATUS")],
+        [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
+    ])
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     if q.data == "STATUS":
         await bot_logic.fetch_balance()
-        txt = f"🤖 **Status**: `{bot_logic.scanner_status}`\n💰 **Bal**: `{bot_logic.balance}`\n🎲 **Next Stake**: `${bot_logic.current_stake}`\n🎯 **Today**: `{bot_logic.trades_today}` Trades"
+        cd = max(0, int(bot_logic.cooldown_until - time.time()))
+        
+        market_ov = ""
+        for m in MARKETS:
+            s_icon = "📍" if (bot_logic.stages[m]["buy"] == 1 or bot_logic.stages[m]["sell"] == 1) else "⚪"
+            market_ov += f"`{m}:{s_icon}` "
+
+        txt = (
+            f"📊 **DETAILED BOT STATUS**\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🤖 **Scan Status**: `{bot_logic.scanner_status}`\n"
+            f"💰 **Balance**: `{bot_logic.balance}`\n"
+            f"🎲 **Next Stake**: `${bot_logic.current_stake}`\n"
+            f"🔥 **Loss Streak**: `{bot_logic.consecutive_losses}`\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"📈 **Market Stages (1=Ready)**:\n{market_ov}\n"
+            f"⏱️ **Cooldown**: `{cd}s` remaining\n"
+            f"📅 **Week P/L**: `${bot_logic.weekly_profit:.2f}`\n"
+            f"🎯 **Total Trades**: `{bot_logic.trades_today}`"
+        )
         await q.edit_message_text(txt, reply_markup=main_keyboard(), parse_mode="Markdown")
     elif q.data == "START_SCAN":
         bot_logic.is_scanning = True; asyncio.create_task(bot_logic.background_scanner())
@@ -213,10 +256,14 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif q.data == "SET_REAL":
         bot_logic.active_token = REAL_TOKEN; await bot_logic.connect()
         await q.edit_message_text(f"⚠️ **LIVE CONNECTED**", reply_markup=main_keyboard())
+    elif q.data == "TEST_BUY":
+        await bot_logic.execute_trade("R_10", "CALL")
     elif q.data == "STOP_SCAN": bot_logic.is_scanning = False
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper v7.0 (Martingale Edition)**", reply_markup=main_keyboard())
+    # Start the weekly report timer when bot starts
+    asyncio.create_task(bot_logic.report_scheduler())
+    await u.message.reply_text("💎 **Sniper v7.2 (Penta-Scanner + Weekly Reports)**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
