@@ -14,7 +14,7 @@ REAL_TOKEN = "2hsJzopRHG5wUEb"
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50", "R_75", "R_100"] 
-BASE_PAYOUT = 0.50  # Fixed Payout Target
+BASE_PAYOUT = 0.50  
 EMA_PERIOD = 100
 COOLDOWN_SEC = 300  
 MAX_TRADES_PER_DAY = 30
@@ -53,7 +53,9 @@ class DerivSniperBot:
             await self.api.authorize(self.active_token)
             await self.fetch_balance()
             return True
-        except: return False
+        except Exception as e:
+            logger.error(f"Connect error: {e}")
+            return False
 
     async def fetch_balance(self):
         if not self.api: return
@@ -63,13 +65,12 @@ class DerivSniperBot:
         except: pass
 
     async def execute_trade(self, symbol, side):
-        if not self.api or self.active_trade_info or not self.is_scanning: return
+        if not self.api or self.active_trade_info: return
         
-        # Stop if daily limit reached
         if self.trades_today >= MAX_TRADES_PER_DAY:
             self.is_scanning = False
             self.scanner_status = "🛑 Daily Limit Reached"
-            await self.app.bot.send_message(TELEGRAM_CHAT_ID, "🚨 **BOT STOPPED**: 30 trade daily limit reached.")
+            await self.app.bot.send_message(TELEGRAM_CHAT_ID, "🚨 **STOPPED**: Daily limit (30) reached.")
             return
 
         async with self.trade_lock:
@@ -82,6 +83,7 @@ class DerivSniperBot:
                     "duration_unit": "s", "symbol": symbol
                 })
                 
+                # Check for 0.35 minimum stake
                 required_stake = float(prop['proposal']['ask_price'])
                 if required_stake < 0.35:
                     prop = await self.api.proposal({
@@ -113,21 +115,69 @@ class DerivSniperBot:
                 self.consecutive_losses += 1
                 if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
                     self.is_scanning = False
-                    self.scanner_status = "🛑 Safety Stop (Losses)"
-                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, "🛑 **CRITICAL STOP**: 5 consecutive losses reached. Scanner disabled for safety.")
+                    self.scanner_status = "🛑 Safety Stop"
+                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, "🛑 **STOPPED**: 5 consecutive losses.")
             else:
                 self.weekly_wins += 1
-                self.consecutive_losses = 0 # Reset streak on win
+                self.consecutive_losses = 0
             
             await self.fetch_balance()
             status = '✅ WIN' if profit > 0 else '❌ LOSS'
-            msg = f"🏁 **{status}** (${float(profit):.2f})\nConsecutive Losses: {self.consecutive_losses}\nTrades Today: {self.trades_today}/30"
+            msg = f"🏁 **{status}** (${float(profit):.2f})\nLoss Streak: {self.consecutive_losses}\nTotal Trades: {self.trades_today}/30"
             await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
         finally:
             self.active_trade_info = None
             self.cooldown_until = time.time() + COOLDOWN_SEC
 
-# ========================= INDICATORS =========================
+    async def background_scanner(self):
+        while self.is_scanning:
+            if not self.api: 
+                await asyncio.sleep(2)
+                continue
+            for symbol in MARKETS:
+                if not self.is_scanning: break
+                if self.active_trade_info or time.time() < self.cooldown_until: 
+                    await asyncio.sleep(2)
+                    break 
+                try:
+                    self.scanner_status = f"📡 Scanning {symbol}..."
+                    data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 1000, "style": "ticks"})
+                    ticks = list(zip(data['history']['times'], data['history']['prices']))
+                    candles = []; curr_t0 = ticks[0][0] - (ticks[0][0] % 30); o = h = l = c = ticks[0][1]
+                    for t, p in ticks:
+                        t0 = t - (t % 30)
+                        if t0 != curr_t0:
+                            candles.append({'o':o, 'h':h, 'l':l, 'c':c})
+                            curr_t0, o, h, l, c = t0, p, p, p, p
+                        else: h, l, c = max(h, p), min(l, p), p
+                    
+                    if len(candles) < 110: continue
+                    ema100, psar, hist, op, hi, lo, cl = calculate_indicators(candles)
+                    vol_factor = 10.0 if "100" in symbol else (5.0 if "75" in symbol else 1.0)
+                    slope = ema100[-1] - ema100[-5]
+                    slope_threshold = 0.005 * vol_factor
+                    avg_range = np.mean(hi[-10:] - lo[-10:])
+                    
+                    if cl[-1] < ema100[-1] and slope < -slope_threshold:
+                        if psar[-1] > hi[-1] and not (psar[-2] > hi[-2]): self.stages[symbol]["sell"] = 1
+                        elif self.stages[symbol]["sell"] == 1 and psar[-1] > hi[-1]:
+                            if hist[-1] < 0 and abs(cl[-1]-op[-1]) > (avg_range * 0.1): 
+                                await self.execute_trade(symbol, "PUT")
+                                self.stages[symbol]["sell"] = 0
+                    else: self.stages[symbol]["sell"] = 0
+
+                    if cl[-1] > ema100[-1] and slope > slope_threshold:
+                        if psar[-1] < lo[-1] and not (psar[-2] < lo[-2]): self.stages[symbol]["buy"] = 1
+                        elif self.stages[symbol]["buy"] == 1 and psar[-1] < lo[-1]:
+                            if hist[-1] > 0 and abs(cl[-1]-op[-1]) > (avg_range * 0.1): 
+                                await self.execute_trade(symbol, "CALL")
+                                self.stages[symbol]["buy"] = 0
+                    else: self.stages[symbol]["buy"] = 0
+                except Exception as e:
+                    logger.debug(f"Scanner skip {symbol}: {e}")
+                await asyncio.sleep(1.2)
+
+# ========================= UTILITIES =========================
 def calculate_indicators(candles):
     c = np.array([x['c'] for x in candles]); h = np.array([x['h'] for x in candles])
     l = np.array([x['l'] for x in candles]); o = np.array([x['o'] for x in candles])
@@ -153,38 +203,47 @@ def calculate_indicators(candles):
             elif l[i] < ep: ep = l[i]; af = min(0.2, af + 0.02)
     return ema100, psar, hist, o, h, l, c
 
-# ========================= SCANNER & UI =========================
-    async def background_scanner(self):
-        while self.is_scanning:
-            if not self.api: await asyncio.sleep(2); continue
-            for symbol in MARKETS:
-                if not self.is_scanning: break
-                if self.active_trade_info or time.time() < self.cooldown_until: await asyncio.sleep(2); break 
-                try:
-                    self.scanner_status = f"📡 Scanning {symbol}..."
-                    data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 1000, "style": "ticks"})
-                    ticks = list(zip(data['history']['times'], data['history']['prices']))
-                    candles = []; curr_t0 = ticks[0][0] - (ticks[0][0] % 30); o = h = l = c = ticks[0][1]
-                    for t, p in ticks:
-                        t0 = t - (t % 30)
-                        if t0 != curr_t0: candles.append({'o':o, 'h':h, 'l':l, 'c':c}); curr_t0, o, h, l, c = t0, p, p, p, p
-                        else: h, l, c = max(h, p), min(l, p), p
-                    if len(candles) < 110: continue
-                    ema100, psar, hist, op, hi, lo, cl = calculate_indicators(candles)
-                    vol_factor = 10.0 if "100" in symbol else (5.0 if "75" in symbol else 1.0)
-                    slope = ema100[-1] - ema100[-5]; slope_threshold = 0.005 * vol_factor; avg_range = np.mean(hi[-10:] - lo[-10:])
-                    
-                    if cl[-1] < ema100[-1] and slope < -slope_threshold:
-                        if psar[-1] > hi[-1] and not (psar[-2] > hi[-2]): self.stages[symbol]["sell"] = 1
-                        elif self.stages[symbol]["sell"] == 1 and psar[-1] > hi[-1]:
-                            if hist[-1] < 0 and abs(cl[-1]-op[-1]) > (avg_range * 0.1): await self.execute_trade(symbol, "PUT"); self.stages[symbol]["sell"] = 0
-                    else: self.stages[symbol]["sell"] = 0
-                    if cl[-1] > ema100[-1] and slope > slope_threshold:
-                        if psar[-1] < lo[-1] and not (psar[-2] < lo[-2]): self.stages[symbol]["buy"] = 1
-                        elif self.stages[symbol]["buy"] == 1 and psar[-1] < lo[-1]:
-                            if hist[-1] > 0 and abs(cl[-1]-op[-1]) > (avg_range * 0.1): await self.execute_trade(symbol, "CALL"); self.stages[symbol]["buy"] = 0
-                    else: self.stages[symbol]["buy"] = 0
-                except: pass
-                await asyncio.sleep(1.2)
+# ========================= UI & APP =========================
+bot_logic = DerivSniperBot()
 
-# ... [Maintain same report_scheduler, btn_handler, main_keyboard, and app.run_polling() logic] ...
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ START SCANNER", callback_data="START_SCAN"), InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
+        [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY"), InlineKeyboardButton("📊 STATUS", callback_data="STATUS")],
+        [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
+    ])
+
+async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query; await q.answer()
+    if q.data == "STATUS":
+        await bot_logic.fetch_balance()
+        txt = (f"📊 **BOT STATUS**\n🤖 Status: `{bot_logic.scanner_status}`\n💰 Balance: `{bot_logic.balance}`\n"
+               f"📉 Today's Trades: `{bot_logic.trades_today}/30`\n⚠️ Streak: `{bot_logic.consecutive_losses}/5`")
+        await q.edit_message_text(txt, reply_markup=main_keyboard(), parse_mode="Markdown")
+    elif q.data == "START_SCAN":
+        if not bot_logic.active_token:
+            await q.edit_message_text("❌ Connect DEMO or LIVE first!", reply_markup=main_keyboard()); return
+        bot_logic.is_scanning = True
+        asyncio.create_task(bot_logic.background_scanner())
+        await q.edit_message_text("🔍 **SCANNER ACTIVE**", reply_markup=main_keyboard())
+    elif q.data == "SET_DEMO":
+        bot_logic.active_token = DEMO_TOKEN; await bot_logic.connect()
+        await q.edit_message_text("✅ DEMO CONNECTED", reply_markup=main_keyboard())
+    elif q.data == "SET_REAL":
+        bot_logic.active_token = REAL_TOKEN; await bot_logic.connect()
+        await q.edit_message_text("⚠️ LIVE CONNECTED", reply_markup=main_keyboard())
+    elif q.data == "TEST_BUY":
+        await bot_logic.execute_trade("R_10", "CALL")
+    elif q.data == "STOP_SCAN": 
+        bot_logic.is_scanning = False
+        bot_logic.scanner_status = "⏹️ Stopped"
+
+async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text("💎 **Sniper Bot v7.8 Ready**", reply_markup=main_keyboard())
+
+if __name__ == "__main__":
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    bot_logic.app = app
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CallbackQueryHandler(btn_handler))
+    app.run_polling()
