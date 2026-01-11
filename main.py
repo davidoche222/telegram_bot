@@ -14,7 +14,7 @@ REAL_TOKEN = "2hsJzopRHG5wUEb"
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50", "R_75", "R_100"] 
-BASE_PAYOUT = 0.50  
+TARGET_PAYOUT = 1.00  
 EMA_PERIOD = 100
 COOLDOWN_SEC = 300  
 MAX_TRADES_PER_DAY = 30
@@ -36,7 +36,6 @@ class DerivSniperBot:
         self.scanner_status = "💤 Offline"
         self.active_trade_info = None 
         self.cooldown_until = 0
-        self.current_payout = Decimal(str(BASE_PAYOUT))
         self.stages = {m: {"buy": 0, "sell": 0} for m in MARKETS}
         self.balance = "0.00"
         self.trade_lock = asyncio.Lock()
@@ -74,11 +73,9 @@ class DerivSniperBot:
 
         async with self.trade_lock:
             try:
-                target_payout = float(round(float(self.current_payout), 2))
-                if target_payout <= 0: target_payout = 0.50
-
+                payout_val = float(TARGET_PAYOUT) 
                 prop = await self.api.proposal({
-                    "proposal": 1, "amount": target_payout, "basis": "payout",
+                    "proposal": 1, "amount": payout_val, "basis": "payout",
                     "contract_type": side, "currency": "USD", "duration": 150,
                     "duration_unit": "s", "symbol": symbol
                 })
@@ -94,7 +91,7 @@ class DerivSniperBot:
                 self.active_trade_info = buy["buy"]["contract_id"]
                 self.trades_today += 1
                 
-                msg = f"🚀 **{side} TRADE**\nMarket: `{symbol}`\nStake: `${float(prop['proposal']['ask_price']):.2f}`"
+                msg = f"🚀 **{side} TRADE**\nMarket: `{symbol}`\nStake: `${float(prop['proposal']['ask_price']):.2f}`\nPayout: `$1.00`"
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
                 asyncio.create_task(self.check_result(self.active_trade_info))
             except Exception as e:
@@ -131,9 +128,12 @@ class DerivSniperBot:
             for symbol in MARKETS:
                 if not self.is_scanning: break
                 self.current_market = symbol
+                
                 if self.active_trade_info or time.time() < self.cooldown_until:
                     await asyncio.sleep(1); break
+                
                 try:
+                    # 1. Fetch Ticks & Convert to 30s Candles
                     data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 600, "style": "ticks"})
                     ticks = list(zip(data['history']['times'], data['history']['prices']))
                     candles = []; curr_t0 = ticks[0][0] - (ticks[0][0] % 30); o = h = l = c = ticks[0][1]
@@ -147,29 +147,27 @@ class DerivSniperBot:
                     if len(candles) < 110: continue
                     ema100, psar, hist, op, hi, lo, cl = calculate_indicators(candles)
                     
-                    vol_factor = 10.0 if "100" in symbol else (5.0 if "75" in symbol else 1.0)
-                    slope = ema100[-1] - ema100[-5]
-                    slope_threshold = 0.005 * vol_factor
-                    avg_range = np.mean(hi[-10:] - lo[-10:])
+                    # --- START STRATEGY LOGIC ---
                     
-                    # SELL STRATEGY: Price < EMA + Down Slope + PSAR flip to Top + MACD Negative
-                    if cl[-1] < ema100[-1] and slope < -slope_threshold:
-                        if psar[-1] > hi[-1] and not (psar[-2] > hi[-2]): self.stages[symbol]["sell"] = 1
-                        elif self.stages[symbol]["sell"] == 1 and psar[-1] > hi[-1]:
-                            if hist[-1] < 0 and abs(cl[-1]-op[-1]) > (avg_range * 0.1): 
-                                await self.execute_trade(symbol, "PUT")
-                                self.stages[symbol]["sell"] = 0
-                    else: self.stages[symbol]["sell"] = 0
+                    # CALL SETUP: Price > EMA100 AND MACD > 0
+                    if cl[-1] > ema100[-1] and hist[-1] > 0:
+                        # TRIGGER: PSAR flips from above to below candle
+                        if psar[-1] < lo[-1] and psar[-2] > hi[-2]:
+                            logger.info(f"🎯 SIGNAL FOUND: CALL on {symbol}")
+                            await self.execute_trade(symbol, "CALL")
+                    
+                    # PUT SETUP: Price < EMA100 AND MACD < 0
+                    elif cl[-1] < ema100[-1] and hist[-1] < 0:
+                        # TRIGGER: PSAR flips from below to above candle
+                        if psar[-1] > hi[-1] and psar[-2] < lo[-2]:
+                            logger.info(f"🎯 SIGNAL FOUND: PUT on {symbol}")
+                            await self.execute_trade(symbol, "PUT")
+                    
+                    # --- END STRATEGY LOGIC ---
 
-                    # BUY STRATEGY: Price > EMA + Up Slope + PSAR flip to Bottom + MACD Positive
-                    if cl[-1] > ema100[-1] and slope > slope_threshold:
-                        if psar[-1] < lo[-1] and not (psar[-2] < lo[-2]): self.stages[symbol]["buy"] = 1
-                        elif self.stages[symbol]["buy"] == 1 and psar[-1] < lo[-1]:
-                            if hist[-1] > 0 and abs(cl[-1]-op[-1]) > (avg_range * 0.1): 
-                                await self.execute_trade(symbol, "CALL")
-                                self.stages[symbol]["buy"] = 0
-                    else: self.stages[symbol]["buy"] = 0
-                except: pass
+                except Exception as e:
+                    logger.debug(f"Scanner error on {symbol}: {e}")
+                
                 await asyncio.sleep(1)
 
 # ========================= UTILITIES =========================
@@ -190,7 +188,7 @@ def calculate_indicators(candles):
     macd_line = get_ema(c, 12) - get_ema(c, 26)
     sig_line = get_ema(macd_line, 9); hist = macd_line - sig_line
     
-    # PSAR
+    # PSAR Calculation
     psar = np.zeros(len(c)); up = True; af = 0.02; ep = h[0]; psar[0] = l[0]
     for i in range(1, len(c)):
         psar[i] = psar[i-1] + af * (ep - psar[i-1])
@@ -252,7 +250,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic.current_market = "None"
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper Bot v8.0 Dashboard**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper Bot v8.2 Dashboard**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
