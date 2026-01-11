@@ -70,7 +70,6 @@ class DerivSniperBot:
         self.scanner_status = "💤 Offline"
         self.active_trade_info = None 
         self.cooldown_until = 0
-        self.last_reason = "System Initialized"
         self.current_stake = BASE_STAKE
         self.stages = {m: {"buy": 0, "sell": 0} for m in MARKETS}
         self.trades_today = 0
@@ -92,16 +91,15 @@ class DerivSniperBot:
         except: return False
 
     async def fetch_balance(self):
+        if not self.api: return
         try:
             bal = await self.api.balance({"balance": 1})
             self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
         except: pass
 
     async def report_scheduler(self):
-        """Checks every hour if it's Sunday night to send the report."""
         while True:
             now = datetime.now()
-            # If Sunday and 23:00 - 23:59
             if now.weekday() == 6 and now.hour == 23:
                 report = (
                     f"📅 **WEEKLY PROFIT REPORT**\n"
@@ -109,19 +107,18 @@ class DerivSniperBot:
                     f"✅ Wins: `{self.weekly_wins}`\n"
                     f"❌ Losses: `{self.weekly_losses}`\n"
                     f"💰 Net Profit: `${self.weekly_profit:.2f}`\n"
-                    f"━━━━━━━━━━━━━━━\n"
-                    f"Resetting stats for the new week..."
                 )
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, report, parse_mode="Markdown")
-                # Reset weekly counters
-                self.weekly_wins = 0
-                self.weekly_losses = 0
-                self.weekly_profit = 0.0
-                await asyncio.sleep(3600) # Sleep 1 hour so it doesn't double-send
-            await asyncio.sleep(1800) # Check every 30 mins
+                self.weekly_wins = 0; self.weekly_losses = 0; self.weekly_profit = 0.0
+                await asyncio.sleep(3600)
+            await asyncio.sleep(1800)
 
     async def background_scanner(self):
         while self.is_scanning:
+            if not self.api: # Safety guard against NoneType error
+                self.scanner_status = "❌ Not Connected"
+                await asyncio.sleep(5); continue
+
             for symbol in MARKETS:
                 if not self.is_scanning: break
                 if self.active_trade_info: await asyncio.sleep(5); continue
@@ -129,8 +126,8 @@ class DerivSniperBot:
                 if time.time() < self.cooldown_until:
                     self.scanner_status = "⏱️ Cooldown"; await asyncio.sleep(2); break 
 
-                self.scanner_status = f"📡 Scanning {symbol}..."
                 try:
+                    self.scanner_status = f"📡 Scanning {symbol}..."
                     data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 1000, "style": "ticks"})
                     ticks = list(zip(data['history']['times'], data['history']['prices']))
                     
@@ -152,22 +149,17 @@ class DerivSniperBot:
                     slope_threshold = 0.005 * vol_factor 
                     avg_range = np.mean(hi[-10:] - lo[-10:])
 
-                    ps_above = psar[-1] > hi[-1]
-                    ps_below = psar[-1] < lo[-1]
-                    prev_ps_above = psar[-2] > hi[-2]
-                    prev_ps_below = psar[-2] < lo[-2]
-
                     if cl[-1] < ema100[-1] and slope < -slope_threshold:
-                        if (not prev_ps_above) and ps_above: self.stages[symbol]["sell"] = 1
-                        elif self.stages[symbol]["sell"] == 1 and ps_above:
+                        if (psar[-1] > hi[-1]) and (not (psar[-2] > hi[-2])): self.stages[symbol]["sell"] = 1
+                        elif self.stages[symbol]["sell"] == 1 and psar[-1] > hi[-1]:
                             if hist[-1] < 0 and abs(cl[-1]-op[-1]) > (avg_range * 0.1):
                                 await self.execute_trade(symbol, "PUT")
                                 self.stages[symbol]["sell"] = 0
                     else: self.stages[symbol]["sell"] = 0
 
                     if cl[-1] > ema100[-1] and slope > slope_threshold:
-                        if (not prev_ps_below) and ps_below: self.stages[symbol]["buy"] = 1
-                        elif self.stages[symbol]["buy"] == 1 and ps_below:
+                        if (psar[-1] < lo[-1]) and (not (psar[-2] < lo[-2])): self.stages[symbol]["buy"] = 1
+                        elif self.stages[symbol]["buy"] == 1 and psar[-1] < lo[-1]:
                             if hist[-1] > 0 and abs(cl[-1]-op[-1]) > (avg_range * 0.1):
                                 await self.execute_trade(symbol, "CALL")
                                 self.stages[symbol]["buy"] = 0
@@ -177,14 +169,17 @@ class DerivSniperBot:
                 await asyncio.sleep(1.5)
 
     async def execute_trade(self, symbol, side):
-        if self.active_trade_info: return
+        if not self.api or self.active_trade_info: return
         async with self.trade_lock:
             try:
-                prop = await self.api.proposal({"proposal": 1, "amount": self.current_stake, "basis": "stake", "contract_type": side, "currency": "USD", "duration": 150, "duration_unit": "s", "symbol": symbol})
+                # FIXED: Force minimum 0.35 and round to 2 decimals
+                final_stake = max(0.35, round(self.current_stake, 2))
+                
+                prop = await self.api.proposal({"proposal": 1, "amount": final_stake, "basis": "stake", "contract_type": side, "currency": "USD", "duration": 150, "duration_unit": "s", "symbol": symbol})
                 buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])})
                 self.active_trade_info = buy["buy"]["contract_id"]
                 self.trades_today += 1
-                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **{side} TRADE: {symbol}**\nStake: ${self.current_stake:.2f}")
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **{side} TRADE: {symbol}**\nStake: ${final_stake}")
                 asyncio.create_task(self.check_result(self.active_trade_info))
             except Exception as e: logger.error(f"Trade Error: {e}")
 
@@ -193,21 +188,17 @@ class DerivSniperBot:
         try:
             res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
             profit = float(res['proposal_open_contract'].get('profit', 0))
-            
-            # Update Weekly stats
             self.weekly_profit += profit
             if profit <= 0:
-                self.weekly_losses += 1
-                self.consecutive_losses += 1
-                self.current_stake = round(self.current_stake * MARTINGALE_MULTIPLIER, 2)
+                self.weekly_losses += 1; self.consecutive_losses += 1
+                self.current_stake = self.current_stake * MARTINGALE_MULTIPLIER
             else:
-                self.weekly_wins += 1
-                self.consecutive_losses = 0
+                self.weekly_wins += 1; self.consecutive_losses = 0
                 self.current_stake = BASE_STAKE
             
             await self.fetch_balance()
             status = '✅ WIN' if profit > 0 else '❌ LOSS'
-            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 **{status}** (${profit:.2f})\nNext Stake: ${self.current_stake:.2f}")
+            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 **{status}** (${profit:.2f})\nNext: ${max(0.35, round(self.current_stake, 2))}")
         finally:
             self.active_trade_info = None
             self.cooldown_until = time.time() + COOLDOWN_SEC
@@ -226,44 +217,37 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     if q.data == "STATUS":
         await bot_logic.fetch_balance()
-        cd = max(0, int(bot_logic.cooldown_until - time.time()))
-        
-        market_ov = ""
-        for m in MARKETS:
-            s_icon = "📍" if (bot_logic.stages[m]["buy"] == 1 or bot_logic.stages[m]["sell"] == 1) else "⚪"
-            market_ov += f"`{m}:{s_icon}` "
-
+        market_ov = "".join([f"`{m}:{'📍' if (bot_logic.stages[m]['buy']==1 or bot_logic.stages[m]['sell']==1) else '⚪'}` " for m in MARKETS])
         txt = (
             f"📊 **DETAILED BOT STATUS**\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"🤖 **Scan Status**: `{bot_logic.scanner_status}`\n"
+            f"🤖 **Status**: `{bot_logic.scanner_status}`\n"
             f"💰 **Balance**: `{bot_logic.balance}`\n"
-            f"🎲 **Next Stake**: `${bot_logic.current_stake}`\n"
-            f"🔥 **Loss Streak**: `{bot_logic.consecutive_losses}`\n"
+            f"🎲 **Next Stake**: `${max(0.35, round(bot_logic.current_stake, 2))}`\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"📈 **Market Stages (1=Ready)**:\n{market_ov}\n"
-            f"⏱️ **Cooldown**: `{cd}s` remaining\n"
-            f"📅 **Week P/L**: `${bot_logic.weekly_profit:.2f}`\n"
-            f"🎯 **Total Trades**: `{bot_logic.trades_today}`"
+            f"📈 **Market Stages**:\n{market_ov}\n"
+            f"📅 **Week P/L**: `${bot_logic.weekly_profit:.2f}`"
         )
         await q.edit_message_text(txt, reply_markup=main_keyboard(), parse_mode="Markdown")
     elif q.data == "START_SCAN":
+        if not bot_logic.active_token:
+            await q.edit_message_text("❌ Select DEMO or LIVE first!", reply_markup=main_keyboard())
+            return
         bot_logic.is_scanning = True; asyncio.create_task(bot_logic.background_scanner())
-        await q.edit_message_text("🔍 **5-MARKET SCANNER ACTIVE**\nStake: $0.52 + Martingale", reply_markup=main_keyboard())
+        await q.edit_message_text("🔍 **SCANNER ACTIVE**", reply_markup=main_keyboard())
     elif q.data == "SET_DEMO":
         bot_logic.active_token = DEMO_TOKEN; await bot_logic.connect()
-        await q.edit_message_text(f"✅ Connected DEMO", reply_markup=main_keyboard())
+        await q.edit_message_text(f"✅ DEMO CONNECTED", reply_markup=main_keyboard())
     elif q.data == "SET_REAL":
         bot_logic.active_token = REAL_TOKEN; await bot_logic.connect()
-        await q.edit_message_text(f"⚠️ **LIVE CONNECTED**", reply_markup=main_keyboard())
+        await q.edit_message_text(f"⚠️ LIVE CONNECTED", reply_markup=main_keyboard())
     elif q.data == "TEST_BUY":
         await bot_logic.execute_trade("R_10", "CALL")
     elif q.data == "STOP_SCAN": bot_logic.is_scanning = False
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    # Start the weekly report timer when bot starts
     asyncio.create_task(bot_logic.report_scheduler())
-    await u.message.reply_text("💎 **Sniper v7.2 (Penta-Scanner + Weekly Reports)**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper v7.4 (Fixed 0.35 + Test Buy)**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
