@@ -14,10 +14,11 @@ REAL_TOKEN = "2hsJzopRHG5wUEb"
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50", "R_75", "R_100"] 
-BASE_PAYOUT = 1.00  
-MARTINGALE_MULTIPLIER = 2.1
+BASE_PAYOUT = 0.50  # Fixed Payout Target
 EMA_PERIOD = 100
 COOLDOWN_SEC = 300  
+MAX_TRADES_PER_DAY = 30
+MAX_CONSECUTIVE_LOSSES = 5
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -40,6 +41,8 @@ class DerivSniperBot:
         self.balance = "0.00"
         self.trade_lock = asyncio.Lock()
         
+        self.trades_today = 0
+        self.consecutive_losses = 0
         self.weekly_wins = 0
         self.weekly_losses = 0
         self.weekly_profit = Decimal('0.00')
@@ -60,51 +63,43 @@ class DerivSniperBot:
         except: pass
 
     async def execute_trade(self, symbol, side):
-        """Martingale on Payout to ensure full recovery + profit."""
-        if not self.api or self.active_trade_info: return
+        if not self.api or self.active_trade_info or not self.is_scanning: return
+        
+        # Stop if daily limit reached
+        if self.trades_today >= MAX_TRADES_PER_DAY:
+            self.is_scanning = False
+            self.scanner_status = "🛑 Daily Limit Reached"
+            await self.app.bot.send_message(TELEGRAM_CHAT_ID, "🚨 **BOT STOPPED**: 30 trade daily limit reached.")
+            return
 
         async with self.trade_lock:
             try:
-                # 1. Precise Payout calculation
                 target_payout = float(self.current_payout.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
                 
-                # 2. Proposal Request
                 prop = await self.api.proposal({
-                    "proposal": 1,
-                    "amount": target_payout,
-                    "basis": "payout",
-                    "contract_type": side,
-                    "currency": "USD",
-                    "duration": 150,
-                    "duration_unit": "s",
-                    "symbol": symbol
+                    "proposal": 1, "amount": target_payout, "basis": "payout",
+                    "contract_type": side, "currency": "USD", "duration": 150,
+                    "duration_unit": "s", "symbol": symbol
                 })
                 
-                # 3. Stake Floor Check (0.35 USD)
                 required_stake = float(prop['proposal']['ask_price'])
                 if required_stake < 0.35:
-                    # Force payout higher to meet minimum stake requirement
                     prop = await self.api.proposal({
-                        "proposal": 1,
-                        "amount": 0.35,
-                        "basis": "stake",
-                        "contract_type": side,
-                        "currency": "USD",
-                        "duration": 150,
-                        "duration_unit": "s",
-                        "symbol": symbol
+                        "proposal": 1, "amount": 0.35, "basis": "stake",
+                        "contract_type": side, "currency": "USD", "duration": 150,
+                        "duration_unit": "s", "symbol": symbol
                     })
 
-                # 4. Final Purchase
                 buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])})
                 self.active_trade_info = buy["buy"]["contract_id"]
+                self.trades_today += 1
                 
                 msg = f"🚀 **{side} TRADE**\nMarket: `{symbol}`\nTarget Payout: `${target_payout:.2f}`\nStake: `${float(prop['proposal']['ask_price']):.2f}`"
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
                 asyncio.create_task(self.check_result(self.active_trade_info))
                 
             except Exception as e:
-                logger.error(f"Trade Execution Failed: {e}")
+                logger.error(f"Trade Error: {e}")
 
     async def check_result(self, cid):
         await asyncio.sleep(160)
@@ -115,16 +110,18 @@ class DerivSniperBot:
             
             if profit <= 0:
                 self.weekly_losses += 1
-                # Multiply payout for recovery + profit on next win
-                self.current_payout = (self.current_payout * Decimal(str(MARTINGALE_MULTIPLIER))).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                self.consecutive_losses += 1
+                if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                    self.is_scanning = False
+                    self.scanner_status = "🛑 Safety Stop (Losses)"
+                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, "🛑 **CRITICAL STOP**: 5 consecutive losses reached. Scanner disabled for safety.")
             else:
                 self.weekly_wins += 1
-                # Reset to base payout
-                self.current_payout = Decimal(str(BASE_PAYOUT))
+                self.consecutive_losses = 0 # Reset streak on win
             
             await self.fetch_balance()
             status = '✅ WIN' if profit > 0 else '❌ LOSS'
-            msg = f"🏁 **{status}** (${float(profit):.2f})\nNext Payout Goal: `${float(self.current_payout):.2f}`"
+            msg = f"🏁 **{status}** (${float(profit):.2f})\nConsecutive Losses: {self.consecutive_losses}\nTrades Today: {self.trades_today}/30"
             await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
         finally:
             self.active_trade_info = None
@@ -190,4 +187,4 @@ def calculate_indicators(candles):
                 except: pass
                 await asyncio.sleep(1.2)
 
-# ... [Standard Boilerplate for report_scheduler, btn_handler, main_keyboard, and app.run_polling() as in v7.5/7.6] ...
+# ... [Maintain same report_scheduler, btn_handler, main_keyboard, and app.run_polling() logic] ...
