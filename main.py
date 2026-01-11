@@ -103,6 +103,14 @@ class DerivSniperBot:
 
     async def background_scanner(self):
         while self.is_scanning:
+            # --- SMART STATUS UPDATE ---
+            if self.active_trade_info:
+                self.scanner_status = "🚀 In Trade"
+            elif time.time() < self.cooldown_until:
+                self.scanner_status = "⏱️ In Cooldown"
+            else:
+                self.scanner_status = "📡 Searching for Signal..."
+
             if self.consecutive_losses >= 5:
                 self.is_scanning = False
                 self.scanner_status = "🛑 STOPPED (5 LOSSES)"
@@ -115,7 +123,6 @@ class DerivSniperBot:
                 break
 
             try:
-                # 1. Build 30s Candles from Ticks
                 data = await self.api.ticks_history({"ticks_history": MARKET, "end": "latest", "count": 1500, "style": "ticks"})
                 ticks = list(zip(data['history']['times'], data['history']['prices']))
                 
@@ -132,17 +139,14 @@ class DerivSniperBot:
                 
                 if len(candles) < 110: continue
 
-                # 2. Indicators
                 ema100, psar, hist, op, hi, lo, cl = calculate_indicators(candles)
                 
-                # 3. Trend Slope & Filters
                 slope = ema100[-1] - ema100[-6]
-                slope_threshold = 0.00005 # Strict trend filter
+                slope_threshold = 0.00005 
                 avg_range = np.mean(hi[-20:] - lo[-20:])
                 body = abs(cl[-1] - op[-1])
                 avg_body = np.mean(np.abs(cl[-6:-1] - op[-6:-1]))
 
-                # 4. Flip Detection
                 ps_above = psar[-1] > hi[-1]
                 ps_below = psar[-1] < lo[-1]
                 prev_ps_above = psar[-2] > hi[-2]
@@ -176,7 +180,6 @@ class DerivSniperBot:
                 else:
                     if cl[-1] < ema100[-1] or slope < 0: self.buy_stage = 0
 
-                self.scanner_status = "📡 Scanning Market..."
             except Exception as e:
                 logger.error(f"Scanner Error: {e}")
             
@@ -186,7 +189,6 @@ class DerivSniperBot:
         if not self.api or self.active_trade_info: return
         async with self.trade_lock:
             try:
-                # Using 1.00 stake pattern from your first code
                 proposal = await self.api.proposal({
                     "proposal": 1, "amount": 1.00, "basis": "stake",
                     "contract_type": side, "currency": "USD",
@@ -218,6 +220,13 @@ class DerivSniperBot:
         finally:
             self.active_trade_info = None
             self.cooldown_until = time.time() + COOLDOWN_SEC
+            # Notification for cooldown ending
+            asyncio.create_task(self.notify_cooldown_end())
+
+    async def notify_cooldown_end(self):
+        await asyncio.sleep(COOLDOWN_SEC)
+        if self.is_scanning:
+            await self.app.bot.send_message(TELEGRAM_CHAT_ID, "📡 **Cooldown Ended**: Bot is now searching for the next signal.")
 
 # ========================= UI =========================
 bot_logic = DerivSniperBot()
@@ -234,7 +243,18 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     
     if q.data == "STATUS":
         await bot_logic.fetch_balance()
-        status_header = f"🤖 **Bot State**: `{bot_logic.scanner_status}`\n🔑 **Account**: `{bot_logic.account_type}`\n"
+        
+        # Priority-based status display
+        if not bot_logic.is_scanning:
+            current_state = "💤 Offline"
+        elif bot_logic.active_trade_info:
+            current_state = "🚀 In Trade"
+        elif time.time() < bot_logic.cooldown_until:
+            current_state = "⏱️ In Cooldown"
+        else:
+            current_state = "📡 Searching for Signal"
+
+        status_header = f"🤖 **Bot State**: `{current_state}`\n🔑 **Account**: `{bot_logic.account_type}`\n"
         
         trade_text = ""
         if bot_logic.active_trade_info:
@@ -270,7 +290,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif q.data == "STOP_SCAN": bot_logic.is_scanning = False; bot_logic.scanner_status = "💤 Offline"
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper v6.2 (Strict SAR Edition)**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper v6.3 (Smart Status Edition)**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
