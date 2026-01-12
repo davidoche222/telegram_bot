@@ -13,7 +13,7 @@ REAL_TOKEN = "2hsJzopRHG5wUEb"
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50", "R_75", "R_100"] 
-TARGET_PAYOUT = 0.50  # Payout $1.00 = ~$0.48 Net Profit
+TARGET_PAYOUT = 1.00  # Payout $1.00 = ~$0.48 Net Profit
 COOLDOWN_SEC = 300 
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
