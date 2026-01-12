@@ -64,12 +64,11 @@ class DerivSniperBot:
         except: pass
 
     async def execute_trade(self, symbol, side, retry=False):
-        """Execute trade with slippage protection and retry logic."""
         if not self.api or self.active_trade_info: return
         
         async with self.trade_lock:
             try:
-                # 1. Get current proposal
+                # 1. Get Proposal with subscribe:1
                 prop = await self.api.proposal({
                     "proposal": 1, "amount": float(TARGET_PAYOUT), "basis": "payout",
                     "contract_type": side, "currency": "USD", "duration": 150,
@@ -78,14 +77,13 @@ class DerivSniperBot:
                 
                 ask_price = float(prop['proposal']['ask_price'])
                 
-                # 2. Add Slippage Buffer (Max price we are willing to pay)
-                # Allowing a 1.5% move prevents the "market moved" error
+                # 2. Restored: Slippage/Price protection (Accepts move up to 1.5%)
                 max_buy_price = round(ask_price * 1.015, 2)
 
                 # 3. Buy the contract
                 buy = await self.api.buy({
                     "buy": prop["proposal"]["id"], 
-                    "price": max_buy_price
+                    "price": max_buy_price # This prevents the "Market Moved" error
                 })
                 
                 self.active_trade_info = buy["buy"]["contract_id"]
@@ -96,11 +94,10 @@ class DerivSniperBot:
                 asyncio.create_task(self.check_result(self.active_trade_info))
                 
             except Exception as e:
-                err = str(e)
-                if "moved too much" in err and not retry:
-                    logger.warning(f"Market moved. Attempting one immediate retry for {symbol}...")
-                    # Delay slightly and retry once
-                    await asyncio.sleep(0.2)
+                err_str = str(e)
+                if "moved too much" in err_str and not retry:
+                    logger.warning(f"Market moved. Retrying once for {symbol}...")
+                    await asyncio.sleep(0.3)
                     asyncio.create_task(self.execute_trade(symbol, side, retry=True))
                 else:
                     logger.error(f"Trade Error: {e}")
@@ -121,7 +118,7 @@ class DerivSniperBot:
             
             await self.fetch_balance()
             status = '✅ WIN' if p > 0 else '❌ LOSS'
-            msg = f"🏁 **{status}** (${float(p):.2f})\nStreak: {self.consecutive_losses} | Today: {self.trades_today}"
+            msg = f"🏁 **{status}** (${float(p):.2f})\nStreak: {self.consecutive_losses}"
             await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
         finally:
             self.active_trade_info = None
@@ -133,10 +130,8 @@ class DerivSniperBot:
             for symbol in MARKETS:
                 if not self.is_scanning: break
                 self.current_market = symbol
-                
                 if self.active_trade_info or time.time() < self.cooldown_until:
                     await asyncio.sleep(1); break
-                
                 try:
                     data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 600, "style": "ticks"})
                     ticks = list(zip(data['history']['times'], data['history']['prices']))
@@ -147,40 +142,28 @@ class DerivSniperBot:
                             candles.append({'o':o, 'h':h, 'l':l, 'c':c})
                             curr_t0, o, h, l, c = t0, p, p, p, p
                         else: h, l, c = max(h, p), min(l, p), p
-                    
                     if len(candles) < 110: continue
                     ema100, psar, hist, op, hi, lo, cl = calculate_indicators(candles)
-                    
-                    # CALL Logic
-                    if cl[-1] > ema100[-1] and hist[-1] > 0:
-                        if psar[-1] < lo[-1] and psar[-2] > hi[-2]:
-                            await self.execute_trade(symbol, "CALL")
-                    
-                    # PUT Logic
-                    elif cl[-1] < ema100[-1] and hist[-1] < 0:
-                        if psar[-1] > hi[-1] and psar[-2] < lo[-2]:
-                            await self.execute_trade(symbol, "PUT")
-
-                except Exception as e:
-                    logger.debug(f"Scanner error on {symbol}: {e}")
+                    if cl[-1] > ema100[-1] and hist[-1] > 0 and psar[-1] < lo[-1] and psar[-2] > hi[-2]:
+                        await self.execute_trade(symbol, "CALL")
+                    elif cl[-1] < ema100[-1] and hist[-1] < 0 and psar[-1] > hi[-1] and psar[-2] < lo[-2]:
+                        await self.execute_trade(symbol, "PUT")
+                except: pass
                 await asyncio.sleep(1)
 
-# ========================= INDICATORS =========================
+# ========================= UTILS & INDICATORS =========================
 def calculate_indicators(candles):
     c = np.array([x['c'] for x in candles]); h = np.array([x['h'] for x in candles])
     l = np.array([x['l'] for x in candles]); o = np.array([x['o'] for x in candles])
-    
     ema = [c[0]]; k = 2 / (101)
     for price in c[1:]: ema.append(price * k + ema[-1] * (1 - k))
     ema100 = np.array(ema)
-    
     def get_ema(data, p):
         res = [data[0]]; alpha = 2/(p+1)
         for v in data[1:]: res.append(v*alpha + res[-1]*(1-alpha))
         return np.array(res)
     macd_line = get_ema(c, 12) - get_ema(c, 26)
     sig_line = get_ema(macd_line, 9); hist = macd_line - sig_line
-    
     psar = np.zeros(len(c)); up = True; af = 0.02; ep = h[0]; psar[0] = l[0]
     for i in range(1, len(c)):
         psar[i] = psar[i-1] + af * (ep - psar[i-1])
@@ -195,12 +178,11 @@ def calculate_indicators(candles):
     return ema100, psar, hist, o, h, l, c
 
 # ========================= TELEGRAM UI =========================
-bot_logic = DerivSniperBot()
-
 def main_keyboard():
+    # RESTORED: All buttons including TEST_BUY are now back
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("▶️ START SCANNER", callback_data="START_SCAN"), InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
-        [InlineKeyboardButton("📊 STATUS", callback_data="STATUS")],
+        [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY"), InlineKeyboardButton("📊 STATUS", callback_data="STATUS")],
         [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
     ])
 
@@ -215,6 +197,9 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic.is_scanning = True
         bot_logic.scanner_status = "📡 Active"
         asyncio.create_task(bot_logic.background_scanner())
+    elif q.data == "TEST_BUY":
+        # RESTORED: Trigger a quick test trade on R_10
+        await bot_logic.execute_trade("R_10", "CALL")
     elif q.data == "SET_DEMO":
         bot_logic.active_token = DEMO_TOKEN; await bot_logic.connect()
     elif q.data == "SET_REAL":
@@ -224,12 +209,12 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic.scanner_status = "⏹️ Stopped"
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper Bot v8.6**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper Bot v8.7**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     bot_logic.app = app
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(btn_handler))
-    # drop_pending_updates kills old sessions to prevent the Conflict error
+    # Conflict fix: Clear old updates
     app.run_polling(drop_pending_updates=True)
