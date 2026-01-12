@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import numpy as np
 from deriv_api import DerivAPI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -13,12 +14,15 @@ REAL_TOKEN = "2hsJzopRHG5wUEb"
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50", "R_75", "R_100"]
+
 COOLDOWN_SEC = 300 
 MAX_TRADES_PER_DAY = 20
 MAX_CONSEC_LOSSES = 5
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
 TELEGRAM_CHAT_ID = "7634818949"
+
+TELEGRAM_DEBUG = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -63,9 +67,11 @@ def calculate_indicators(candles):
     pk = 100 * ((c[stoch_p - 1 :] - l_min) / (h_max - l_min + 1e-6))
     pd = np.convolve(pk, np.ones(3), "valid") / 3
 
-    return upper_band[-1], lower_band[-1], adx[-1], pk[-1], pd[-1], o[-1], c[-1], h[-1], l[-1]
+    return (float(upper_band[-1]), float(lower_band[-1]), float(adx[-1]) if len(adx) else 999.0,
+            float(pk[-1]), float(pd[-1]), float(o[-1]), float(c[-1]), float(h[-1]), float(l[-1]))
 
-def build_candles(times, prices):
+def build_m1_candles_from_ticks(times, prices):
+    if not times or not prices: return []
     candles = []
     curr_t0 = times[0] - (times[0] % 60)
     o = h = l = c = float(prices[0])
@@ -87,6 +93,7 @@ class DerivSniperBot:
         self.active_token = None
         self.account_type = "None"
         self.is_scanning = False
+        self.scanner_task = None
         self.market_tasks = {}
         self.active_trade_info = None
         self.active_market = "None"
@@ -97,9 +104,15 @@ class DerivSniperBot:
         self.consecutive_losses = 0
         self.balance = "0.00"
         self.trade_lock = asyncio.Lock()
+        self.last_scan_symbol = "None"
+        self.last_signal_reason = "None"
+        self.last_block_reason = "None"
+        self.last_trade_side = "None"
+        self.last_trade_source = "None"
 
     async def connect(self) -> bool:
         try:
+            if not self.active_token: return False
             self.api = DerivAPI(app_id=APP_ID)
             await self.api.authorize(self.active_token)
             await self.fetch_balance()
@@ -114,14 +127,15 @@ class DerivSniperBot:
         except: pass
 
     def can_auto_trade(self) -> tuple[bool, str]:
-        if self.consecutive_losses >= MAX_CONSEC_LOSSES: return False, "Max Loss Reached"
+        if self.consecutive_losses >= MAX_CONSEC_LOSSES: return False, "Max Streak Loss"
         if self.trades_today >= MAX_TRADES_PER_DAY: return False, "Daily Limit Met"
         if time.time() < self.cooldown_until: return False, f"Cooldown {int(self.cooldown_until - time.time())}s"
         if self.active_trade_info: return False, "Trade in Progress"
-        if not self.api: return False, "No Connection"
+        if not self.api: return False, "Not Connected"
         return True, "OK"
 
     async def background_scanner(self):
+        if not self.api: return
         self.market_tasks = {sym: asyncio.create_task(self.scan_market(sym)) for sym in MARKETS}
         try:
             while self.is_scanning:
@@ -134,25 +148,27 @@ class DerivSniperBot:
 
     async def scan_market(self, symbol: str):
         while self.is_scanning:
+            self.last_scan_symbol = symbol
             try:
-                data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 1000, "style": "ticks"})
-                candles = build_candles(data["history"]["times"], data["history"]["prices"])
-                if len(candles) < 40: 
-                    await asyncio.sleep(10); continue
+                if self.consecutive_losses >= MAX_CONSEC_LOSSES or self.trades_today >= MAX_TRADES_PER_DAY:
+                    self.is_scanning = False; break
+                data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 1500, "style": "ticks"})
+                candles = build_m1_candles_from_ticks(data["history"]["times"], data["history"]["prices"])
+                if len(candles) < 40: await asyncio.sleep(10); continue
                 ind = calculate_indicators(candles)
-                if not ind: continue
+                if not ind: await asyncio.sleep(10); continue
                 up, lw, adx_v, pk, pd, op, cl, hi, lo = ind
                 ok, gate = self.can_auto_trade()
-                if not ok: 
-                    await asyncio.sleep(5); continue
-                if adx_v < 30:
-                    if (lo <= lw) and (pk < 25) and (pk > pd):
-                        await self.execute_trade("CALL", symbol, "Oversold BB", source="AUTO")
-                    elif (hi >= up) and (pk > 75) and (pk < pd):
-                        await self.execute_trade("PUT", symbol, "Overbought BB", source="AUTO")
+                self.last_block_reason = gate
+                if not ok: await asyncio.sleep(10); continue
+                if adx_v < 25:
+                    if (lo <= lw) and (pk < 20) and (pk > pd) and (cl > op):
+                        await self.execute_trade("CALL", symbol, f"Oversold BB (ADX:{adx_v:.1f})", source="AUTO")
+                    elif (hi >= up) and (pk > 80) and (pk < pd) and (cl < op):
+                        await self.execute_trade("PUT", symbol, f"Overbought BB (ADX:{adx_v:.1f})", source="AUTO")
             except asyncio.CancelledError: break
             except: pass
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
 
     async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL"):
         if not self.api or self.active_trade_info: return
@@ -160,10 +176,11 @@ class DerivSniperBot:
             try:
                 prop = await self.api.proposal({"proposal": 1, "amount": 1.00, "basis": "stake", "contract_type": side, "currency": "USD", "duration": 180, "duration_unit": "s", "symbol": symbol})
                 buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])})
-                self.active_trade_info = int(buy["buy"]["contract_id"])
-                self.active_market, self.trade_start_time = symbol, time.time()
+                self.active_trade_info, self.active_market, self.trade_start_time = int(buy["buy"]["contract_id"]), symbol, time.time()
+                self.last_signal_reason, self.last_trade_side, self.last_trade_source = reason, side, source
                 if source == "AUTO": self.trades_today += 1
-                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 *{side} OPENED*\n🛒 `{symbol}`\n📝 {reason}", parse_mode="Markdown")
+                msg = f"🚀 *{side} TRADE OPENED*\n🛒 Market: {symbol}\n🧠 Source: {source}\n📝 Reason: {reason}"
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
                 asyncio.create_task(self.check_result(self.active_trade_info, source))
             except: pass
 
@@ -176,10 +193,9 @@ class DerivSniperBot:
                 if profit <= 0: self.consecutive_losses += 1; self.total_losses_today += 1
                 else: self.consecutive_losses = 0
             await self.fetch_balance()
-            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 *FINISH*: {'✅ WIN' if profit > 0 else '❌ LOSS'} (${profit:.2f})", parse_mode="Markdown")
+            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 *FINISH*: {'✅ WIN' if profit > 0 else '❌ LOSS'} (${profit:.2f})\n💰 Balance: {self.balance}", parse_mode="Markdown")
         finally:
-            self.active_trade_info = None
-            self.cooldown_until = time.time() + COOLDOWN_SEC
+            self.active_trade_info = None; self.cooldown_until = time.time() + COOLDOWN_SEC
 
 # ========================= UI =========================
 bot_logic = DerivSniperBot()
@@ -193,70 +209,55 @@ def main_keyboard():
     ])
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query
-    await q.answer()
-    
+    q = u.callback_query; await q.answer()
     if q.data == "SET_DEMO":
-        bot_logic.active_token = DEMO_TOKEN; bot_logic.account_type = "DEMO"
+        bot_logic.active_token, bot_logic.account_type = DEMO_TOKEN, "DEMO"
         ok = await bot_logic.connect()
-        await q.edit_message_text("✅ DEMO CONNECTED" if ok else "❌ FAILED", reply_markup=main_keyboard())
-    
+        await q.edit_message_text("✅ Connected to DEMO" if ok else "❌ DEMO Failed", reply_markup=main_keyboard())
     elif q.data == "SET_REAL":
-        bot_logic.active_token = REAL_TOKEN; bot_logic.account_type = "LIVE"
+        bot_logic.active_token, bot_logic.account_type = REAL_TOKEN, "LIVE"
         ok = await bot_logic.connect()
-        await q.edit_message_text("⚠️ LIVE CONNECTED" if ok else "❌ FAILED", reply_markup=main_keyboard())
-    
+        await q.edit_message_text("⚠️ LIVE CONNECTED" if ok else "❌ LIVE Failed", reply_markup=main_keyboard())
     elif q.data == "START_SCAN":
-        if not bot_logic.api: 
-            await q.edit_message_text("❌ Connect First!", reply_markup=main_keyboard())
-            return
+        if not bot_logic.api: await q.edit_message_text("❌ Connect first.", reply_markup=main_keyboard()); return
         bot_logic.is_scanning = True
-        asyncio.create_task(bot_logic.background_scanner())
+        bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
         await q.edit_message_text("🔍 *SCANNER ACTIVE*", reply_markup=main_keyboard(), parse_mode="Markdown")
-    
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
-        await q.edit_message_text("⏹️ STOPPED", reply_markup=main_keyboard())
-    
+        await q.edit_message_text("⏹️ Scanner stopped.", reply_markup=main_keyboard())
     elif q.data == "TEST_BUY":
-        await bot_logic.execute_trade("CALL", "R_10", "Manual Test")
-    
+        await bot_logic.execute_trade("CALL", "R_10", "Manual Test", source="MANUAL")
     elif q.data == "STATUS":
         await bot_logic.fetch_balance()
-        now_time = datetime.now().strftime("%H:%M:%S")
+        now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
         ok, gate = bot_logic.can_auto_trade()
-        
-        trade_status = "No active trade"
+        trade_status = "No Active Trade"
         if bot_logic.active_trade_info and bot_logic.api:
             try:
                 res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
-                pnl = float(res['proposal_open_contract'].get('profit', 0))
-                elapsed = int(time.time() - bot_logic.trade_start_time)
-                rem = max(0, 180 - elapsed)
-                icon = "🟢" if pnl >= 0 else "🔴"
-                trade_status = f"Active: {bot_logic.active_market} | {icon} PnL: ${pnl:.2f} | {rem}s"
-            except:
-                trade_status = "Syncing trade..."
-
-        status_text = (
-            f"🕒 **Time:** `{now_time}`\n"
-            f"🤖 **Bot:** `{'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'}` (`{bot_logic.account_type}`)\n"
-            f"📡 **Scanning:** `{', '.join(MARKETS)}`\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"📌 **Trade:** {trade_status}\n"
-            f"💰 **Balance:** `{bot_logic.balance}`\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"🎯 **Today:** `{bot_logic.trades_today}/20` | 📉 **Loss Streak:** `{bot_logic.consecutive_losses}/5` \n"
-            f"🚦 **Gate:** `{gate}`"
+                pnl = float(res["proposal_open_contract"].get("profit", 0))
+                rem = max(0, 180 - int(time.time() - bot_logic.trade_start_time))
+                icon = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
+                trade_status = f"🚀 Active Trade ({bot_logic.active_market})\n📈 PnL: {icon} (${pnl:.2f})\n⏳ Left: {rem}s"
+            except: trade_status = "🚀 Active Trade: Syncing..."
+        
+        status_msg = (
+            f"🕒 Nigerian Time (WAT): {now_time}\n"
+            f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
+            f"📡 Markets: {', '.join(MARKETS)}\n"
+            f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
+            f"🎯 Today: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
+            f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | ⏳ Cool: {max(0, int(bot_logic.cooldown_until - time.time()))}s\n"
+            f"🚦 Gate: {gate}\n💰 Balance: {bot_logic.balance}"
         )
-        await q.edit_message_text(status_text, reply_markup=main_keyboard(), parse_mode="Markdown")
+        await q.edit_message_text(status_msg, reply_markup=main_keyboard(), parse_mode="Markdown")
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper M1 v4.9 Stable**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 Sniper Range M1 (WAT Edition)", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     bot_logic.app = app
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CallbackQueryHandler(btn_handler))
+    app.add_handler(CommandHandler("start", start_cmd)); app.add_handler(CallbackQueryHandler(btn_handler))
     app.run_polling(drop_pending_updates=True)
