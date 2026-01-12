@@ -12,6 +12,8 @@ REAL_TOKEN = "2hsJzopRHG5wUEb"
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50", "R_75", "R_100"] 
+# Setting Payout to $1.00 ensures your NET PROFIT is ~$0.48
+TARGET_PAYOUT = 1.00  
 COOLDOWN_SEC = 300 
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
@@ -27,14 +29,12 @@ def calculate_indicators(candles):
     l = np.array([x['l'] for x in candles])
     o = np.array([x['o'] for x in candles])
 
-    # 1. Bollinger Bands (20, 2)
     period = 20
     sma = np.convolve(c, np.ones(period), 'valid') / period
     std_dev = np.array([np.std(c[i : i + period]) for i in range(len(sma))])
     upper_band = sma + (std_dev * 2)
     lower_band = sma - (std_dev * 2)
 
-    # 2. ADX (14)
     adx_p = 14
     tr = np.maximum(h[1:]-l[1:], np.maximum(abs(h[1:]-c[:-1]), abs(l[1:]-c[:-1])))
     plus_dm = np.where((h[1:]-h[:-1]) > (l[:-1]-l[1:]), np.maximum(h[1:]-h[:-1], 0), 0)
@@ -51,7 +51,6 @@ def calculate_indicators(candles):
     dx = 100*abs(pdi-mdi)/(pdi+mdi)
     adx = smooth(dx, adx_p)
 
-    # 3. Stochastic (14, 3)
     stoch_p = 14
     l_min = np.array([np.min(l[i:i+stoch_p]) for i in range(len(l)-stoch_p+1)])
     h_max = np.array([np.max(h[i:i+stoch_p]) for i in range(len(h)-stoch_p+1)])
@@ -66,7 +65,6 @@ class DerivSniperBot:
         self.api = None
         self.app = None
         self.active_token = None
-        self.account_type = "None"
         self.is_scanning = False
         self.active_trade_info = None 
         self.active_market = "None"
@@ -92,46 +90,60 @@ class DerivSniperBot:
             self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
         except: pass
 
-    async def scan_market(self, symbol):
+    async def background_scanner(self):
         while self.is_scanning:
-            if self.consecutive_losses >= 5 or self.trades_today >= 20:
-                self.is_scanning = False
-                break
-            try:
-                data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 1500, "style": "ticks"})
-                ticks = list(zip(data['history']['times'], data['history']['prices']))
-                candles = []
-                curr_t0 = ticks[0][0] - (ticks[0][0] % 60)
-                o = h = l = c = ticks[0][1]
-                for t, p in ticks:
-                    t0 = t - (t % 60)
-                    if t0 != curr_t0:
-                        candles.append({'o':o, 'h':h, 'l':l, 'c':c})
-                        curr_t0, o, h, l, c = t0, p, p, p, p
-                    else: h, l, c = max(h, p), min(l, p), p
-                
-                if len(candles) < 40: continue
-                up, lw, adx_v, pk, pd, op, cl, hi, lo = calculate_indicators(candles)
+            for m in MARKETS:
+                if not self.is_scanning: break
+                await self.scan_market(m)
+                await asyncio.sleep(2)
 
-                if adx_v < 25 and time.time() >= self.cooldown_until:
-                    # CALL Logic
-                    if lo <= lw and pk < 20 and pk > pd and cl > op:
-                        reason = f"Ranging Market (ADX:{adx_v:.1f})\nBottom Band Touch + Stoch Cross ({pk:.1f})"
-                        await self.execute_trade("CALL", symbol, reason)
-                    # PUT Logic
-                    elif hi >= up and pk > 80 and pk < pd and cl < op:
-                        reason = f"Ranging Market (ADX:{adx_v:.1f})\nTop Band Touch + Stoch Cross ({pk:.1f})"
-                        await self.execute_trade("PUT", symbol, reason)
+    async def scan_market(self, symbol):
+        if self.consecutive_losses >= 5 or self.trades_today >= 20:
+            self.is_scanning = False
+            return
+        try:
+            data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 1500, "style": "ticks"})
+            ticks = list(zip(data['history']['times'], data['history']['prices']))
+            candles = []
+            curr_t0 = ticks[0][0] - (ticks[0][0] % 60)
+            o = h = l = c = ticks[0][1]
+            for t, p in ticks:
+                t0 = t - (t % 60)
+                if t0 != curr_t0:
+                    candles.append({'o':o, 'h':h, 'l':l, 'c':c})
+                    curr_t0, o, h, l, c = t0, p, p, p, p
+                else: h, l, c = max(h, p), min(l, p), p
+            
+            if len(candles) < 40: return
+            up, lw, adx_v, pk, pd, op, cl, hi, lo = calculate_indicators(candles)
 
-            except Exception as e: logger.error(f"Error {symbol}: {e}")
-            await asyncio.sleep(10)
+            if adx_v < 25 and time.time() >= self.cooldown_until:
+                if lo <= lw and pk < 20 and pk > pd and cl > op:
+                    await self.execute_trade("CALL", symbol, f"Bottom BB + Stoch ({pk:.1f})")
+                elif hi >= up and pk > 80 and pk < pd and cl < op:
+                    await self.execute_trade("PUT", symbol, f"Top BB + Stoch ({pk:.1f})")
+        except Exception as e: logger.error(f"Error {symbol}: {e}")
 
     async def execute_trade(self, side: str, symbol: str, reason="MANUAL"):
         if not self.api or self.active_trade_info: return
         async with self.trade_lock:
             try:
-                proposal = await self.api.proposal({"proposal": 1, "amount": 1.00, "basis": "stake", "contract_type": side, "currency": "USD", "duration": 180, "duration_unit": "s", "symbol": symbol})
-                buy = await self.api.buy({"buy": proposal["proposal"]["id"], "price": float(proposal["proposal"]["ask_price"]) + 0.02})
+                # Switching to PAYOUT basis to target exactly $0.48 profit
+                proposal = await self.api.proposal({
+                    "proposal": 1, 
+                    "amount": TARGET_PAYOUT, 
+                    "basis": "payout", 
+                    "contract_type": side, 
+                    "currency": "USD", 
+                    "duration": 180, 
+                    "duration_unit": "s", 
+                    "symbol": symbol
+                })
+                
+                stake_used = float(proposal["proposal"]["ask_price"])
+                net_profit = TARGET_PAYOUT - stake_used
+
+                buy = await self.api.buy({"buy": proposal["proposal"]["id"], "price": stake_used + 0.05})
                 self.active_trade_info = buy["buy"]["contract_id"]
                 self.active_market = symbol
                 self.trade_start_time = time.time()
@@ -139,9 +151,10 @@ class DerivSniperBot:
                 source = "AUTO" if "Manual" not in reason else "MANUAL"
                 if source == "AUTO": self.trades_today += 1
                 
-                # RESTORED UI + REASON INFO
                 msg = (f"🚀 **{side} TRADE OPENED**\n"
                        f"🛒 Market: `{symbol}`\n"
+                       f"📉 Risk (Stake): `${stake_used:.2f}`\n"
+                       f"💰 Net Profit Target: `${net_profit:.2f}`\n"
                        f"📝 **Reason**: {reason}")
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
                 
@@ -179,32 +192,13 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     if q.data == "STATUS":
         await bot_logic.fetch_balance()
-        market_list = ", ".join(MARKETS)
-        trade_status = "No Active Trade"
-        
-        if bot_logic.active_trade_info:
-            try:
-                res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
-                pnl = float(res['proposal_open_contract'].get('profit', 0))
-                elapsed = int(time.time() - bot_logic.trade_start_time)
-                remaining = max(0, 180 - elapsed)
-                icon = "🟢 WINNING" if pnl >= 0 else "🔴 LOSING"
-                trade_status = f"🚀 **Active Trade**: `{bot_logic.active_market}`\n📈 **Live PnL**: {icon} (${pnl:.2f})\n⏳ **Time Left**: `{remaining}s`"
-            except: trade_status = "🚀 **Active Trade**: `Syncing...`"
-
         status_msg = (
             f"🤖 **Bot**: `{'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'}`\n"
-            f"📡 **Scanning**: `{market_list}`\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"{trade_status}\n"
-            f"━━━━━━━━━━━━━━━\n"
             f"🎯 **Trades Today**: `{bot_logic.trades_today}/20`\n"
-            f"❌ **Total Lost**: `{bot_logic.total_losses_today}`\n"
             f"📉 **Streak**: `{bot_logic.consecutive_losses}/5` losses\n"
             f"💰 **Balance**: `{bot_logic.balance}`"
         )
         await q.edit_message_text(status_msg, reply_markup=main_keyboard(), parse_mode="Markdown")
-    
     elif q.data == "START_SCAN":
         if not bot_logic.api: await q.edit_message_text("❌ Connect First!", reply_markup=main_keyboard()); return
         bot_logic.is_scanning = True; asyncio.create_task(bot_logic.background_scanner())
@@ -219,7 +213,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif q.data == "TEST_BUY": await bot_logic.execute_trade("CALL", "R_10", "Manual Test")
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper Range M1 v4.2**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper Range M1 v4.6**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
