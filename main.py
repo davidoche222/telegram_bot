@@ -65,38 +65,27 @@ class DerivSniperBot:
 
     async def execute_trade(self, symbol, side, retry=False):
         if not self.api or self.active_trade_info: return
-        
         async with self.trade_lock:
             try:
-                # 1. Get Proposal with subscribe:1
+                # FIX: Market Moved protection
                 prop = await self.api.proposal({
                     "proposal": 1, "amount": float(TARGET_PAYOUT), "basis": "payout",
                     "contract_type": side, "currency": "USD", "duration": 150,
                     "duration_unit": "s", "symbol": symbol, "subscribe": 1
                 })
-                
                 ask_price = float(prop['proposal']['ask_price'])
-                
-                # 2. Restored: Slippage/Price protection (Accepts move up to 1.5%)
+                # 1.5% Slippage buffer
                 max_buy_price = round(ask_price * 1.015, 2)
 
-                # 3. Buy the contract
-                buy = await self.api.buy({
-                    "buy": prop["proposal"]["id"], 
-                    "price": max_buy_price # This prevents the "Market Moved" error
-                })
-                
+                buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": max_buy_price})
                 self.active_trade_info = buy["buy"]["contract_id"]
                 self.trades_today += 1
                 
-                msg = f"🚀 **{side} TRADE**\nMarket: `{symbol}`\nStake: `${ask_price:.2f}`\nPayout: `$1.00`"
+                msg = f"🚀 **{side} TRADE**\nMarket: `{symbol}`\nStake: `${ask_price:.2f}`"
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
                 asyncio.create_task(self.check_result(self.active_trade_info))
-                
             except Exception as e:
-                err_str = str(e)
-                if "moved too much" in err_str and not retry:
-                    logger.warning(f"Market moved. Retrying once for {symbol}...")
+                if "moved too much" in str(e) and not retry:
                     await asyncio.sleep(0.3)
                     asyncio.create_task(self.execute_trade(symbol, side, retry=True))
                 else:
@@ -107,19 +96,15 @@ class DerivSniperBot:
         try:
             res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
             p = Decimal(str(res['proposal_open_contract'].get('profit', '0')))
-            self.weekly_profit += p
-            
             if p <= 0:
                 self.weekly_losses += 1
                 self.consecutive_losses += 1
             else:
                 self.weekly_wins += 1
                 self.consecutive_losses = 0
-            
             await self.fetch_balance()
             status = '✅ WIN' if p > 0 else '❌ LOSS'
-            msg = f"🏁 **{status}** (${float(p):.2f})\nStreak: {self.consecutive_losses}"
-            await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
+            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"{status} (${float(p):.2f})")
         finally:
             self.active_trade_info = None
             self.cooldown_until = time.time() + COOLDOWN_SEC
@@ -151,7 +136,7 @@ class DerivSniperBot:
                 except: pass
                 await asyncio.sleep(1)
 
-# ========================= UTILS & INDICATORS =========================
+# ========================= INDICATORS & SETUP =========================
 def calculate_indicators(candles):
     c = np.array([x['c'] for x in candles]); h = np.array([x['h'] for x in candles])
     l = np.array([x['l'] for x in candles]); o = np.array([x['o'] for x in candles])
@@ -177,9 +162,10 @@ def calculate_indicators(candles):
             elif l[i] < ep: ep = l[i]; af = min(0.2, af + 0.02)
     return ema100, psar, hist, o, h, l, c
 
-# ========================= TELEGRAM UI =========================
+# --- IMPORTANT: DEFINING THE INSTANCE BEFORE THE HANDLERS ---
+bot_logic = DerivSniperBot()
+
 def main_keyboard():
-    # RESTORED: All buttons including TEST_BUY are now back
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("▶️ START SCANNER", callback_data="START_SCAN"), InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
         [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY"), InlineKeyboardButton("📊 STATUS", callback_data="STATUS")],
@@ -190,15 +176,12 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     if q.data == "STATUS":
         await bot_logic.fetch_balance()
-        txt = f"📊 **STATUS**\nSystem: `{bot_logic.scanner_status}`\nBalance: `{bot_logic.balance}`\nWins/Losses: `{bot_logic.weekly_wins}/{bot_logic.weekly_losses}`"
-        await q.edit_message_text(txt, reply_markup=main_keyboard(), parse_mode="Markdown")
+        await q.edit_message_text(f"💰 Balance: {bot_logic.balance}\nStat: {bot_logic.scanner_status}", reply_markup=main_keyboard())
     elif q.data == "START_SCAN":
-        if not bot_logic.active_token: return
         bot_logic.is_scanning = True
         bot_logic.scanner_status = "📡 Active"
         asyncio.create_task(bot_logic.background_scanner())
     elif q.data == "TEST_BUY":
-        # RESTORED: Trigger a quick test trade on R_10
         await bot_logic.execute_trade("R_10", "CALL")
     elif q.data == "SET_DEMO":
         bot_logic.active_token = DEMO_TOKEN; await bot_logic.connect()
@@ -206,15 +189,14 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic.active_token = REAL_TOKEN; await bot_logic.connect()
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
-        bot_logic.scanner_status = "⏹️ Stopped"
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper Bot v8.7**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 Sniper Bot v8.8", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     bot_logic.app = app
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(btn_handler))
-    # Conflict fix: Clear old updates
+    # Conflict Fix
     app.run_polling(drop_pending_updates=True)
