@@ -179,8 +179,12 @@ class DerivSniperBot:
                 self.active_trade_info, self.active_market, self.trade_start_time = int(buy["buy"]["contract_id"]), symbol, time.time()
                 self.last_signal_reason, self.last_trade_side, self.last_trade_source = reason, side, source
                 if source == "AUTO": self.trades_today += 1
-                msg = f"🚀 *{side} TRADE OPENED*\n🛒 Market: {symbol}\n🧠 Source: {source}\n📝 Reason: {reason}"
-                await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
+                
+                # FIXED NOTIFICATION: Clean symbol name to prevent crash
+                safe_symbol = str(symbol).replace("_", " ")
+                msg = f"🚀 {side} TRADE OPENED\n🛒 Market: {safe_symbol}\n🧠 Source: {source}\n📝 Reason: {reason}"
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
+                
                 asyncio.create_task(self.check_result(self.active_trade_info, source))
             except: pass
 
@@ -193,7 +197,7 @@ class DerivSniperBot:
                 if profit <= 0: self.consecutive_losses += 1; self.total_losses_today += 1
                 else: self.consecutive_losses = 0
             await self.fetch_balance()
-            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 *FINISH*: {'✅ WIN' if profit > 0 else '❌ LOSS'} (${profit:.2f})\n💰 Balance: {self.balance}", parse_mode="Markdown")
+            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} (${profit:.2f})\n💰 Balance: {self.balance}")
         finally:
             self.active_trade_info = None; self.cooldown_until = time.time() + COOLDOWN_SEC
 
@@ -222,7 +226,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if not bot_logic.api: await q.edit_message_text("❌ Connect first.", reply_markup=main_keyboard()); return
         bot_logic.is_scanning = True
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
-        await q.edit_message_text("🔍 *SCANNER ACTIVE*", reply_markup=main_keyboard(), parse_mode="Markdown")
+        await q.edit_message_text("🔍 SCANNER ACTIVE", reply_markup=main_keyboard())
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
         await q.edit_message_text("⏹️ Scanner stopped.", reply_markup=main_keyboard())
@@ -238,20 +242,21 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
                 pnl = float(res["proposal_open_contract"].get("profit", 0))
                 rem = max(0, 180 - int(time.time() - bot_logic.trade_start_time))
-                icon = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
-                trade_status = f"🚀 Active Trade ({bot_logic.active_market})\n📈 PnL: {icon} (${pnl:.2f})\n⏳ Left: {rem}s"
+                icon = "PROFIT" if pnl > 0 else "LOSS"
+                mkt_clean = str(bot_logic.active_market).replace("_", " ")
+                trade_status = f"🚀 Active Trade ({mkt_clean})\n📈 PnL: {icon} (${pnl:.2f})\n⏳ Left: {rem}s"
             except: trade_status = "🚀 Active Trade: Syncing..."
         
         status_msg = (
-            f"🕒 Nigerian Time (WAT): {now_time}\n"
+            f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"📡 Markets: {', '.join(MARKETS)}\n"
+            f"📡 Markets: {', '.join(MARKETS).replace('_', ' ')}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
             f"🎯 Today: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
             f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | ⏳ Cool: {max(0, int(bot_logic.cooldown_until - time.time()))}s\n"
             f"🚦 Gate: {gate}\n💰 Balance: {bot_logic.balance}"
         )
-        await q.edit_message_text(status_msg, reply_markup=main_keyboard(), parse_mode="Markdown")
+        await q.edit_message_text(status_msg, reply_markup=main_keyboard())
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text("💎 Sniper Range M1 (WAT Edition)", reply_markup=main_keyboard())
