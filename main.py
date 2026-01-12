@@ -12,7 +12,8 @@ REAL_TOKEN = "2hsJzopRHG5wUEb"
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50", "R_75", "R_100"] 
-STAKE_AMOUNT = 0.52  # Updated to $0.52 as requested
+# Setting Payout to $1.00 to get ~$0.48 clear profit (interest)
+PAYOUT_TARGET = 1.00  
 COOLDOWN_SEC = 300 
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
@@ -28,14 +29,12 @@ def calculate_indicators(candles):
     l = np.array([x['l'] for x in candles])
     o = np.array([x['o'] for x in candles])
 
-    # 1. Bollinger Bands (20, 2)
     period = 20
     sma = np.convolve(c, np.ones(period), 'valid') / period
     std_dev = np.array([np.std(c[i : i + period]) for i in range(len(sma))])
     upper_band = sma + (std_dev * 2)
     lower_band = sma - (std_dev * 2)
 
-    # 2. ADX (14)
     adx_p = 14
     tr = np.maximum(h[1:]-l[1:], np.maximum(abs(h[1:]-c[:-1]), abs(l[1:]-c[:-1])))
     plus_dm = np.where((h[1:]-h[:-1]) > (l[:-1]-l[1:]), np.maximum(h[1:]-h[:-1], 0), 0)
@@ -52,7 +51,6 @@ def calculate_indicators(candles):
     dx = 100*abs(pdi-mdi)/(pdi+mdi)
     adx = smooth(dx, adx_p)
 
-    # 3. Stochastic (14, 3)
     stoch_p = 14
     l_min = np.array([np.min(l[i:i+stoch_p]) for i in range(len(l)-stoch_p+1)])
     h_max = np.array([np.max(h[i:i+stoch_p]) for i in range(len(h)-stoch_p+1)])
@@ -129,18 +127,22 @@ class DerivSniperBot:
         if not self.api or self.active_trade_info: return
         async with self.trade_lock:
             try:
-                # Using STAKE_AMOUNT from config
                 proposal = await self.api.proposal({
                     "proposal": 1, 
-                    "amount": STAKE_AMOUNT, 
-                    "basis": "stake", 
+                    "amount": PAYOUT_TARGET, 
+                    "basis": "payout", 
                     "contract_type": side, 
                     "currency": "USD", 
                     "duration": 180, 
                     "duration_unit": "s", 
                     "symbol": symbol
                 })
-                buy = await self.api.buy({"buy": proposal["proposal"]["id"], "price": float(proposal["proposal"]["ask_price"]) + 0.02})
+                
+                # Calculate the exact stake and interest for the message
+                stake = float(proposal["proposal"]["ask_price"])
+                interest = PAYOUT_TARGET - stake
+                
+                buy = await self.api.buy({"buy": proposal["proposal"]["id"], "price": stake + 0.02})
                 self.active_trade_info = buy["buy"]["contract_id"]
                 self.active_market = symbol
                 self.trade_start_time = time.time()
@@ -150,7 +152,8 @@ class DerivSniperBot:
                 
                 msg = (f"🚀 **{side} TRADE OPENED**\n"
                        f"🛒 Market: `{symbol}`\n"
-                       f"💵 Stake: `${STAKE_AMOUNT}`\n"
+                       f"💵 Stake: `${stake:.2f}`\n"
+                       f"💰 Interest: `${interest:.2f}`\n"
                        f"📝 **Reason**: {reason}")
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
                 
@@ -228,7 +231,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif q.data == "TEST_BUY": await bot_logic.execute_trade("CALL", "R_10", "Manual Test")
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper Range M1 v4.3**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper Range M1 v4.5**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
