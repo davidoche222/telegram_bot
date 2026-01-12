@@ -114,15 +114,19 @@ class DerivSniperBot:
                 up, lw, adx_v, pk, pd, op, cl, hi, lo = calculate_indicators(candles)
 
                 if adx_v < 25 and time.time() >= self.cooldown_until:
+                    # CALL Logic
                     if lo <= lw and pk < 20 and pk > pd and cl > op:
-                        await self.execute_trade("CALL", symbol, "AUTO")
+                        reason = f"Ranging Market (ADX:{adx_v:.1f})\nBottom Band Touch + Stoch Cross ({pk:.1f})"
+                        await self.execute_trade("CALL", symbol, reason)
+                    # PUT Logic
                     elif hi >= up and pk > 80 and pk < pd and cl < op:
-                        await self.execute_trade("PUT", symbol, "AUTO")
+                        reason = f"Ranging Market (ADX:{adx_v:.1f})\nTop Band Touch + Stoch Cross ({pk:.1f})"
+                        await self.execute_trade("PUT", symbol, reason)
 
             except Exception as e: logger.error(f"Error {symbol}: {e}")
             await asyncio.sleep(10)
 
-    async def execute_trade(self, side: str, symbol: str, source="MANUAL"):
+    async def execute_trade(self, side: str, symbol: str, reason="MANUAL"):
         if not self.api or self.active_trade_info: return
         async with self.trade_lock:
             try:
@@ -131,8 +135,16 @@ class DerivSniperBot:
                 self.active_trade_info = buy["buy"]["contract_id"]
                 self.active_market = symbol
                 self.trade_start_time = time.time()
+                
+                source = "AUTO" if "Manual" not in reason else "MANUAL"
                 if source == "AUTO": self.trades_today += 1
-                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **{side} TRADE OPENED**\nMarket: `{symbol}`")
+                
+                # RESTORED UI + REASON INFO
+                msg = (f"🚀 **{side} TRADE OPENED**\n"
+                       f"🛒 Market: `{symbol}`\n"
+                       f"📝 **Reason**: {reason}")
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
+                
                 asyncio.create_task(self.check_result(self.active_trade_info, source))
             except Exception as e: logger.error(f"Trade Error: {e}")
 
@@ -204,10 +216,10 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic.active_token = REAL_TOKEN; await bot_logic.connect()
         await q.edit_message_text(f"⚠️ **LIVE CONNECTED**", reply_markup=main_keyboard())
     elif q.data == "STOP_SCAN": bot_logic.is_scanning = False
-    elif q.data == "TEST_BUY": await bot_logic.execute_trade("CALL", "R_10", "MANUAL")
+    elif q.data == "TEST_BUY": await bot_logic.execute_trade("CALL", "R_10", "Manual Test")
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper Range M1 v4.1**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper Range M1 v4.2**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
