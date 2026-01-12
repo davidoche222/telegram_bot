@@ -30,14 +30,12 @@ def calculate_indicators(candles):
     l = np.array([x["l"] for x in candles], dtype=float)
     o = np.array([x["o"] for x in candles], dtype=float)
 
-    # Bollinger Bands (20)
     period = 20
     sma = np.convolve(c, np.ones(period), "valid") / period
     std_dev = np.array([np.std(c[i : i + period]) for i in range(len(sma))], dtype=float)
     upper_band = sma + (std_dev * 2)
     lower_band = sma - (std_dev * 2)
 
-    # ADX (14)
     adx_p = 14
     tr = np.maximum(h[1:] - l[1:], np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
     plus_dm = np.where((h[1:] - h[:-1]) > (l[:-1] - l[1:]), np.maximum(h[1:] - h[:-1], 0), 0)
@@ -58,7 +56,6 @@ def calculate_indicators(candles):
     dx = 100 * (np.abs(pdi - mdi) / (pdi + mdi + eps))
     adx = smooth(dx, adx_p)
 
-    # Stochastic (14,3)
     stoch_p = 14
     if len(l) < stoch_p: return None
     l_min = np.array([np.min(l[i : i + stoch_p]) for i in range(len(l) - stoch_p + 1)], dtype=float)
@@ -150,7 +147,6 @@ class DerivSniperBot:
                 if not ok: 
                     await asyncio.sleep(5); continue
 
-                # RELAXED LOGIC (ADX < 30, no candle color check)
                 if adx_v < 30:
                     if (lo <= lw) and (pk < 25) and (pk > pd):
                         await self.execute_trade("CALL", symbol, "Oversold BB", source="AUTO")
@@ -220,9 +216,32 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await bot_logic.execute_trade("CALL", "R_10", "Manual Test")
     elif q.data == "STATUS":
         await bot_logic.fetch_balance()
+        now = datetime.now().strftime("%H:%M:%S")
         ok, gate = bot_logic.can_auto_trade()
-        status = f"🤖 Bot: `{'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'}`\n💰 Balance: `{bot_logic.balance}`\n🎯 Today: `{bot_logic.trades_today}/20`\n📉 Streak: `{bot_logic.consecutive_losses}/5` losses\n🚦 Gate: `{gate}`"
-        await q.edit_message_text(status, reply_markup=main_keyboard(), parse_mode="Markdown")
+        
+        # --- Live Trade Check ---
+        trade_status = "No active trade"
+        if bot_logic.active_trade_info:
+            try:
+                res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
+                pnl = float(res['proposal_open_contract'].get('profit', 0))
+                rem = max(0, 180 - int(time.time() - bot_logic.trade_start_time))
+                icon = "🟢" if pnl >= 0 else "🔴"
+                trade_status = f"Active: {bot_logic.active_market} | {icon} PnL: ${pnl:.2f} | {rem}s left"
+            except: trade_status = "Active trade: syncing..."
+
+        status_text = (
+            f"🕒 **Time:** `{now}`\n"
+            f"🤖 **Bot State:** `{'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'}`\n"
+            f"📡 **Scanning:** `{', '.join(MARKETS)}`\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"📌 **Trade:** {trade_status}\n"
+            f"💰 **Balance:** `{bot_logic.balance}`\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🎯 **Today:** `{bot_logic.trades_today}/20` | 📉 **Streak:** `{bot_logic.consecutive_losses}/5` losses\n"
+            f"🚦 **Gate:** `{gate}`"
+        )
+        await q.edit_message_text(status_text, reply_markup=main_keyboard(), parse_mode="Markdown")
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text("💎 **Sniper M1 v4.9 Stable**", reply_markup=main_keyboard())
