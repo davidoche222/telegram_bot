@@ -174,7 +174,7 @@ class DerivSniperBot:
         if not self.api or self.active_trade_info: return
         async with self.trade_lock:
             try:
-                prop = await self.api.proposal({"proposal": 1, "amount": 0.50, "basis": "payout", "contract_type": side, "currency": "USD", "duration": 180, "duration_unit": "s", "symbol": symbol})
+                prop = await self.api.proposal({"proposal": 1, "amount": 1.00, "basis": "stake", "contract_type": side, "currency": "USD", "duration": 180, "duration_unit": "s", "symbol": symbol})
                 buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])})
                 self.active_trade_info, self.active_market, self.trade_start_time = int(buy["buy"]["contract_id"]), symbol, time.time()
                 self.last_signal_reason, self.last_trade_side, self.last_trade_source = reason, side, source
