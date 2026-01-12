@@ -12,8 +12,7 @@ REAL_TOKEN = "2hsJzopRHG5wUEb"
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50", "R_75", "R_100"] 
-EMA_PERIOD = 100
-COOLDOWN_SEC = 300 # Set to 5 minutes to catch the next range cycle
+COOLDOWN_SEC = 300 
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -21,7 +20,7 @@ TELEGRAM_CHAT_ID = "7634818949"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ========================= STRATEGY MATH (TRIPLE-LOCK) =========================
+# ========================= STRATEGY MATH =========================
 def calculate_indicators(candles):
     c = np.array([x['c'] for x in candles])
     h = np.array([x['h'] for x in candles])
@@ -35,7 +34,7 @@ def calculate_indicators(candles):
     upper_band = sma + (std_dev * 2)
     lower_band = sma - (std_dev * 2)
 
-    # 2. ADX (14) - Trend Filter
+    # 2. ADX (14)
     adx_p = 14
     tr = np.maximum(h[1:]-l[1:], np.maximum(abs(h[1:]-c[:-1]), abs(l[1:]-c[:-1])))
     plus_dm = np.where((h[1:]-h[:-1]) > (l[:-1]-l[1:]), np.maximum(h[1:]-h[:-1], 0), 0)
@@ -69,12 +68,10 @@ class DerivSniperBot:
         self.active_token = None
         self.account_type = "None"
         self.is_scanning = False
-        
         self.active_trade_info = None 
         self.active_market = "None"
         self.trade_start_time = 0
         self.cooldown_until = 0
-        
         self.trades_today = 0
         self.total_losses_today = 0
         self.consecutive_losses = 0
@@ -101,7 +98,6 @@ class DerivSniperBot:
                 self.is_scanning = False
                 break
             try:
-                # Building 1-Minute Candles from Ticks
                 data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 1500, "style": "ticks"})
                 ticks = list(zip(data['history']['times'], data['history']['prices']))
                 candles = []
@@ -115,31 +111,21 @@ class DerivSniperBot:
                     else: h, l, c = max(h, p), min(l, p), p
                 
                 if len(candles) < 40: continue
+                up, lw, adx_v, pk, pd, op, cl, hi, lo = calculate_indicators(candles)
 
-                up, lw, adx_val, pk, pd, op, cl, hi, lo = calculate_indicators(candles)
-
-                # TRIGGER LOGIC: Ranging market (ADX < 25) + Bollinger Touch + Stoch Cross
-                if adx_val < 25 and time.time() >= self.cooldown_until:
-                    # CALL Signal
+                if adx_v < 25 and time.time() >= self.cooldown_until:
                     if lo <= lw and pk < 20 and pk > pd and cl > op:
                         await self.execute_trade("CALL", symbol, "AUTO")
-                    
-                    # PUT Signal
                     elif hi >= up and pk > 80 and pk < pd and cl < op:
                         await self.execute_trade("PUT", symbol, "AUTO")
 
             except Exception as e: logger.error(f"Error {symbol}: {e}")
             await asyncio.sleep(10)
 
-    async def background_scanner(self):
-        tasks = [asyncio.create_task(self.scan_market(m)) for m in MARKETS]
-        await asyncio.gather(*tasks)
-
     async def execute_trade(self, side: str, symbol: str, source="MANUAL"):
         if not self.api or self.active_trade_info: return
         async with self.trade_lock:
             try:
-                # 3-Minute Expiration (180s)
                 proposal = await self.api.proposal({"proposal": 1, "amount": 1.00, "basis": "stake", "contract_type": side, "currency": "USD", "duration": 180, "duration_unit": "s", "symbol": symbol})
                 buy = await self.api.buy({"buy": proposal["proposal"]["id"], "price": float(proposal["proposal"]["ask_price"]) + 0.02})
                 self.active_trade_info = buy["buy"]["contract_id"]
@@ -151,7 +137,6 @@ class DerivSniperBot:
             except Exception as e: logger.error(f"Trade Error: {e}")
 
     async def check_result(self, cid, source):
-        # Wait for 3-minute expiration + buffer
         await asyncio.sleep(185)
         try:
             res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
@@ -182,9 +167,24 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     if q.data == "STATUS":
         await bot_logic.fetch_balance()
+        market_list = ", ".join(MARKETS)
+        trade_status = "No Active Trade"
+        
+        if bot_logic.active_trade_info:
+            try:
+                res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
+                pnl = float(res['proposal_open_contract'].get('profit', 0))
+                elapsed = int(time.time() - bot_logic.trade_start_time)
+                remaining = max(0, 180 - elapsed)
+                icon = "🟢 WINNING" if pnl >= 0 else "🔴 LOSING"
+                trade_status = f"🚀 **Active Trade**: `{bot_logic.active_market}`\n📈 **Live PnL**: {icon} (${pnl:.2f})\n⏳ **Time Left**: `{remaining}s`"
+            except: trade_status = "🚀 **Active Trade**: `Syncing...`"
+
         status_msg = (
             f"🤖 **Bot**: `{'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'}`\n"
-            f"📡 **Scanning**: `R10, R25, R50, R75, R100`\n"
+            f"📡 **Scanning**: `{market_list}`\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"{trade_status}\n"
             f"━━━━━━━━━━━━━━━\n"
             f"🎯 **Trades Today**: `{bot_logic.trades_today}/20`\n"
             f"❌ **Total Lost**: `{bot_logic.total_losses_today}`\n"
@@ -192,11 +192,11 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"💰 **Balance**: `{bot_logic.balance}`"
         )
         await q.edit_message_text(status_msg, reply_markup=main_keyboard(), parse_mode="Markdown")
+    
     elif q.data == "START_SCAN":
+        if not bot_logic.api: await q.edit_message_text("❌ Connect First!", reply_markup=main_keyboard()); return
         bot_logic.is_scanning = True; asyncio.create_task(bot_logic.background_scanner())
-        await q.edit_message_text("🔍 **RANGE SCANNER ACTIVE**", reply_markup=main_keyboard())
-    elif q.data == "TEST_BUY":
-        await bot_logic.execute_trade("CALL", "R_10", "MANUAL")
+        await q.edit_message_text("🔍 **SCANNER ACTIVE**", reply_markup=main_keyboard())
     elif q.data == "SET_DEMO":
         bot_logic.active_token = DEMO_TOKEN; await bot_logic.connect()
         await q.edit_message_text(f"✅ Connected to DEMO", reply_markup=main_keyboard())
@@ -204,9 +204,10 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic.active_token = REAL_TOKEN; await bot_logic.connect()
         await q.edit_message_text(f"⚠️ **LIVE CONNECTED**", reply_markup=main_keyboard())
     elif q.data == "STOP_SCAN": bot_logic.is_scanning = False
+    elif q.data == "TEST_BUY": await bot_logic.execute_trade("CALL", "R_10", "MANUAL")
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper Range v4.0**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper Range M1 v4.1**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
