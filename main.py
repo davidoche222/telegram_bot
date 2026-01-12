@@ -13,11 +13,12 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "2hsJzopRHG5wUEb"
 APP_ID = 1089
 
-MARKETS = ["R_10", "R_25", "R_50", "R_75", "R_100"]
+# Survival Markets: R10, R25, and now R50
+MARKETS = ["R_10", "R_25", "R_50"]
 
-COOLDOWN_SEC = 300 
+COOLDOWN_SEC = 120 
 MAX_TRADES_PER_DAY = 20
-MAX_CONSEC_LOSSES = 5
+MAX_CONSEC_LOSSES = 4 # Stop after 4 losses in a row
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -34,41 +35,40 @@ def calculate_indicators(candles):
     l = np.array([x["l"] for x in candles], dtype=float)
     o = np.array([x["o"] for x in candles], dtype=float)
 
+    # 1. EMA 50 + Slope
+    ema_p = 50
+    ema50 = [c[0]]
+    k = 2 / (ema_p + 1)
+    for price in c[1:]:
+        ema50.append(price * k + ema50[-1] * (1 - k))
+    ema50 = np.array(ema50)
+    slope = ema50[-1] - ema50[-3]
+
+    # 2. Bollinger Bands (20, 2)
     period = 20
     sma = np.convolve(c, np.ones(period), "valid") / period
     std_dev = np.array([np.std(c[i : i + period]) for i in range(len(sma))], dtype=float)
-    upper_band = sma + (std_dev * 2)
-    lower_band = sma - (std_dev * 2)
+    bb_mid = sma
 
-    adx_p = 14
-    tr = np.maximum(h[1:] - l[1:], np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
-    plus_dm = np.where((h[1:] - h[:-1]) > (l[:-1] - l[1:]), np.maximum(h[1:] - h[:-1], 0), 0)
-    minus_dm = np.where((l[:-1] - l[1:]) > (h[1:] - h[:-1]), np.maximum(l[:-1] - l[1:], 0), 0)
+    # 3. RSI 14
+    delta = np.diff(c)
+    gain = (delta.clip(min=0))
+    loss = (-delta.clip(max=0))
+    avg_gain = np.convolve(gain, np.ones(14), 'valid') / 14
+    avg_loss = np.convolve(loss, np.ones(14), 'valid') / 14
+    rs = avg_gain / (avg_loss + 1e-9)
+    rsi = 100 - (100 / (1 + rs))
 
-    def smooth(data, p):
-        if len(data) < p: return np.array([], dtype=float)
-        res = [np.mean(data[:p])]
-        for x in data[p:]: res.append((res[-1] * (p - 1) + x) / p)
-        return np.array(res, dtype=float)
+    # 4. Candle Structure (Confirmation)
+    candle_range = np.abs(h[-1] - l[-1]) + 1e-9
+    body_size = np.abs(c[-1] - o[-1])
+    body_pct = (body_size / candle_range) * 100
 
-    trs = smooth(tr, adx_p)
-    pdms = smooth(plus_dm, adx_p)
-    mdms = smooth(minus_dm, adx_p)
-    eps = 1e-9
-    pdi = 100 * (pdms / (trs + eps))
-    mdi = 100 * (mdms / (trs + eps))
-    dx = 100 * (np.abs(pdi - mdi) / (pdi + mdi + eps))
-    adx = smooth(dx, adx_p)
-
-    stoch_p = 14
-    if len(l) < stoch_p: return None
-    l_min = np.array([np.min(l[i : i + stoch_p]) for i in range(len(l) - stoch_p + 1)], dtype=float)
-    h_max = np.array([np.max(h[i : i + stoch_p]) for i in range(len(h) - stoch_p + 1)], dtype=float)
-    pk = 100 * ((c[stoch_p - 1 :] - l_min) / (h_max - l_min + 1e-6))
-    pd = np.convolve(pk, np.ones(3), "valid") / 3
-
-    return (float(upper_band[-1]), float(lower_band[-1]), float(adx[-1]) if len(adx) else 999.0,
-            float(pk[-1]), float(pd[-1]), float(o[-1]), float(c[-1]), float(h[-1]), float(l[-1]))
+    return {
+        "ema50": ema50[-1], "slope": slope,
+        "bb_mid": bb_mid[-1], "rsi": rsi[-1], "body_pct": body_pct,
+        "o": o[-1], "c": c[-1], "h": h[-1], "l": l[-1]
+    }
 
 def build_m1_candles_from_ticks(times, prices):
     if not times or not prices: return []
@@ -139,7 +139,7 @@ class DerivSniperBot:
         self.market_tasks = {sym: asyncio.create_task(self.scan_market(sym)) for sym in MARKETS}
         try:
             while self.is_scanning:
-                if self.active_trade_info and (time.time() - self.trade_start_time > 240):
+                if self.active_trade_info and (time.time() - self.trade_start_time > 330):
                     self.active_trade_info = None
                 await asyncio.sleep(1)
         finally:
@@ -152,20 +152,35 @@ class DerivSniperBot:
             try:
                 if self.consecutive_losses >= MAX_CONSEC_LOSSES or self.trades_today >= MAX_TRADES_PER_DAY:
                     self.is_scanning = False; break
+                
                 data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 1500, "style": "ticks"})
                 candles = build_m1_candles_from_ticks(data["history"]["times"], data["history"]["prices"])
-                if len(candles) < 40: await asyncio.sleep(10); continue
+                if len(candles) < 60: await asyncio.sleep(10); continue
+                
                 ind = calculate_indicators(candles)
                 if not ind: await asyncio.sleep(10); continue
-                up, lw, adx_v, pk, pd, op, cl, hi, lo = ind
+                
                 ok, gate = self.can_auto_trade()
                 self.last_block_reason = gate
                 if not ok: await asyncio.sleep(10); continue
-                if adx_v < 25:
-                    if (lo <= lw) and (pk < 20) and (pk > pd) and (cl > op):
-                        await self.execute_trade("CALL", symbol, f"Oversold BB (ADX:{adx_v:.1f})", source="AUTO")
-                    elif (hi >= up) and (pk > 80) and (pk < pd) and (cl < op):
-                        await self.execute_trade("PUT", symbol, f"Overbought BB (ADX:{adx_v:.1f})", source="AUTO")
+
+                # SURVIVAL STRATEGY LOGIC
+                # CALL LOGIC
+                if ind['c'] > ind['ema50'] and ind['slope'] > 0:
+                    if ind['l'] <= ind['bb_mid'] * 1.0001:
+                        if 45 <= ind['rsi'] <= 60:
+                            if ind['c'] > ind['o'] and ind['body_pct'] >= 60:
+                                if ind['c'] > ind['bb_mid'] and ind['c'] > ind['ema50']:
+                                    await self.execute_trade("CALL", symbol, "EMA Up + BB Mid Pullback", source="AUTO")
+
+                # PUT LOGIC
+                elif ind['c'] < ind['ema50'] and ind['slope'] < 0:
+                    if ind['h'] >= ind['bb_mid'] * 0.9999:
+                        if 40 <= ind['rsi'] <= 55:
+                            if ind['c'] < ind['o'] and ind['body_pct'] >= 60:
+                                if ind['c'] < ind['bb_mid'] and ind['c'] < ind['ema50']:
+                                    await self.execute_trade("PUT", symbol, "EMA Down + BB Mid Pullback", source="AUTO")
+
             except asyncio.CancelledError: break
             except: pass
             await asyncio.sleep(10)
@@ -174,22 +189,21 @@ class DerivSniperBot:
         if not self.api or self.active_trade_info: return
         async with self.trade_lock:
             try:
-                prop = await self.api.proposal({"proposal": 1, "amount": 1.00, "basis": "stake", "contract_type": side, "currency": "USD", "duration": 180, "duration_unit": "s", "symbol": symbol})
+                # 5 Minute Expiry
+                prop = await self.api.proposal({"proposal": 1, "amount": 1.00, "basis": "stake", "contract_type": side, "currency": "USD", "duration": 5, "duration_unit": "m", "symbol": symbol})
                 buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])})
                 self.active_trade_info, self.active_market, self.trade_start_time = int(buy["buy"]["contract_id"]), symbol, time.time()
                 self.last_signal_reason, self.last_trade_side, self.last_trade_source = reason, side, source
                 if source == "AUTO": self.trades_today += 1
                 
-                # FIXED NOTIFICATION: Clean symbol name to prevent crash
                 safe_symbol = str(symbol).replace("_", " ")
                 msg = f"🚀 {side} TRADE OPENED\n🛒 Market: {safe_symbol}\n🧠 Source: {source}\n📝 Reason: {reason}"
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
-                
                 asyncio.create_task(self.check_result(self.active_trade_info, source))
             except: pass
 
     async def check_result(self, cid: int, source: str):
-        await asyncio.sleep(185)
+        await asyncio.sleep(305) 
         try:
             res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
             profit = float(res["proposal_open_contract"].get("profit", 0))
@@ -241,7 +255,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             try:
                 res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
                 pnl = float(res["proposal_open_contract"].get("profit", 0))
-                rem = max(0, 180 - int(time.time() - bot_logic.trade_start_time))
+                rem = max(0, 300 - int(time.time() - bot_logic.trade_start_time))
                 icon = "PROFIT" if pnl > 0 else "LOSS"
                 mkt_clean = str(bot_logic.active_market).replace("_", " ")
                 trade_status = f"🚀 Active Trade ({mkt_clean})\n📈 PnL: {icon} (${pnl:.2f})\n⏳ Left: {rem}s"
@@ -259,7 +273,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(status_msg, reply_markup=main_keyboard())
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 Sniper Range M1 (WAT Edition)", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 Sniper Survival M1 (WAT Edition)", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
