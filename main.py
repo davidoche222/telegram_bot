@@ -3,7 +3,7 @@ import logging
 import time
 import numpy as np
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from deriv_api import DerivAPI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -74,12 +74,16 @@ class DerivSniperBot:
         async with self.trade_lock:
             try:
                 payout_val = float(TARGET_PAYOUT) 
+                # FIX: Added subscribe:1 to prevent "Market Moved" error
                 prop = await self.api.proposal({
                     "proposal": 1, "amount": payout_val, "basis": "payout",
                     "contract_type": side, "currency": "USD", "duration": 150,
-                    "duration_unit": "s", "symbol": symbol
+                    "duration_unit": "s", "symbol": symbol, "subscribe": 1
                 })
                 
+                # Stability delay
+                await asyncio.sleep(0.5)
+
                 if float(prop['proposal']['ask_price']) < 0.35:
                     prop = await self.api.proposal({
                         "proposal": 1, "amount": 0.35, "basis": "stake",
@@ -133,7 +137,6 @@ class DerivSniperBot:
                     await asyncio.sleep(1); break
                 
                 try:
-                    # 1. Fetch Ticks & Convert to 30s Candles
                     data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 600, "style": "ticks"})
                     ticks = list(zip(data['history']['times'], data['history']['prices']))
                     candles = []; curr_t0 = ticks[0][0] - (ticks[0][0] % 30); o = h = l = c = ticks[0][1]
@@ -147,8 +150,7 @@ class DerivSniperBot:
                     if len(candles) < 110: continue
                     ema100, psar, hist, op, hi, lo, cl = calculate_indicators(candles)
                     
-                    # --- START STRATEGY LOGIC ---
-                    
+                    # --- RESTORED STRATEGY LOGIC ---
                     # CALL SETUP: Price > EMA100 AND MACD > 0
                     if cl[-1] > ema100[-1] and hist[-1] > 0:
                         # TRIGGER: PSAR flips from above to below candle
@@ -162,8 +164,6 @@ class DerivSniperBot:
                         if psar[-1] > hi[-1] and psar[-2] < lo[-2]:
                             logger.info(f"🎯 SIGNAL FOUND: PUT on {symbol}")
                             await self.execute_trade(symbol, "PUT")
-                    
-                    # --- END STRATEGY LOGIC ---
 
                 except Exception as e:
                     logger.debug(f"Scanner error on {symbol}: {e}")
@@ -175,12 +175,10 @@ def calculate_indicators(candles):
     c = np.array([x['c'] for x in candles]); h = np.array([x['h'] for x in candles])
     l = np.array([x['l'] for x in candles]); o = np.array([x['o'] for x in candles])
     
-    # EMA 100
     ema = [c[0]]; k = 2 / (101)
     for price in c[1:]: ema.append(price * k + ema[-1] * (1 - k))
     ema100 = np.array(ema)
     
-    # MACD (12, 26, 9)
     def get_ema(data, p):
         res = [data[0]]; alpha = 2/(p+1)
         for v in data[1:]: res.append(v*alpha + res[-1]*(1-alpha))
@@ -188,7 +186,6 @@ def calculate_indicators(candles):
     macd_line = get_ema(c, 12) - get_ema(c, 26)
     sig_line = get_ema(macd_line, 9); hist = macd_line - sig_line
     
-    # PSAR Calculation
     psar = np.zeros(len(c)); up = True; af = 0.02; ep = h[0]; psar[0] = l[0]
     for i in range(1, len(c)):
         psar[i] = psar[i-1] + af * (ep - psar[i-1])
@@ -250,11 +247,12 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic.current_market = "None"
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper Bot v8.2 Dashboard**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper Bot v8.4 Dashboard**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
+    # FIX: drop_pending_updates=True prevents Conflict error by clearing old sessions
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     bot_logic.app = app
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(btn_handler))
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
