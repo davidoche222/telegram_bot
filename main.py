@@ -70,14 +70,17 @@ class DerivSniperBot:
         self.is_scanning = False
         self.scanner_status = "💤 Offline"
         
+        # Live Tracking
         self.active_trade_info = None 
         self.trade_start_time = 0
         self.cooldown_until = 0
         self.last_reason = "Waiting for data..."
         
+        # Strategy Stages
         self.buy_stage = 0
         self.sell_stage = 0
         
+        # Risk Management
         self.trades_today = 0
         self.consecutive_losses = 0
         self.pnl_today = 0.0
@@ -100,6 +103,7 @@ class DerivSniperBot:
 
     async def background_scanner(self):
         while self.is_scanning:
+            # --- SMART STATUS UPDATE ---
             if self.active_trade_info:
                 self.scanner_status = "🚀 In Trade"
             elif time.time() < self.cooldown_until:
@@ -110,12 +114,12 @@ class DerivSniperBot:
             if self.consecutive_losses >= 5:
                 self.is_scanning = False
                 self.scanner_status = "🛑 STOPPED (5 LOSSES)"
-                await self.app.bot.send_message(TELEGRAM_CHAT_ID, "🛑 **Safety Stop**: 5 consecutive losses reached.")
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, "🛑 **Safety Stop**: 5 consecutive losses reached. Bot deactivated.")
                 break
             
             if self.trades_today >= 20:
                 self.is_scanning = False
-                self.scanner_status = "🛑 DAILY LIMIT REACHED"
+                self.scanner_status = "🛑 DAILY LIMIT (20) REACHED"
                 break
 
             try:
@@ -130,18 +134,18 @@ class DerivSniperBot:
                     if t0 != curr_t0:
                         candles.append({'o':o, 'h':h, 'l':l, 'c':c})
                         curr_t0, o, h, l, c = t0, p, p, p, p
-                    else: h, l, c = max(h, p), min(l, p), p
+                    else:
+                        h, l, c = max(h, p), min(l, p), p
                 
                 if len(candles) < 110: continue
 
                 ema100, psar, hist, op, hi, lo, cl = calculate_indicators(candles)
                 
-                # --- V6.4 OPTIMIZED EXECUTION FILTERS ---
-                slope = ema100[-1] - ema100[-3]   # Shortened lookback
-                slope_threshold = 0.00001        # Relaxed threshold
+                slope = ema100[-1] - ema100[-6]
+                slope_threshold = 0.00005 
                 avg_range = np.mean(hi[-20:] - lo[-20:])
                 body = abs(cl[-1] - op[-1])
-                avg_body = np.mean(np.abs(cl[-10:-1] - op[-10:-1]))
+                avg_body = np.mean(np.abs(cl[-6:-1] - op[-6:-1]))
 
                 ps_above = psar[-1] > hi[-1]
                 ps_below = psar[-1] < lo[-1]
@@ -151,31 +155,30 @@ class DerivSniperBot:
                 # --- SELL Logic ---
                 if slope < -slope_threshold and cl[-1] < ema100[-1]:
                     if (not prev_ps_above) and ps_above:
-                        self.sell_stage = 1; self.buy_stage = 0; self.last_reason = "SELL: Flip detected"
+                        self.sell_stage = 1; self.buy_stage = 0; self.last_reason = "SELL: Flip 1 detected"
+                    elif self.sell_stage == 1 and ps_above:
+                        self.sell_stage = 2; self.last_reason = "SELL: Stage 2 confirmed"
                     
-                    if self.sell_stage >= 1 and time.time() >= self.cooldown_until:
-                        # Reduced volatility gap requirement to 30% (0.3) for more trades
-                        if abs(psar[-1] - cl[-1]) >= 0.3 * avg_range and cl[-1] < op[-1]:
+                    if self.sell_stage == 2 and time.time() >= self.cooldown_until:
+                        if abs(psar[-1] - cl[-1]) >= 0.6 * avg_range and hist[-1] < hist[-2] and cl[-1] < op[-1] and body >= avg_body:
                             await self.execute_trade("PUT", "AUTO"); self.sell_stage = 0
-                        else: self.last_reason = "SELL: Waiting for Gap/Candle"
+                        else: self.last_reason = "SELL: Waiting for Momentum/Body"
                 else: 
-                    self.sell_stage = 0
+                    if cl[-1] > ema100[-1] or slope > 0: self.sell_stage = 0
 
                 # --- BUY Logic ---
                 if slope > slope_threshold and cl[-1] > ema100[-1]:
                     if (not prev_ps_below) and ps_below:
-                        self.buy_stage = 1; self.sell_stage = 0; self.last_reason = "BUY: Flip detected"
+                        self.buy_stage = 1; self.sell_stage = 0; self.last_reason = "BUY: Flip 1 detected"
+                    elif self.buy_stage == 1 and ps_below:
+                        self.buy_stage = 2; self.last_reason = "BUY: Stage 2 confirmed"
                     
-                    if self.buy_stage >= 1 and time.time() >= self.cooldown_until:
-                        # Reduced volatility gap requirement to 30% (0.3) for more trades
-                        if abs(psar[-1] - cl[-1]) >= 0.3 * avg_range and cl[-1] > op[-1]:
+                    if self.buy_stage == 2 and time.time() >= self.cooldown_until:
+                        if abs(psar[-1] - cl[-1]) >= 0.6 * avg_range and hist[-1] > hist[-2] and cl[-1] > op[-1] and body >= avg_body:
                             await self.execute_trade("CALL", "AUTO"); self.buy_stage = 0
-                        else: self.last_reason = "BUY: Waiting for Gap/Candle"
+                        else: self.last_reason = "BUY: Waiting for Momentum/Body"
                 else:
-                    self.buy_stage = 0
-
-                # Logger for terminal verification
-                logger.info(f"Scan: Slope {slope:.6f} | B:{self.buy_stage} S:{self.sell_stage} | {self.last_reason}")
+                    if cl[-1] < ema100[-1] or slope < 0: self.buy_stage = 0
 
             except Exception as e:
                 logger.error(f"Scanner Error: {e}")
@@ -191,14 +194,13 @@ class DerivSniperBot:
                     "contract_type": side, "currency": "USD",
                     "duration": 150, "duration_unit": "s", "symbol": MARKET
                 })
-                # Added slippage buffer to price
-                buy = await self.api.buy({"buy": proposal["proposal"]["id"], "price": float(proposal["proposal"]["ask_price"]) + 0.05})
+                buy = await self.api.buy({"buy": proposal["proposal"]["id"], "price": float(proposal["proposal"]["ask_price"]) + 0.02})
                 
                 self.active_trade_info = buy["buy"]["contract_id"]
                 self.trade_start_time = time.time()
                 if source == "AUTO": self.trades_today += 1
                 
-                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **{side} TRADE ({source})**\nMarket: {MARKET}")
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🚀 **{side} TRADE EXECUTED ({source})**\nStage 2 PSAR Confirmation\nMarket: {MARKET}")
                 asyncio.create_task(self.check_result(self.active_trade_info, source))
             except Exception as e:
                 logger.error(f"Execution Error: {e}")
@@ -214,17 +216,17 @@ class DerivSniperBot:
                 else: self.consecutive_losses = 0
             
             await self.fetch_balance()
-            status = '✅ WIN' if profit > 0 else '❌ LOSS'
-            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 **{status}** (${profit:.2f})\nStreak: {self.consecutive_losses}/5")
+            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 **TRADE FINISHED**\nResult: {'✅ WIN' if profit > 0 else '❌ LOSS'} (${profit:.2f})\nStreak: {self.consecutive_losses}/5 losses.")
         finally:
             self.active_trade_info = None
             self.cooldown_until = time.time() + COOLDOWN_SEC
+            # Notification for cooldown ending
             asyncio.create_task(self.notify_cooldown_end())
 
     async def notify_cooldown_end(self):
         await asyncio.sleep(COOLDOWN_SEC)
         if self.is_scanning:
-            await self.app.bot.send_message(TELEGRAM_CHAT_ID, "📡 **Ready**: Cooldown ended.")
+            await self.app.bot.send_message(TELEGRAM_CHAT_ID, "📡 **Cooldown Ended**: Bot is now searching for the next signal.")
 
 # ========================= UI =========================
 bot_logic = DerivSniperBot()
@@ -241,28 +243,54 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     
     if q.data == "STATUS":
         await bot_logic.fetch_balance()
+        
+        # Priority-based status display
+        if not bot_logic.is_scanning:
+            current_state = "💤 Offline"
+        elif bot_logic.active_trade_info:
+            current_state = "🚀 In Trade"
+        elif time.time() < bot_logic.cooldown_until:
+            current_state = "⏱️ In Cooldown"
+        else:
+            current_state = "📡 Searching for Signal"
+
+        status_header = f"🤖 **Bot State**: `{current_state}`\n🔑 **Account**: `{bot_logic.account_type}`\n"
+        
+        trade_text = ""
+        if bot_logic.active_trade_info:
+            try:
+                res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
+                current_pnl = float(res['proposal_open_contract'].get('profit', 0))
+                pnl_icon = "🟢" if current_pnl >= 0 else "🔴"
+                elapsed = int(time.time() - bot_logic.trade_start_time)
+                remaining = max(0, 150 - elapsed)
+                trade_text = f"\n⏳ **Live Trade**: {pnl_icon} `${current_pnl:.2f}`\n⏱️ **Remaining**: `{remaining}s`\n"
+            except: trade_text = "\n⏳ **Trade Status**: `Updating...`\n"
+        
         cd = max(0, int(bot_logic.cooldown_until - time.time()))
-        txt = f"📊 **STATUS**\nState: `{bot_logic.scanner_status}`\nAcc: `{bot_logic.account_type}`\nBal: `{bot_logic.balance}`\nCD: `{cd}s`"
-        await q.edit_message_text(txt, reply_markup=main_keyboard(), parse_mode="Markdown")
+        summary = f"\n💰 **Balance**: `{bot_logic.balance}`\n🎯 **Today**: `{bot_logic.trades_today}/20` | **Streak**: `{bot_logic.consecutive_losses}/5`"
+        details = f"\n📈 **Stages**: `B:{bot_logic.buy_stage} S:{bot_logic.sell_stage}`\n⏱️ **Cooldown**: `{cd}s`\n💬 **Last**: `{bot_logic.last_reason}`"
+        
+        await q.edit_message_text(f"📊 **DETAILED STATUS**\n{status_header}{trade_text}{details}{summary}", reply_markup=main_keyboard(), parse_mode="Markdown")
 
     elif q.data == "START_SCAN":
-        if not bot_logic.api: await q.edit_message_text("❌ Connect First!", reply_markup=main_keyboard()); return
+        if not bot_logic.api: await q.edit_message_text("❌ Connect Account First!", reply_markup=main_keyboard()); return
         bot_logic.is_scanning = True; asyncio.create_task(bot_logic.background_scanner())
-        await q.edit_message_text("🔍 **SCANNER ACTIVE**", reply_markup=main_keyboard(), parse_mode="Markdown")
+        await q.edit_message_text("🔍 **SCANNER ACTIVE**\nStrategy: Strict Second SAR Confirmation", reply_markup=main_keyboard(), parse_mode="Markdown")
 
     elif q.data == "SET_DEMO":
         bot_logic.active_token = DEMO_TOKEN; await bot_logic.connect(); bot_logic.account_type = "DEMO"
-        await q.edit_message_text(f"✅ Connected to DEMO", reply_markup=main_keyboard())
+        await q.edit_message_text(f"✅ Connected to DEMO\nBal: {bot_logic.balance}", reply_markup=main_keyboard())
             
     elif q.data == "SET_REAL":
         bot_logic.active_token = REAL_TOKEN; await bot_logic.connect(); bot_logic.account_type = "LIVE 💰"
-        await q.edit_message_text(f"⚠️ **LIVE CONNECTED**", reply_markup=main_keyboard(), parse_mode="Markdown")
+        await q.edit_message_text(f"⚠️ **CONNECTED TO LIVE**\nBal: {bot_logic.balance}", reply_markup=main_keyboard(), parse_mode="Markdown")
             
     elif q.data == "TEST_BUY": await bot_logic.execute_trade("CALL", "MANUAL-TEST")
     elif q.data == "STOP_SCAN": bot_logic.is_scanning = False; bot_logic.scanner_status = "💤 Offline"
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper v6.4 (Optimized)**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper v6.3 (Smart Status Edition)**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
