@@ -107,6 +107,7 @@ class DerivSniperBot:
         except: return False
 
     async def fetch_balance(self):
+        if not self.api: return
         try:
             bal = await self.api.balance({"balance": 1})
             self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
@@ -138,15 +139,12 @@ class DerivSniperBot:
                 candles = build_candles(data["history"]["times"], data["history"]["prices"])
                 if len(candles) < 40: 
                     await asyncio.sleep(10); continue
-
                 ind = calculate_indicators(candles)
                 if not ind: continue
                 up, lw, adx_v, pk, pd, op, cl, hi, lo = ind
-                
                 ok, gate = self.can_auto_trade()
                 if not ok: 
                     await asyncio.sleep(5); continue
-
                 if adx_v < 30:
                     if (lo <= lw) and (pk < 25) and (pk > pd):
                         await self.execute_trade("CALL", symbol, "Oversold BB", source="AUTO")
@@ -195,50 +193,60 @@ def main_keyboard():
     ])
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query; await q.answer()
+    q = u.callback_query
+    await q.answer()
+    
     if q.data == "SET_DEMO":
         bot_logic.active_token = DEMO_TOKEN; bot_logic.account_type = "DEMO"
         ok = await bot_logic.connect()
         await q.edit_message_text("✅ DEMO CONNECTED" if ok else "❌ FAILED", reply_markup=main_keyboard())
+    
     elif q.data == "SET_REAL":
         bot_logic.active_token = REAL_TOKEN; bot_logic.account_type = "LIVE"
         ok = await bot_logic.connect()
         await q.edit_message_text("⚠️ LIVE CONNECTED" if ok else "❌ FAILED", reply_markup=main_keyboard())
+    
     elif q.data == "START_SCAN":
-        if not bot_logic.api: await q.edit_message_text("Connect First!", reply_markup=main_keyboard()); return
+        if not bot_logic.api: 
+            await q.edit_message_text("❌ Connect First!", reply_markup=main_keyboard())
+            return
         bot_logic.is_scanning = True
         asyncio.create_task(bot_logic.background_scanner())
         await q.edit_message_text("🔍 *SCANNER ACTIVE*", reply_markup=main_keyboard(), parse_mode="Markdown")
+    
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
         await q.edit_message_text("⏹️ STOPPED", reply_markup=main_keyboard())
+    
     elif q.data == "TEST_BUY":
         await bot_logic.execute_trade("CALL", "R_10", "Manual Test")
+    
     elif q.data == "STATUS":
         await bot_logic.fetch_balance()
-        now = datetime.now().strftime("%H:%M:%S")
+        now_time = datetime.now().strftime("%H:%M:%S")
         ok, gate = bot_logic.can_auto_trade()
         
-        # --- Live Trade Check ---
         trade_status = "No active trade"
-        if bot_logic.active_trade_info:
+        if bot_logic.active_trade_info and bot_logic.api:
             try:
                 res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
                 pnl = float(res['proposal_open_contract'].get('profit', 0))
-                rem = max(0, 180 - int(time.time() - bot_logic.trade_start_time))
+                elapsed = int(time.time() - bot_logic.trade_start_time)
+                rem = max(0, 180 - elapsed)
                 icon = "🟢" if pnl >= 0 else "🔴"
-                trade_status = f"Active: {bot_logic.active_market} | {icon} PnL: ${pnl:.2f} | {rem}s left"
-            except: trade_status = "Active trade: syncing..."
+                trade_status = f"Active: {bot_logic.active_market} | {icon} PnL: ${pnl:.2f} | {rem}s"
+            except:
+                trade_status = "Syncing trade..."
 
         status_text = (
-            f"🕒 **Time:** `{now}`\n"
-            f"🤖 **Bot State:** `{'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'}`\n"
+            f"🕒 **Time:** `{now_time}`\n"
+            f"🤖 **Bot:** `{'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'}` (`{bot_logic.account_type}`)\n"
             f"📡 **Scanning:** `{', '.join(MARKETS)}`\n"
             f"━━━━━━━━━━━━━━━\n"
             f"📌 **Trade:** {trade_status}\n"
             f"💰 **Balance:** `{bot_logic.balance}`\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"🎯 **Today:** `{bot_logic.trades_today}/20` | 📉 **Streak:** `{bot_logic.consecutive_losses}/5` losses\n"
+            f"🎯 **Today:** `{bot_logic.trades_today}/20` | 📉 **Loss Streak:** `{bot_logic.consecutive_losses}/5` \n"
             f"🚦 **Gate:** `{gate}`"
         )
         await q.edit_message_text(status_text, reply_markup=main_keyboard(), parse_mode="Markdown")
@@ -249,5 +257,6 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     bot_logic.app = app
-    app.add_handler(CommandHandler("start", start_cmd)); app.add_handler(CallbackQueryHandler(btn_handler))
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CallbackQueryHandler(btn_handler))
     app.run_polling(drop_pending_updates=True)
