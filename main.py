@@ -12,6 +12,7 @@ REAL_TOKEN = "2hsJzopRHG5wUEb"
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50", "R_75", "R_100"] 
+STAKE_AMOUNT = 0.52  # Updated to $0.52 as requested
 COOLDOWN_SEC = 300 
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
@@ -114,13 +115,11 @@ class DerivSniperBot:
                 up, lw, adx_v, pk, pd, op, cl, hi, lo = calculate_indicators(candles)
 
                 if adx_v < 25 and time.time() >= self.cooldown_until:
-                    # CALL Logic
                     if lo <= lw and pk < 20 and pk > pd and cl > op:
-                        reason = f"Ranging Market (ADX:{adx_v:.1f})\nBottom Band Touch + Stoch Cross ({pk:.1f})"
+                        reason = f"Ranging (ADX:{adx_v:.1f})\nBottom Band + Stoch ({pk:.1f})"
                         await self.execute_trade("CALL", symbol, reason)
-                    # PUT Logic
                     elif hi >= up and pk > 80 and pk < pd and cl < op:
-                        reason = f"Ranging Market (ADX:{adx_v:.1f})\nTop Band Touch + Stoch Cross ({pk:.1f})"
+                        reason = f"Ranging (ADX:{adx_v:.1f})\nTop Band + Stoch ({pk:.1f})"
                         await self.execute_trade("PUT", symbol, reason)
 
             except Exception as e: logger.error(f"Error {symbol}: {e}")
@@ -130,7 +129,17 @@ class DerivSniperBot:
         if not self.api or self.active_trade_info: return
         async with self.trade_lock:
             try:
-                proposal = await self.api.proposal({"proposal": 1, "amount": 1.00, "basis": "stake", "contract_type": side, "currency": "USD", "duration": 180, "duration_unit": "s", "symbol": symbol})
+                # Using STAKE_AMOUNT from config
+                proposal = await self.api.proposal({
+                    "proposal": 1, 
+                    "amount": STAKE_AMOUNT, 
+                    "basis": "stake", 
+                    "contract_type": side, 
+                    "currency": "USD", 
+                    "duration": 180, 
+                    "duration_unit": "s", 
+                    "symbol": symbol
+                })
                 buy = await self.api.buy({"buy": proposal["proposal"]["id"], "price": float(proposal["proposal"]["ask_price"]) + 0.02})
                 self.active_trade_info = buy["buy"]["contract_id"]
                 self.active_market = symbol
@@ -139,9 +148,9 @@ class DerivSniperBot:
                 source = "AUTO" if "Manual" not in reason else "MANUAL"
                 if source == "AUTO": self.trades_today += 1
                 
-                # RESTORED UI + REASON INFO
                 msg = (f"🚀 **{side} TRADE OPENED**\n"
                        f"🛒 Market: `{symbol}`\n"
+                       f"💵 Stake: `${STAKE_AMOUNT}`\n"
                        f"📝 **Reason**: {reason}")
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
                 
@@ -219,7 +228,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif q.data == "TEST_BUY": await bot_logic.execute_trade("CALL", "R_10", "Manual Test")
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper Range M1 v4.2**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper Range M1 v4.3**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
