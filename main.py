@@ -36,7 +36,6 @@ class DerivSniperBot:
         self.scanner_status = "💤 Offline"
         self.active_trade_info = None 
         self.cooldown_until = 0
-        self.stages = {m: {"buy": 0, "sell": 0} for m in MARKETS}
         self.balance = "0.00"
         self.trade_lock = asyncio.Lock()
         
@@ -64,42 +63,47 @@ class DerivSniperBot:
             self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
         except: pass
 
-    async def execute_trade(self, symbol, side):
+    async def execute_trade(self, symbol, side, retry=False):
+        """Execute trade with slippage protection and retry logic."""
         if not self.api or self.active_trade_info: return
-        if self.trades_today >= MAX_TRADES_PER_DAY:
-            self.is_scanning = False
-            self.scanner_status = "🛑 Daily Limit Reached"
-            return
-
+        
         async with self.trade_lock:
             try:
-                payout_val = float(TARGET_PAYOUT) 
-                # FIX: Added subscribe:1 to prevent "Market Moved" error
+                # 1. Get current proposal
                 prop = await self.api.proposal({
-                    "proposal": 1, "amount": payout_val, "basis": "payout",
+                    "proposal": 1, "amount": float(TARGET_PAYOUT), "basis": "payout",
                     "contract_type": side, "currency": "USD", "duration": 150,
                     "duration_unit": "s", "symbol": symbol, "subscribe": 1
                 })
                 
-                # Stability delay
-                await asyncio.sleep(0.5)
+                ask_price = float(prop['proposal']['ask_price'])
+                
+                # 2. Add Slippage Buffer (Max price we are willing to pay)
+                # Allowing a 1.5% move prevents the "market moved" error
+                max_buy_price = round(ask_price * 1.015, 2)
 
-                if float(prop['proposal']['ask_price']) < 0.35:
-                    prop = await self.api.proposal({
-                        "proposal": 1, "amount": 0.35, "basis": "stake",
-                        "contract_type": side, "currency": "USD", "duration": 150,
-                        "duration_unit": "s", "symbol": symbol
-                    })
-
-                buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])})
+                # 3. Buy the contract
+                buy = await self.api.buy({
+                    "buy": prop["proposal"]["id"], 
+                    "price": max_buy_price
+                })
+                
                 self.active_trade_info = buy["buy"]["contract_id"]
                 self.trades_today += 1
                 
-                msg = f"🚀 **{side} TRADE**\nMarket: `{symbol}`\nStake: `${float(prop['proposal']['ask_price']):.2f}`\nPayout: `$1.00`"
+                msg = f"🚀 **{side} TRADE**\nMarket: `{symbol}`\nStake: `${ask_price:.2f}`\nPayout: `$1.00`"
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
                 asyncio.create_task(self.check_result(self.active_trade_info))
+                
             except Exception as e:
-                logger.error(f"Trade Error: {e}")
+                err = str(e)
+                if "moved too much" in err and not retry:
+                    logger.warning(f"Market moved. Attempting one immediate retry for {symbol}...")
+                    # Delay slightly and retry once
+                    await asyncio.sleep(0.2)
+                    asyncio.create_task(self.execute_trade(symbol, side, retry=True))
+                else:
+                    logger.error(f"Trade Error: {e}")
 
     async def check_result(self, cid):
         await asyncio.sleep(160)
@@ -111,16 +115,13 @@ class DerivSniperBot:
             if p <= 0:
                 self.weekly_losses += 1
                 self.consecutive_losses += 1
-                if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-                    self.is_scanning = False
-                    self.scanner_status = "🛑 Safety Stop"
             else:
                 self.weekly_wins += 1
                 self.consecutive_losses = 0
             
             await self.fetch_balance()
             status = '✅ WIN' if p > 0 else '❌ LOSS'
-            msg = f"🏁 **{status}** (${float(p):.2f})\nStreak: {self.consecutive_losses} | Today: {self.trades_today}/30"
+            msg = f"🏁 **{status}** (${float(p):.2f})\nStreak: {self.consecutive_losses} | Today: {self.trades_today}"
             await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
         finally:
             self.active_trade_info = None
@@ -150,27 +151,21 @@ class DerivSniperBot:
                     if len(candles) < 110: continue
                     ema100, psar, hist, op, hi, lo, cl = calculate_indicators(candles)
                     
-                    # --- RESTORED STRATEGY LOGIC ---
-                    # CALL SETUP: Price > EMA100 AND MACD > 0
+                    # CALL Logic
                     if cl[-1] > ema100[-1] and hist[-1] > 0:
-                        # TRIGGER: PSAR flips from above to below candle
                         if psar[-1] < lo[-1] and psar[-2] > hi[-2]:
-                            logger.info(f"🎯 SIGNAL FOUND: CALL on {symbol}")
                             await self.execute_trade(symbol, "CALL")
                     
-                    # PUT SETUP: Price < EMA100 AND MACD < 0
+                    # PUT Logic
                     elif cl[-1] < ema100[-1] and hist[-1] < 0:
-                        # TRIGGER: PSAR flips from below to above candle
                         if psar[-1] > hi[-1] and psar[-2] < lo[-2]:
-                            logger.info(f"🎯 SIGNAL FOUND: PUT on {symbol}")
                             await self.execute_trade(symbol, "PUT")
 
                 except Exception as e:
                     logger.debug(f"Scanner error on {symbol}: {e}")
-                
                 await asyncio.sleep(1)
 
-# ========================= UTILITIES =========================
+# ========================= INDICATORS =========================
 def calculate_indicators(candles):
     c = np.array([x['c'] for x in candles]); h = np.array([x['h'] for x in candles])
     l = np.array([x['l'] for x in candles]); o = np.array([x['o'] for x in candles])
@@ -199,13 +194,13 @@ def calculate_indicators(candles):
             elif l[i] < ep: ep = l[i]; af = min(0.2, af + 0.02)
     return ema100, psar, hist, o, h, l, c
 
-# ========================= UI & APP =========================
+# ========================= TELEGRAM UI =========================
 bot_logic = DerivSniperBot()
 
 def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("▶️ START SCANNER", callback_data="START_SCAN"), InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
-        [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY"), InlineKeyboardButton("📊 STATUS", callback_data="STATUS")],
+        [InlineKeyboardButton("📊 STATUS", callback_data="STATUS")],
         [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
     ])
 
@@ -213,46 +208,28 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query; await q.answer()
     if q.data == "STATUS":
         await bot_logic.fetch_balance()
-        streak_icon = "⚠️" if bot_logic.consecutive_losses > 0 else "🔥"
-        txt = (
-            f"📊 **BOT DASHBOARD**\n━━━━━━━━━━━━━━━\n"
-            f"🖥 **System**: `{bot_logic.scanner_status}`\n"
-            f"🛰 **Scanning**: `{bot_logic.current_market}`\n"
-            f"💰 **Balance**: `{bot_logic.balance}`\n\n"
-            f"📈 **Session Stats**:\n"
-            f"├ Wins: `{bot_logic.weekly_wins}` | Losses: `{bot_logic.weekly_losses}`\n"
-            f"├ Profit: `${float(bot_logic.weekly_profit):.2f}`\n"
-            f"└ Total Trades: `{bot_logic.trades_today}/30`\n\n"
-            f"{streak_icon} **Current Streak**: `{bot_logic.consecutive_losses}/5 losses`"
-        )
+        txt = f"📊 **STATUS**\nSystem: `{bot_logic.scanner_status}`\nBalance: `{bot_logic.balance}`\nWins/Losses: `{bot_logic.weekly_wins}/{bot_logic.weekly_losses}`"
         await q.edit_message_text(txt, reply_markup=main_keyboard(), parse_mode="Markdown")
     elif q.data == "START_SCAN":
-        if not bot_logic.active_token:
-            await q.edit_message_text("❌ Connect DEMO or LIVE first!", reply_markup=main_keyboard()); return
+        if not bot_logic.active_token: return
         bot_logic.is_scanning = True
         bot_logic.scanner_status = "📡 Active"
         asyncio.create_task(bot_logic.background_scanner())
-        await q.edit_message_text("🔍 **SCANNER INITIALIZED**", reply_markup=main_keyboard())
     elif q.data == "SET_DEMO":
         bot_logic.active_token = DEMO_TOKEN; await bot_logic.connect()
-        await q.edit_message_text("✅ DEMO CONNECTED", reply_markup=main_keyboard())
     elif q.data == "SET_REAL":
         bot_logic.active_token = REAL_TOKEN; await bot_logic.connect()
-        await q.edit_message_text("⚠️ LIVE CONNECTED", reply_markup=main_keyboard())
-    elif q.data == "TEST_BUY":
-        await bot_logic.execute_trade("R_10", "CALL")
-    elif q.data == "STOP_SCAN": 
+    elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
         bot_logic.scanner_status = "⏹️ Stopped"
-        bot_logic.current_market = "None"
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 **Sniper Bot v8.4 Dashboard**", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 **Sniper Bot v8.6**", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
-    # FIX: drop_pending_updates=True prevents Conflict error by clearing old sessions
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     bot_logic.app = app
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(btn_handler))
+    # drop_pending_updates kills old sessions to prevent the Conflict error
     app.run_polling(drop_pending_updates=True)
