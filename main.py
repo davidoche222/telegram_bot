@@ -13,61 +13,61 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "2hsJzopRHG5wUEb"
 APP_ID = 1089
 
-# Survival Markets: R10, R25, and now R50
 MARKETS = ["R_10", "R_25", "R_50"]
 
 COOLDOWN_SEC = 120 
 MAX_TRADES_PER_DAY = 20
-MAX_CONSEC_LOSSES = 4 # Stop after 4 losses in a row
+MAX_CONSEC_LOSSES = 4 
 
 TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
 TELEGRAM_CHAT_ID = "7634818949"
-
-TELEGRAM_DEBUG = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # ========================= STRATEGY MATH =========================
-def calculate_indicators(candles):
-    c = np.array([x["c"] for x in candles], dtype=float)
-    h = np.array([x["h"] for x in candles], dtype=float)
-    l = np.array([x["l"] for x in candles], dtype=float)
-    o = np.array([x["o"] for x in candles], dtype=float)
+def calculate_ema(data, period):
+    if len(data) < period: return np.array([])
+    values = np.array(data, dtype=float)
+    ema = np.zeros_like(values)
+    k = 2 / (period + 1)
+    ema[0] = values[0]
+    for i in range(1, len(values)):
+        ema[i] = values[i] * k + ema[i-1] * (1 - k)
+    return ema
 
-    # 1. EMA 50 + Slope
-    ema_p = 50
-    ema50 = [c[0]]
-    k = 2 / (ema_p + 1)
-    for price in c[1:]:
-        ema50.append(price * k + ema50[-1] * (1 - k))
-    ema50 = np.array(ema50)
-    slope = ema50[-1] - ema50[-3]
-
-    # 2. Bollinger Bands (20, 2)
-    period = 20
-    sma = np.convolve(c, np.ones(period), "valid") / period
-    std_dev = np.array([np.std(c[i : i + period]) for i in range(len(sma))], dtype=float)
-    bb_mid = sma
-
-    # 3. RSI 14
-    delta = np.diff(c)
+def calculate_rsi(data, period=14):
+    delta = np.diff(data)
     gain = (delta.clip(min=0))
     loss = (-delta.clip(max=0))
-    avg_gain = np.convolve(gain, np.ones(14), 'valid') / 14
-    avg_loss = np.convolve(loss, np.ones(14), 'valid') / 14
+    avg_gain = np.convolve(gain, np.ones(period), 'valid') / period
+    avg_loss = np.convolve(loss, np.ones(period), 'valid') / period
     rs = avg_gain / (avg_loss + 1e-9)
-    rsi = 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + rs))
 
-    # 4. Candle Structure (Confirmation)
-    candle_range = np.abs(h[-1] - l[-1]) + 1e-9
-    body_size = np.abs(c[-1] - o[-1])
-    body_pct = (body_size / candle_range) * 100
+def calculate_indicators(candles):
+    c = np.array([x["c"] for x in candles], dtype=float)
+    o = np.array([x["o"] for x in candles], dtype=float)
+
+    # EMA 9 and EMA 21
+    ema9 = calculate_ema(c, 9)
+    ema21 = calculate_ema(c, 21)
+    
+    if len(ema21) < 2: return None
+
+    # RSI 14 (Current and Previous for slope)
+    rsi_vals = calculate_rsi(c, 14)
+    
+    # EMA Slopes
+    ema21_slope = ema21[-1] - ema21[-2]
 
     return {
-        "ema50": ema50[-1], "slope": slope,
-        "bb_mid": bb_mid[-1], "rsi": rsi[-1], "body_pct": body_pct,
-        "o": o[-1], "c": c[-1], "h": h[-1], "l": l[-1]
+        "ema9": ema9[-1],
+        "ema21": ema21[-1],
+        "ema21_slope": ema21_slope,
+        "rsi": rsi_vals[-1],
+        "rsi_prev": rsi_vals[-2],
+        "o": o[-1], "c": c[-1]
     }
 
 def build_m1_candles_from_ticks(times, prices):
@@ -153,9 +153,9 @@ class DerivSniperBot:
                 if self.consecutive_losses >= MAX_CONSEC_LOSSES or self.trades_today >= MAX_TRADES_PER_DAY:
                     self.is_scanning = False; break
                 
-                data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 1500, "style": "ticks"})
+                data = await self.api.ticks_history({"ticks_history": symbol, "end": "latest", "count": 1000, "style": "ticks"})
                 candles = build_m1_candles_from_ticks(data["history"]["times"], data["history"]["prices"])
-                if len(candles) < 60: await asyncio.sleep(10); continue
+                if len(candles) < 30: await asyncio.sleep(10); continue
                 
                 ind = calculate_indicators(candles)
                 if not ind: await asyncio.sleep(10); continue
@@ -164,32 +164,32 @@ class DerivSniperBot:
                 self.last_block_reason = gate
                 if not ok: await asyncio.sleep(10); continue
 
-                # SURVIVAL STRATEGY LOGIC
-                # CALL LOGIC
-                if ind['c'] > ind['ema50'] and ind['slope'] > 0:
-                    if ind['l'] <= ind['bb_mid'] * 1.0001:
-                        if 45 <= ind['rsi'] <= 60:
-                            if ind['c'] > ind['o'] and ind['body_pct'] >= 60:
-                                if ind['c'] > ind['bb_mid'] and ind['c'] > ind['ema50']:
-                                    await self.execute_trade("CALL", symbol, "EMA Up + BB Mid Pullback", source="AUTO")
+                # --- NEW STRATEGY LOGIC: EMA 9/21 + RSI ---
+                
+                # CALL (BUY) CONDITIONS
+                if ind['ema9'] > ind['ema21'] and ind['ema21_slope'] > 0: # Trend Up
+                    if ind['c'] > ind['ema21']: # Price above Slow EMA
+                        if 45 <= ind['rsi'] <= 60 and ind['rsi'] > ind['rsi_prev']: # RSI Momentum
+                            if ind['c'] > ind['ema9']: # Candle closes above Fast EMA
+                                if 35 <= ind['rsi'] <= 65: # Safety range
+                                    await self.execute_trade("CALL", symbol, "EMA Cross + RSI Rising", source="AUTO")
 
-                # PUT LOGIC
-                elif ind['c'] < ind['ema50'] and ind['slope'] < 0:
-                    if ind['h'] >= ind['bb_mid'] * 0.9999:
-                        if 40 <= ind['rsi'] <= 55:
-                            if ind['c'] < ind['o'] and ind['body_pct'] >= 60:
-                                if ind['c'] < ind['bb_mid'] and ind['c'] < ind['ema50']:
-                                    await self.execute_trade("PUT", symbol, "EMA Down + BB Mid Pullback", source="AUTO")
+                # PUT (SELL) CONDITIONS
+                elif ind['ema9'] < ind['ema21'] and ind['ema21_slope'] < 0: # Trend Down
+                    if ind['c'] < ind['ema21']: # Price below Slow EMA
+                        if 40 <= ind['rsi'] <= 55 and ind['rsi'] < ind['rsi_prev']: # RSI Momentum
+                            if ind['c'] < ind['ema9']: # Candle closes below Fast EMA
+                                if 35 <= ind['rsi'] <= 65: # Safety range
+                                    await self.execute_trade("PUT", symbol, "EMA Cross + RSI Falling", source="AUTO")
 
             except asyncio.CancelledError: break
-            except: pass
-            await asyncio.sleep(10)
+            except Exception as e: logger.error(f"Scanner Error: {e}")
+            await asyncio.sleep(5)
 
     async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL"):
         if not self.api or self.active_trade_info: return
         async with self.trade_lock:
             try:
-                # 5 Minute Expiry
                 prop = await self.api.proposal({"proposal": 1, "amount": 1.00, "basis": "stake", "contract_type": side, "currency": "USD", "duration": 5, "duration_unit": "m", "symbol": symbol})
                 buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])})
                 self.active_trade_info, self.active_market, self.trade_start_time = int(buy["buy"]["contract_id"]), symbol, time.time()
@@ -215,7 +215,7 @@ class DerivSniperBot:
         finally:
             self.active_trade_info = None; self.cooldown_until = time.time() + COOLDOWN_SEC
 
-# ========================= UI =========================
+# ========================= UI (REMAINED SAME) =========================
 bot_logic = DerivSniperBot()
 
 def main_keyboard():
@@ -273,7 +273,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(status_msg, reply_markup=main_keyboard())
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 Sniper Survival M1 (WAT Edition)", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 Sniper Survival M1 (EMA 9/21 Edition)", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
