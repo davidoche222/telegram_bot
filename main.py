@@ -10,7 +10,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 # ========================= CONFIG =========================
 DEMO_TOKEN = "tIrfitLjqeBxCOM"
-REAL_TOKEN = "2hsJzopRHG5wUEb"
+REAL_TOKEN = "2hsJzopRHG5w"
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50"]
@@ -19,7 +19,7 @@ COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 40  # <--- UPDATED TO 40 TRADES
 MAX_CONSEC_LOSSES = 4 
 
-TELEGRAM_TOKEN = "8276370676:AAGh5VqkG7b4cvpfRIVwY_rtaBlIiNwCTDM"
+TELEGRAM_TOKEN = "8253450930:AAHUhPk9TML-8kZlA9UaHZZvTUGdurN9MVY"
 TELEGRAM_CHAT_ID = "7634818949"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
