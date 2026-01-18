@@ -188,17 +188,17 @@ def calculate_indicators(candles):
         "allig_down": alligator_down,
     }
 
-# ========================= CHANGED: USE REAL DERIV CANDLES =========================
+# ========================= CHANGED: USE REAL DERIV CANDLES (via ticks_history style=candles) =========================
 def build_candles_from_deriv(candles_raw):
-    # Deriv candles response -> your internal candle format
+    # Deriv candles response -> your internal candle format (flexible keys)
     out = []
     for x in candles_raw:
         out.append({
-            "o": float(x.get("open", 0)),
-            "h": float(x.get("high", 0)),
-            "l": float(x.get("low", 0)),
-            "c": float(x.get("close", 0)),
-            "v": float(x.get("volume", 1) or 1),  # if not provided, use 1
+            "o": float(x.get("open", x.get("o", 0))),
+            "h": float(x.get("high", x.get("h", 0))),
+            "l": float(x.get("low",  x.get("l", 0))),
+            "c": float(x.get("close", x.get("c", 0))),
+            "v": float(x.get("volume", x.get("v", 1)) or 1),  # if not provided, use 1
         })
     return out
 
@@ -289,12 +289,13 @@ class DerivSniperBot:
                     self.is_scanning = False
                     break
 
-                # ========================= CHANGED: FETCH REAL M5 CANDLES =========================
+                # ========================= CHANGED: FETCH REAL M5 CANDLES (SUPPORTED) =========================
                 need = max(200, MFI_PERIOD + ALLIGATOR_JAWS_SHIFT + 30)
-                res = await self.api.candles({
-                    "candles": symbol,
+                res = await self.api.ticks_history({
+                    "ticks_history": symbol,
                     "end": "latest",
                     "count": need,
+                    "style": "candles",
                     "granularity": TIMEFRAME_SEC
                 })
                 candles_raw = res.get("candles", [])
@@ -428,7 +429,20 @@ class DerivSniperBot:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Scanner Error: {e}")
+                logger.error(f"Scanner Error ({symbol}): {e}")
+
+                # Always show something in STATUS instead of "no scan data yet"
+                self.market_debug[symbol] = {
+                    "time": time.time(),
+                    "rsi": 0.0, "rsi_prev": 0.0,
+                    "mfi": 0.0, "mfi_prev": 0.0,
+                    "jaws": 0.0, "teeth": 0.0, "lips": 0.0,
+                    "awake": False,
+                    "allig_up": False, "allig_down": False,
+                    "c": 0.0,
+                    "o": 0.0,
+                    "waiting": f"⚠️ Scan error: {str(e)[:120]}"
+                }
             await asyncio.sleep(5)
 
     async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL"):
