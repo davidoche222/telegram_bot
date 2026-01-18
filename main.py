@@ -13,14 +13,7 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "2hsJzopRHG5w"
 APP_ID = 1089
 
-# ADDED R_75 and R_100 (only change here)
 MARKETS = ["R_10", "R_25", "R_50", "R_75", "R_100"]
-
-COOLDOWN_SEC = 120
-MAX_TRADES_PER_DAY = 40
-MAX_CONSEC_LOSSES = 10
-
-BASE_STAKE = 1.00  # <--- Initial trade amount
 
 TELEGRAM_TOKEN = "8253450930:AAHUhPk9TML-8kZlA9UaHZZvTUGdurN9MVY"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -28,289 +21,61 @@ TELEGRAM_CHAT_ID = "7634818949"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ========================= STRATEGY CONFIG (ONLY STRATEGY SETTINGS) =========================
-TIMEFRAME_SEC = 300          # 5 minutes candles
-EXPIRY_CANDLES = 2           # 2 candles expiry
-TRADE_DURATION_MIN = (TIMEFRAME_SEC * EXPIRY_CANDLES) // 60  # 10 minutes
-TRADE_DURATION_SEC = TIMEFRAME_SEC * EXPIRY_CANDLES          # 600 seconds
+# ========================= RISK / LIMITS =========================
+# Your strategy target: ~10 trades/day (cap)
+MAX_TRADES_PER_DAY_TOTAL = 10
+MAX_TRADES_PER_MARKET_PER_DAY = 3
+STOP_DAY_AFTER_TOTAL_LOSSES = 3
+STOP_SYMBOL_AFTER_LOSSES = 2
 
-RSI_FAST_PERIOD = 1
-RSI_LEVEL_BUY = 20
-RSI_LEVEL_SELL = 80
+COOLDOWN_AFTER_TRADE_SEC = 120          # extra cooldown after a trade (global)
+COOLDOWN_PER_SYMBOL_SEC = 120           # 2 full M1 candles cooldown on same symbol
 
-MFI_PERIOD = 50
-MFI_LEVEL_BUY = 20
-MFI_LEVEL_SELL = 80
+BASE_STAKE = 1.00
 
-# Alligator: using periods=2, shifts=10 (as per your settings)
-ALLIGATOR_JAWS_PERIOD = 2
-ALLIGATOR_TEETH_PERIOD = 2
-ALLIGATOR_LIPS_PERIOD = 2
-ALLIGATOR_JAWS_SHIFT = 10
-ALLIGATOR_TEETH_SHIFT = 10
-ALLIGATOR_LIPS_SHIFT = 10
+# ========================= STRATEGY SETTINGS =========================
+ENTRY_TF_SEC = 60  # M1 entries
 
-# ========================= PRICE ACTION SETTINGS (ADDED) =========================
-# This is the "price action strategy" added on top of your current one.
-# It uses: Engulfing + Pinbar at swing + RSI confirmation.
-PA_LOOKBACK_SWING = 8                 # swing check (last N candles)
-PA_PINBAR_WICK_RATIO = 2.2            # wick must be >= body * ratio
-PA_PINBAR_BODY_MAX_RANGE = 0.35       # body must be <= 35% of candle range
+# Structure TF by market (as per your rules)
+STRUCT_TF_SEC = {
+    "R_10": 300,   # M5
+    "R_25": 300,   # M5
+    "R_50": 900,   # M15
+    "R_75": 900,   # M15
+    "R_100": 900,  # M15
+}
 
-RSI_CONFIRM_PERIOD = 14               # RSI confirmation for price action (stable)
-RSI_CONFIRM_BUY = 52                  # buy confirmation
-RSI_CONFIRM_SELL = 48                 # sell confirmation
-# ================================================================================
+# Expiry per index (minutes)
+EXPIRY_MIN = {
+    "R_10": 3,   # 2-3 ok; we use 3
+    "R_25": 2,
+    "R_50": 2,   # 1-2 ok; we use 2
+    "R_75": 1,
+    "R_100": 1,
+}
 
-# ========================= STRATEGY MATH =========================
-def calculate_ema(data, period):
-    if len(data) < period:
-        return np.array([])
-    values = np.array(data, dtype=float)
-    ema = np.zeros_like(values)
-    k = 2 / (period + 1)
-    ema[0] = values[0]
-    for i in range(1, len(values)):
-        ema[i] = values[i] * k + ema[i - 1] * (1 - k)
-    return ema
+# Swing fractal N (5-candle fractal)
+SWING_N = 2
 
-def calculate_rsi(data, period=14):
-    # Works for period=1 too.
-    if len(data) < (period + 1):
-        return np.array([])
-    values = np.array(data, dtype=float)
-    delta = np.diff(values)
-    gain = delta.clip(min=0)
-    loss = (-delta).clip(min=0)
+# Sweep buffer (0.05% of price)
+SWEEP_BUFFER_PCT = 0.0005
 
-    avg_gain = np.convolve(gain, np.ones(period), "valid") / period
-    avg_loss = np.convolve(loss, np.ones(period), "valid") / period
-    rs = avg_gain / (avg_loss + 1e-9)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+# Optional RSI filter on M1
+RSI_PERIOD = 14
+RSI_LO = 30
+RSI_HI = 70
+USE_RSI_FILTER = True
 
-def _smma(values, period):
-    values = np.array(values, dtype=float)
-    if len(values) < period:
-        return np.array([])
-    out = np.zeros_like(values)
-    out[:period - 1] = np.nan
-    out[period - 1] = np.mean(values[:period])
-    for i in range(period, len(values)):
-        out[i] = (out[i - 1] * (period - 1) + values[i]) / period
-    return out
+# Filters
+DOJI_BODY_PCT = 0.25        # doji if body <= 25% of range
+CHOP_DOJI_COUNT = 6         # if >=6 dojis in last 10 -> chop
+CHOP_LOOKBACK = 10
+CHOP_PAUSE_SEC = 600        # pause 10 minutes on that symbol
 
-def calculate_mfi(high, low, close, volume, period=14):
-    high = np.array(high, dtype=float)
-    low = np.array(low, dtype=float)
-    close = np.array(close, dtype=float)
-    volume = np.array(volume, dtype=float)
+SPIKE_MULTIPLIER = 2.0
+AVG_RANGE_LOOKBACK = 20
 
-    if len(close) < (period + 1):
-        return np.array([])
-
-    typical = (high + low + close) / 3.0
-    raw_mf = typical * volume
-
-    tp_diff = np.diff(typical)
-    pos_mf = np.where(tp_diff > 0, raw_mf[1:], 0.0)
-    neg_mf = np.where(tp_diff < 0, raw_mf[1:], 0.0)
-
-    pos_sum = np.convolve(pos_mf, np.ones(period), "valid")
-    neg_sum = np.convolve(neg_mf, np.ones(period), "valid")
-
-    mfr = pos_sum / (neg_sum + 1e-9)
-    mfi = 100 - (100 / (1 + mfr))
-    return mfi
-
-# ========================= PRICE ACTION HELPERS (ADDED) =========================
-def _candle_parts(c):
-    o, h, l, cl = float(c["o"]), float(c["h"]), float(c["l"]), float(c["c"])
-    body = abs(cl - o)
-    rng = max(1e-9, h - l)
-    upper = h - max(o, cl)
-    lower = min(o, cl) - l
-    green = cl > o
-    red = cl < o
-    return o, h, l, cl, body, rng, upper, lower, green, red
-
-def _is_bullish_engulf(prev, cur):
-    po, ph, pl, pc, pbody, prng, pupper, plower, pgreen, pred = _candle_parts(prev)
-    co, ch, cl, cc, cbody, crng, cupper, clower, cgreen, cred = _candle_parts(cur)
-    if not (pred and cgreen):
-        return False
-    # engulf body
-    prev_low = min(po, pc)
-    prev_high = max(po, pc)
-    cur_low = min(co, cc)
-    cur_high = max(co, cc)
-    return (cur_low <= prev_low) and (cur_high >= prev_high) and (cbody > pbody * 0.9)
-
-def _is_bearish_engulf(prev, cur):
-    po, ph, pl, pc, pbody, prng, pupper, plower, pgreen, pred = _candle_parts(prev)
-    co, ch, cl, cc, cbody, crng, cupper, clower, cgreen, cred = _candle_parts(cur)
-    if not (pgreen and cred):
-        return False
-    prev_low = min(po, pc)
-    prev_high = max(po, pc)
-    cur_low = min(co, cc)
-    cur_high = max(co, cc)
-    return (cur_low <= prev_low) and (cur_high >= prev_high) and (cbody > pbody * 0.9)
-
-def _is_bullish_pinbar(cur):
-    o, h, l, c, body, rng, upper, lower, green, red = _candle_parts(cur)
-    # long lower wick, small body
-    if body / rng > PA_PINBAR_BODY_MAX_RANGE:
-        return False
-    if lower < body * PA_PINBAR_WICK_RATIO:
-        return False
-    if upper > lower * 0.65:
-        return False
-    return True
-
-def _is_bearish_pinbar(cur):
-    o, h, l, c, body, rng, upper, lower, green, red = _candle_parts(cur)
-    # long upper wick, small body
-    if body / rng > PA_PINBAR_BODY_MAX_RANGE:
-        return False
-    if upper < body * PA_PINBAR_WICK_RATIO:
-        return False
-    if lower > upper * 0.65:
-        return False
-    return True
-
-def _is_swing_low(candles, lookback):
-    if len(candles) < lookback + 1:
-        return False
-    cur = candles[-1]
-    cur_low = float(cur["l"])
-    prev_lows = [float(x["l"]) for x in candles[-(lookback+1):-1]]
-    return cur_low <= min(prev_lows)
-
-def _is_swing_high(candles, lookback):
-    if len(candles) < lookback + 1:
-        return False
-    cur = candles[-1]
-    cur_high = float(cur["h"])
-    prev_highs = [float(x["h"]) for x in candles[-(lookback+1):-1]]
-    return cur_high >= max(prev_highs)
-
-def detect_price_action_signal(candles, rsi_confirm_now, rsi_confirm_prev):
-    """
-    Returns dict:
-      { "side": "CALL"/"PUT"/None, "pattern": "...", "why": "..." }
-    """
-    if len(candles) < 3:
-        return {"side": None, "pattern": "NONE", "why": "Need more candles"}
-
-    prev = candles[-2]
-    cur = candles[-1]
-
-    bull_engulf = _is_bullish_engulf(prev, cur)
-    bear_engulf = _is_bearish_engulf(prev, cur)
-
-    bull_pin = _is_bullish_pinbar(cur) and _is_swing_low(candles, PA_LOOKBACK_SWING)
-    bear_pin = _is_bearish_pinbar(cur) and _is_swing_high(candles, PA_LOOKBACK_SWING)
-
-    rsi_buy_ok = (rsi_confirm_now >= RSI_CONFIRM_BUY) and (rsi_confirm_now >= rsi_confirm_prev)
-    rsi_sell_ok = (rsi_confirm_now <= RSI_CONFIRM_SELL) and (rsi_confirm_now <= rsi_confirm_prev)
-
-    # Priority: engulfing, then pinbar
-    if bull_engulf and rsi_buy_ok:
-        return {"side": "CALL", "pattern": "BULL ENGULF", "why": f"Engulfing + RSI({RSI_CONFIRM_PERIOD}) up"}
-    if bear_engulf and rsi_sell_ok:
-        return {"side": "PUT", "pattern": "BEAR ENGULF", "why": f"Engulfing + RSI({RSI_CONFIRM_PERIOD}) down"}
-    if bull_pin and rsi_buy_ok:
-        return {"side": "CALL", "pattern": "BULL PINBAR", "why": f"Pinbar @ swing low + RSI({RSI_CONFIRM_PERIOD}) up"}
-    if bear_pin and rsi_sell_ok:
-        return {"side": "PUT", "pattern": "BEAR PINBAR", "why": f"Pinbar @ swing high + RSI({RSI_CONFIRM_PERIOD}) down"}
-
-    # Explain what's missing (simple)
-    if bull_engulf:
-        return {"side": None, "pattern": "BULL ENGULF", "why": f"Waiting RSI({RSI_CONFIRM_PERIOD}) >= {RSI_CONFIRM_BUY} and rising"}
-    if bear_engulf:
-        return {"side": None, "pattern": "BEAR ENGULF", "why": f"Waiting RSI({RSI_CONFIRM_PERIOD}) <= {RSI_CONFIRM_SELL} and falling"}
-    if bull_pin:
-        return {"side": None, "pattern": "BULL PINBAR", "why": f"Waiting RSI({RSI_CONFIRM_PERIOD}) >= {RSI_CONFIRM_BUY} and rising"}
-    if bear_pin:
-        return {"side": None, "pattern": "BEAR PINBAR", "why": f"Waiting RSI({RSI_CONFIRM_PERIOD}) <= {RSI_CONFIRM_SELL} and falling"}
-
-    return {"side": None, "pattern": "NONE", "why": "No price action setup"}
-# ================================================================================
-
-def calculate_indicators(candles):
-    c = np.array([x["c"] for x in candles], dtype=float)
-    o = np.array([x["o"] for x in candles], dtype=float)
-    h = np.array([x["h"] for x in candles], dtype=float)
-    l = np.array([x["l"] for x in candles], dtype=float)
-    v = np.array([x.get("v", 1) for x in candles], dtype=float)
-
-    rsi_fast = calculate_rsi(c, RSI_FAST_PERIOD)
-    if len(rsi_fast) < 2:
-        return None
-
-    # ADDED: stable RSI confirmation for price action
-    rsi_conf = calculate_rsi(c, RSI_CONFIRM_PERIOD)
-    if len(rsi_conf) < 2:
-        return None
-
-    mfi_vals = calculate_mfi(h, l, c, v, MFI_PERIOD)
-    if len(mfi_vals) < 2:
-        return None
-
-    median = (h + l) / 2.0
-    jaws = _smma(median, ALLIGATOR_JAWS_PERIOD)
-    teeth = _smma(median, ALLIGATOR_TEETH_PERIOD)
-    lips = _smma(median, ALLIGATOR_LIPS_PERIOD)
-    if len(jaws) == 0 or len(teeth) == 0 or len(lips) == 0:
-        return None
-
-    def shifted(arr, shift):
-        if len(arr) <= shift:
-            return np.array([])
-        return arr[:-shift]
-
-    jaws_s = shifted(jaws, ALLIGATOR_JAWS_SHIFT)
-    teeth_s = shifted(teeth, ALLIGATOR_TEETH_SHIFT)
-    lips_s = shifted(lips, ALLIGATOR_LIPS_SHIFT)
-
-    min_len = min(len(jaws_s), len(teeth_s), len(lips_s), len(c))
-    if min_len < 5:
-        return None
-
-    jaws_v = jaws_s[-1]
-    teeth_v = teeth_s[-1]
-    lips_v = lips_s[-1]
-
-    spread = abs(lips_v - teeth_v) + abs(teeth_v - jaws_v)
-    price_scale = max(1e-9, abs(c[-1]))
-    is_awake = spread > (price_scale * 1e-5)
-
-    alligator_up = (lips_v > teeth_v > jaws_v)
-    alligator_down = (lips_v < teeth_v < jaws_v)
-
-    return {
-        "o": o[-1],
-        "c": c[-1],
-
-        "rsi_fast": rsi_fast[-1],
-        "rsi_fast_prev": rsi_fast[-2],
-
-        "rsi_conf": rsi_conf[-1],
-        "rsi_conf_prev": rsi_conf[-2],
-
-        "mfi": mfi_vals[-1],
-        "mfi_prev": mfi_vals[-2],
-
-        "jaws": jaws_v,
-        "teeth": teeth_v,
-        "lips": lips_v,
-        "is_awake": is_awake,
-        "allig_up": alligator_up,
-        "allig_down": alligator_down,
-    }
-
-# ========================= CHANGED: USE REAL DERIV CANDLES (via ticks_history style=candles) =========================
+# ========================= HELPERS =========================
 def build_candles_from_deriv(candles_raw):
     out = []
     for x in candles_raw:
@@ -319,71 +84,161 @@ def build_candles_from_deriv(candles_raw):
             "h": float(x.get("high", x.get("h", 0))),
             "l": float(x.get("low",  x.get("l", 0))),
             "c": float(x.get("close", x.get("c", 0))),
-            "v": float(x.get("volume", x.get("v", 1)) or 1),
         })
     return out
 
-# ========================= ADDED: CLEAN / SIMPLE DEBUG FORMATTER =========================
-def fmt_scan_line(sym: str, d: dict) -> str:
-    age = int(time.time() - d.get("time", time.time()))
-    rsi = d.get("rsi", 0.0)
-    mfi = d.get("mfi", 0.0)
-    awake = d.get("awake", False)
-    up = d.get("allig_up", False)
-    down = d.get("allig_down", False)
-    waiting = d.get("waiting", "Waiting...")
-    pa_pat = d.get("pa_pattern", "NONE")
-    pa_why = d.get("pa_why", "")
+def calculate_rsi(closes, period=14):
+    closes = np.array(closes, dtype=float)
+    if len(closes) < period + 1:
+        return np.array([])
+    delta = np.diff(closes)
+    gain = np.clip(delta, 0, None)
+    loss = np.clip(-delta, 0, None)
+    avg_gain = np.convolve(gain, np.ones(period), "valid") / period
+    avg_loss = np.convolve(loss, np.ones(period), "valid") / period
+    rs = avg_gain / (avg_loss + 1e-9)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def candle_range(c):
+    return max(1e-9, c["h"] - c["l"])
+
+def candle_body(c):
+    return abs(c["c"] - c["o"])
+
+def is_doji(c):
+    return candle_body(c) <= DOJI_BODY_PCT * candle_range(c)
+
+def avg_range(candles, lookback=20):
+    if len(candles) < lookback + 1:
+        lookback = max(2, len(candles) - 1)
+    rngs = [candle_range(x) for x in candles[-lookback:]]
+    return float(sum(rngs) / max(1, len(rngs)))
+
+def strong_bull_close(c):
+    rng = candle_range(c)
+    return c["c"] >= (c["h"] - 0.30 * rng) and (c["c"] > c["o"])
+
+def strong_bear_close(c):
+    rng = candle_range(c)
+    return c["c"] <= (c["l"] + 0.30 * rng) and (c["c"] < c["o"])
+
+def bull_engulf(prev, cur):
+    return (prev["c"] < prev["o"]) and (cur["c"] > cur["o"]) and (cur["c"] >= prev["o"]) and (cur["o"] <= prev["c"])
+
+def bear_engulf(prev, cur):
+    return (prev["c"] > prev["o"]) and (cur["c"] < cur["o"]) and (cur["c"] <= prev["o"]) and (cur["o"] >= prev["c"])
+
+def find_swings(candles, n=2):
+    # returns indices of swing highs and swing lows
+    highs = []
+    lows = []
+    if len(candles) < (2 * n + 1):
+        return highs, lows
+
+    for i in range(n, len(candles) - n):
+        hi = candles[i]["h"]
+        lo = candles[i]["l"]
+        if all(hi > candles[j]["h"] for j in range(i - n, i)) and all(hi > candles[j]["h"] for j in range(i + 1, i + n + 1)):
+            highs.append(i)
+        if all(lo < candles[j]["l"] for j in range(i - n, i)) and all(lo < candles[j]["l"] for j in range(i + 1, i + n + 1)):
+            lows.append(i)
+    return highs, lows
+
+def determine_bias(struct_candles):
+    highs_idx, lows_idx = find_swings(struct_candles, SWING_N)
+
+    if len(highs_idx) < 2 or len(lows_idx) < 2:
+        return "RANGE", None, None
+
+    h1, h2 = highs_idx[-2], highs_idx[-1]
+    l1, l2 = lows_idx[-2], lows_idx[-1]
+
+    last_high_1 = struct_candles[h1]["h"]
+    last_high_2 = struct_candles[h2]["h"]
+    last_low_1 = struct_candles[l1]["l"]
+    last_low_2 = struct_candles[l2]["l"]
+
+    up = (last_high_2 > last_high_1) and (last_low_2 > last_low_1)
+    down = (last_high_2 < last_high_1) and (last_low_2 < last_low_1)
+
+    # liquidity levels = most recent confirmed swing high/low
+    liquidity_high = struct_candles[highs_idx[-1]]["h"]
+    liquidity_low = struct_candles[lows_idx[-1]]["l"]
 
     if up:
-        trend = "UP"
-    elif down:
-        trend = "DOWN"
-    else:
-        trend = "MIXED"
+        return "UP", liquidity_high, liquidity_low
+    if down:
+        return "DOWN", liquidity_high, liquidity_low
+    return "RANGE", liquidity_high, liquidity_low
 
-    awake_icon = "✅ AWAKE" if awake else "😴 SLEEPING"
-
-    o = d.get("o", 0.0)
-    c = d.get("c", 0.0)
-    candle = "GREEN" if c > o else ("RED" if c < o else "FLAT")
-
-    return (
-        f"• {sym.replace('_',' ')} ({age}s)\n"
-        f"  {awake_icon} | Trend: {trend}\n"
-        f"  MFI: {mfi:.0f} | RSI(1): {rsi:.0f} | Candle: {candle}\n"
-        f"  🧩 PA: {pa_pat} {('- ' + pa_why) if pa_why else ''}\n"
-        f"  ⏳ {waiting}"
-    )
+def fmt_scan(sym, d):
+    age = int(time.time() - d.get("time", time.time()))
+    lines = [
+        f"• {sym.replace('_',' ')} ({age}s)",
+        f"  Bias: {d.get('bias','?')} | Setup: {d.get('setup','-')} | Signal: {d.get('signal','-')}",
+    ]
+    if d.get("levels"):
+        lines.append(f"  Levels: {d['levels']}")
+    if d.get("ind"):
+        lines.append(f"  {d['ind']}")
+    if d.get("waiting"):
+        lines.append(f"  ⏳ {d['waiting']}")
+    return "\n".join(lines)
 
 # ========================= BOT CORE =========================
-class DerivSniperBot:
+class DerivBot:
     def __init__(self):
         self.api = None
         self.app = None
         self.active_token = None
         self.account_type = "None"
+
         self.is_scanning = False
         self.scanner_task = None
         self.market_tasks = {}
+
         self.active_trade_info = None
-        self.active_market = "None"
+        self.active_market = None
         self.trade_start_time = 0.0
-        self.cooldown_until = 0.0
-        self.trades_today = 0
-        self.total_losses_today = 0
-        self.consecutive_losses = 0
-        self.total_profit_today = 0.0
+        self.global_cooldown_until = 0.0
+
+        # Daily tracking
+        self.day_key = None
+        self.trades_today_total = 0
+        self.losses_today_total = 0
+        self.trades_today_by_symbol = {m: 0 for m in MARKETS}
+        self.losses_today_by_symbol = {m: 0 for m in MARKETS}
+        self.disabled_symbol_today = {m: False for m in MARKETS}
+
+        # Symbol cooldown + chop lock
+        self.symbol_cooldown_until = {m: 0.0 for m in MARKETS}
+        self.symbol_chop_until = {m: 0.0 for m in MARKETS}
+
         self.balance = "0.00"
+        self.total_profit_today = 0.0
         self.current_stake = BASE_STAKE
+        self.consecutive_losses = 0
         self.trade_lock = asyncio.Lock()
-        self.last_scan_symbol = "None"
-        self.last_signal_reason = "None"
-        self.last_block_reason = "None"
-        self.last_trade_side = "None"
-        self.last_trade_source = "None"
 
         self.market_debug = {}
+
+    def reset_day_if_needed(self):
+        # Reset at local day change (Africa/Lagos)
+        now = datetime.now(ZoneInfo("Africa/Lagos"))
+        key = now.strftime("%Y-%m-%d")
+        if self.day_key != key:
+            self.day_key = key
+            self.trades_today_total = 0
+            self.losses_today_total = 0
+            self.trades_today_by_symbol = {m: 0 for m in MARKETS}
+            self.losses_today_by_symbol = {m: 0 for m in MARKETS}
+            self.disabled_symbol_today = {m: False for m in MARKETS}
+            self.symbol_cooldown_until = {m: 0.0 for m in MARKETS}
+            self.symbol_chop_until = {m: 0.0 for m in MARKETS}
+            self.total_profit_today = 0.0
+            self.current_stake = BASE_STAKE
+            self.consecutive_losses = 0
 
     async def connect(self) -> bool:
         try:
@@ -393,7 +248,8 @@ class DerivSniperBot:
             await self.api.authorize(self.active_token)
             await self.fetch_balance()
             return True
-        except:
+        except Exception as e:
+            logger.error(f"Connect error: {e}")
             return False
 
     async def fetch_balance(self):
@@ -405,26 +261,40 @@ class DerivSniperBot:
         except:
             pass
 
-    def can_auto_trade(self) -> tuple[bool, str]:
-        if self.consecutive_losses >= MAX_CONSEC_LOSSES:
-            return False, "Max Streak Loss"
-        if self.trades_today >= MAX_TRADES_PER_DAY:
-            return False, "Daily Limit Met"
-        if time.time() < self.cooldown_until:
-            return False, f"Cooldown {int(self.cooldown_until - time.time())}s"
+    def gate(self, symbol: str):
+        self.reset_day_if_needed()
+
+        if self.disabled_symbol_today.get(symbol, False):
+            return False, "Symbol disabled (loss limit)"
+        if self.losses_today_total >= STOP_DAY_AFTER_TOTAL_LOSSES:
+            return False, "Stopped: daily loss limit"
+        if self.trades_today_total >= MAX_TRADES_PER_DAY_TOTAL:
+            return False, "Daily trade limit reached"
+        if self.trades_today_by_symbol.get(symbol, 0) >= MAX_TRADES_PER_MARKET_PER_DAY:
+            return False, "Symbol trade cap reached"
+
+        now = time.time()
+        if now < self.global_cooldown_until:
+            return False, f"Global cooldown {int(self.global_cooldown_until - now)}s"
+        if now < self.symbol_cooldown_until.get(symbol, 0.0):
+            return False, f"Symbol cooldown {int(self.symbol_cooldown_until[symbol] - now)}s"
+        if now < self.symbol_chop_until.get(symbol, 0.0):
+            return False, f"Chop filter {int(self.symbol_chop_until[symbol] - now)}s"
+
         if self.active_trade_info:
-            return False, "Trade in Progress"
+            return False, "Trade in progress"
         if not self.api:
-            return False, "Not Connected"
+            return False, "Not connected"
         return True, "OK"
 
     async def background_scanner(self):
         if not self.api:
             return
-        self.market_tasks = {sym: asyncio.create_task(self.scan_market(sym)) for sym in MARKETS}
+        self.market_tasks = {sym: asyncio.create_task(self.scan_symbol(sym)) for sym in MARKETS}
         try:
             while self.is_scanning:
-                if self.active_trade_info and (time.time() - self.trade_start_time > (TRADE_DURATION_SEC + 30)):
+                # safety timeout
+                if self.active_trade_info and (time.time() - self.trade_start_time > (EXPIRY_MIN.get(self.active_market, 2) * 60 + 90)):
                     self.active_trade_info = None
                 await asyncio.sleep(1)
         finally:
@@ -432,305 +302,403 @@ class DerivSniperBot:
                 t.cancel()
             self.market_tasks.clear()
 
-    async def scan_market(self, symbol: str):
+    async def fetch_candles(self, symbol: str, granularity: int, count: int):
+        res = await self.api.ticks_history({
+            "ticks_history": symbol,
+            "end": "latest",
+            "count": count,
+            "style": "candles",
+            "granularity": granularity
+        })
+        raw = res.get("candles", [])
+        return build_candles_from_deriv(raw)
+
+    async def scan_symbol(self, symbol: str):
         while self.is_scanning:
-            self.last_scan_symbol = symbol
             try:
-                if self.consecutive_losses >= MAX_CONSEC_LOSSES or self.trades_today >= MAX_TRADES_PER_DAY:
-                    self.is_scanning = False
-                    break
-
-                need = max(220, MFI_PERIOD + ALLIGATOR_JAWS_SHIFT + 60, RSI_CONFIRM_PERIOD + 60)
-                res = await self.api.ticks_history({
-                    "ticks_history": symbol,
-                    "end": "latest",
-                    "count": need,
-                    "style": "candles",
-                    "granularity": TIMEFRAME_SEC
-                })
-                candles_raw = res.get("candles", [])
-                candles = build_candles_from_deriv(candles_raw)
-
-                if len(candles) < (MFI_PERIOD + 5):
+                ok, g = self.gate(symbol)
+                if not ok:
                     self.market_debug[symbol] = {
                         "time": time.time(),
-                        "rsi": 0.0,
-                        "mfi": 0.0,
-                        "awake": False,
-                        "allig_up": False, "allig_down": False,
-                        "c": float(candles[-1]["c"]) if candles else 0.0,
-                        "o": float(candles[-1]["o"]) if candles else 0.0,
-                        "pa_pattern": "NONE",
-                        "pa_why": "Waiting candles",
-                        "waiting": f"Not enough M5 candles yet ({len(candles)})"
+                        "bias": "-",
+                        "setup": "-",
+                        "signal": "-",
+                        "levels": "",
+                        "ind": "",
+                        "waiting": f"🚦 {g}"
                     }
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(2)
                     continue
 
-                ind = calculate_indicators(candles)
-                if not ind:
-                    await asyncio.sleep(10)
+                # Fetch structure candles (bias + liquidity levels)
+                struct_tf = STRUCT_TF_SEC[symbol]
+                struct = await self.fetch_candles(symbol, struct_tf, 220)
+
+                # Fetch entry candles (M1)
+                m1 = await self.fetch_candles(symbol, ENTRY_TF_SEC, 220)
+
+                if len(struct) < 50 or len(m1) < 30:
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "bias": "…",
+                        "setup": "-",
+                        "signal": "-",
+                        "levels": "",
+                        "ind": "",
+                        "waiting": "Syncing candles..."
+                    }
+                    await asyncio.sleep(3)
                     continue
 
-                ok, gate = self.can_auto_trade()
-                self.last_block_reason = gate
-                if not ok:
-                    await asyncio.sleep(10)
+                # Use only CLOSED candles: last closed = -2
+                if len(m1) < 5:
+                    await asyncio.sleep(2)
+                    continue
+                c_confirm = m1[-2]  # confirmation / continuation candle (closed)
+                c_sweep = m1[-3]    # sweep candle (closed)
+                c_prev = m1[-4]     # candle before sweep
+
+                # Chop filter (doji count last 10 closed candles)
+                last10 = m1[-(CHOP_LOOKBACK+1):-1]
+                dojis = sum(1 for x in last10 if is_doji(x))
+                if dojis >= CHOP_DOJI_COUNT:
+                    self.symbol_chop_until[symbol] = time.time() + CHOP_PAUSE_SEC
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "bias": "-",
+                        "setup": "-",
+                        "signal": "-",
+                        "levels": "",
+                        "ind": f"Dojis: {dojis}/{CHOP_LOOKBACK}",
+                        "waiting": "Chop detected → pausing 10m"
+                    }
+                    await asyncio.sleep(2)
                     continue
 
-                is_green = ind["c"] > ind["o"]
-                is_red = ind["c"] < ind["o"]
+                # Bias + liquidity levels
+                bias, liq_high, liq_low = determine_bias(struct)
 
-                # ===================== PRICE ACTION (ADDED) =====================
-                pa = detect_price_action_signal(candles, ind["rsi_conf"], ind["rsi_conf_prev"])
-                # ================================================================
+                # ✅ OPTION 1 CHANGE:
+                # If we have NO levels at all, we must skip (can't do Setup A or B).
+                if liq_high is None or liq_low is None:
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "bias": bias,
+                        "setup": "-",
+                        "signal": "-",
+                        "levels": "Need clearer swings",
+                        "ind": "",
+                        "waiting": "No levels yet (waiting swings)"
+                    }
+                    await asyncio.sleep(2)
+                    continue
+                # (We DO NOT block RANGE here anymore — because Setup A can trade in RANGE)
 
-                # Existing strategy readiness
-                buy_ready = (
-                    ind["is_awake"]
-                    and ind["allig_up"]
-                    and (ind["mfi"] <= MFI_LEVEL_BUY)
-                    and (ind["rsi_fast"] <= RSI_LEVEL_BUY)
-                    and (ind["mfi"] >= ind["mfi_prev"])
-                    and (ind["rsi_fast"] >= ind["rsi_fast_prev"])
-                    and is_green
-                )
-                sell_ready = (
-                    ind["is_awake"]
-                    and ind["allig_down"]
-                    and (ind["mfi"] >= MFI_LEVEL_SELL)
-                    and (ind["rsi_fast"] >= RSI_LEVEL_SELL)
-                    and (ind["mfi"] <= ind["mfi_prev"])
-                    and (ind["rsi_fast"] <= ind["rsi_fast_prev"])
-                    and is_red
-                )
+                # RSI optional filter
+                closes_m1 = [x["c"] for x in m1]
+                rsi_arr = calculate_rsi(closes_m1, RSI_PERIOD)
+                rsi_now = float(rsi_arr[-1]) if len(rsi_arr) > 0 else 50.0
+                rsi_prev = float(rsi_arr[-2]) if len(rsi_arr) > 1 else rsi_now
 
-                # Clean waiting message (now includes PA)
-                if pa["side"] == "CALL":
-                    waiting_msg = f"✅ PA BUY READY ({pa['pattern']})"
-                elif pa["side"] == "PUT":
-                    waiting_msg = f"✅ PA SELL READY ({pa['pattern']})"
-                elif buy_ready:
-                    waiting_msg = "✅ INDICATOR BUY READY"
-                elif sell_ready:
-                    waiting_msg = "✅ INDICATOR SELL READY"
+                # Sweep buffer (percent of price)
+                price = float(c_sweep["c"])
+                buf = price * SWEEP_BUFFER_PCT
+
+                # Spike filter on the SIGNAL candle (confirmation candle)
+                avg_rng = avg_range(m1[-(AVG_RANGE_LOOKBACK+1):-1], AVG_RANGE_LOOKBACK)
+                sig_rng = candle_range(c_confirm)
+                if sig_rng > SPIKE_MULTIPLIER * avg_rng:
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "bias": bias,
+                        "setup": "-",
+                        "signal": "-",
+                        "levels": f"H:{liq_high:.2f} L:{liq_low:.2f} | buf:{buf:.2f}",
+                        "ind": f"RSI: {rsi_now:.0f} | Spike: {sig_rng:.2f}>{SPIKE_MULTIPLIER}x{avg_rng:.2f}",
+                        "waiting": "Spike candle → skip"
+                    }
+                    await asyncio.sleep(2)
+                    continue
+
+                # ========================= SETUP A: LIQUIDITY REVERSAL =========================
+                # SELL (Fall): sweep above swing high, close back below, then confirmation bearish
+                sweep_sell = (c_sweep["h"] >= (liq_high + buf)) and (c_sweep["c"] < liq_high)
+                confirm_sell = (bear_engulf(c_sweep, c_confirm) or strong_bear_close(c_confirm))
+                rsi_sell_ok = (rsi_now < RSI_HI and rsi_prev >= RSI_HI) or (rsi_prev > RSI_HI) or (rsi_now > RSI_HI)
+
+                sell_A_ready = sweep_sell and confirm_sell and ((not USE_RSI_FILTER) or rsi_sell_ok)
+
+                # BUY (Rise): sweep below swing low, close back above, then confirmation bullish
+                sweep_buy = (c_sweep["l"] <= (liq_low - buf)) and (c_sweep["c"] > liq_low)
+                confirm_buy = (bull_engulf(c_sweep, c_confirm) or strong_bull_close(c_confirm))
+                rsi_buy_ok = (rsi_now > RSI_LO and rsi_prev <= RSI_LO) or (rsi_prev < RSI_LO) or (rsi_now < RSI_LO)
+
+                buy_A_ready = sweep_buy and confirm_buy and ((not USE_RSI_FILTER) or rsi_buy_ok)
+
+                # ========================= SETUP B: STRUCTURE CONTINUATION =========================
+                # ✅ Still requires non-RANGE bias (UP/DOWN only)
+                pb1 = m1[-4]
+                pb2 = m1[-3]
+                cont = m1[-2]
+                prev_for_break = m1[-3]
+
+                if bias == "UP":
+                    pullback_ok = (pb1["c"] < pb1["o"]) and (pb2["c"] < pb2["o"])
+                    continuation_ok = (cont["c"] > cont["o"]) and (cont["c"] > prev_for_break["h"]) and strong_bull_close(cont)
+                    rsi_ok = (rsi_now > 50)
+                    buy_B_ready = pullback_ok and continuation_ok and ((not USE_RSI_FILTER) or rsi_ok)
+                    sell_B_ready = False
+                elif bias == "DOWN":
+                    pullback_ok = (pb1["c"] > pb1["o"]) and (pb2["c"] > pb2["o"])
+                    continuation_ok = (cont["c"] < cont["o"]) and (cont["c"] < prev_for_break["l"]) and strong_bear_close(cont)
+                    rsi_ok = (rsi_now < 50)
+                    sell_B_ready = pullback_ok and continuation_ok and ((not USE_RSI_FILTER) or rsi_ok)
+                    buy_B_ready = False
                 else:
-                    # simple reason summary
-                    waiting_msg = pa["why"] if pa["pattern"] != "NONE" else "Waiting setup..."
+                    buy_B_ready = False
+                    sell_B_ready = False
 
-                self.market_debug[symbol] = {
-                    "time": time.time(),
-                    "rsi": float(ind["rsi_fast"]),
-                    "mfi": float(ind["mfi"]),
-                    "jaws": float(ind["jaws"]),
-                    "teeth": float(ind["teeth"]),
-                    "lips": float(ind["lips"]),
-                    "awake": bool(ind["is_awake"]),
-                    "allig_up": bool(ind["allig_up"]),
-                    "allig_down": bool(ind["allig_down"]),
-                    "c": float(ind["c"]),
-                    "o": float(ind["o"]),
-                    "pa_pattern": pa["pattern"],
-                    "pa_why": pa["why"],
-                    "waiting": waiting_msg
-                }
+                # Priority: Setup A > Setup B (as per your rule)
+                setup = "-"
+                signal = "-"
+                waiting = ""
+                levels_txt = f"H:{liq_high:.2f}  L:{liq_low:.2f}  buf:{buf:.2f}"
+                ind_txt = f"RSI(14): {rsi_now:.0f} | Doji:{dojis}/10 | avgR:{avg_rng:.2f}"
 
-                # ========================= EXECUTION PRIORITY =========================
-                # 1) Price Action trade first (because it's your new strategy)
-                # 2) If no PA trade, then use old indicator strategy
-
-                if pa["side"] == "CALL":
-                    await self.execute_trade(
-                        "CALL",
-                        symbol,
-                        f"PA {pa['pattern']} + RSI({RSI_CONFIRM_PERIOD}) confirm",
-                        source="AUTO",
-                    )
-
-                elif pa["side"] == "PUT":
-                    await self.execute_trade(
-                        "PUT",
-                        symbol,
-                        f"PA {pa['pattern']} + RSI({RSI_CONFIRM_PERIOD}) confirm",
-                        source="AUTO",
-                    )
-
+                if buy_A_ready:
+                    setup = "A-Reversal"
+                    signal = "BUY (RISE)"
+                    waiting = "✅ Liquidity sweep low + bullish confirm"
+                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": setup, "signal": signal, "levels": levels_txt, "ind": ind_txt, "waiting": waiting}
+                    await self.execute_trade("CALL", symbol, f"Setup A BUY | {levels_txt} | RSI {rsi_now:.0f}")
+                elif sell_A_ready:
+                    setup = "A-Reversal"
+                    signal = "SELL (FALL)"
+                    waiting = "✅ Liquidity sweep high + bearish confirm"
+                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": setup, "signal": signal, "levels": levels_txt, "ind": ind_txt, "waiting": waiting}
+                    await self.execute_trade("PUT", symbol, f"Setup A SELL | {levels_txt} | RSI {rsi_now:.0f}")
+                elif buy_B_ready:
+                    setup = "B-Continuation"
+                    signal = "BUY (RISE)"
+                    waiting = "✅ Pullback then continuation break"
+                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": setup, "signal": signal, "levels": levels_txt, "ind": ind_txt, "waiting": waiting}
+                    await self.execute_trade("CALL", symbol, f"Setup B BUY | Bias {bias} | RSI {rsi_now:.0f}")
+                elif sell_B_ready:
+                    setup = "B-Continuation"
+                    signal = "SELL (FALL)"
+                    waiting = "✅ Pullback then continuation break"
+                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": setup, "signal": signal, "levels": levels_txt, "ind": ind_txt, "waiting": waiting}
+                    await self.execute_trade("PUT", symbol, f"Setup B SELL | Bias {bias} | RSI {rsi_now:.0f}")
                 else:
-                    # OLD strategy (kept)
-                    if buy_ready:
-                        await self.execute_trade(
-                            "CALL",
-                            symbol,
-                            "M5 RSI(1)<=20 + MFI(50)<=20 + Alligator UP (Awake)",
-                            source="AUTO",
-                        )
-                    elif sell_ready:
-                        await self.execute_trade(
-                            "PUT",
-                            symbol,
-                            "M5 RSI(1)>=80 + MFI(50)>=80 + Alligator DOWN (Awake)",
-                            source="AUTO",
-                        )
+                    # Helpful waiting text
+                    notes = []
+                    if USE_RSI_FILTER:
+                        notes.append("RSI filter ON")
+                    notes.append("Need sweep+reject+confirm (A) OR pullback+break (B)")
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "bias": bias,
+                        "setup": "-",
+                        "signal": "-",
+                        "levels": levels_txt,
+                        "ind": ind_txt,
+                        "waiting": " | ".join(notes)
+                    }
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Scanner Error ({symbol}): {e}")
+                logger.error(f"Scan error {symbol}: {e}")
                 self.market_debug[symbol] = {
                     "time": time.time(),
-                    "rsi": 0.0,
-                    "mfi": 0.0,
-                    "awake": False,
-                    "allig_up": False, "allig_down": False,
-                    "c": 0.0,
-                    "o": 0.0,
-                    "pa_pattern": "NONE",
-                    "pa_why": "",
-                    "waiting": f"⚠️ Scan error: {str(e)[:120]}"
+                    "bias": "-",
+                    "setup": "-",
+                    "signal": "-",
+                    "levels": "",
+                    "ind": "",
+                    "waiting": f"⚠️ Error: {str(e)[:120]}"
                 }
-            await asyncio.sleep(5)
 
-    async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL"):
+            await asyncio.sleep(2)
+
+    async def execute_trade(self, side: str, symbol: str, reason: str):
         if not self.api or self.active_trade_info:
             return
+
         async with self.trade_lock:
+            ok, g = self.gate(symbol)
+            if not ok:
+                return
+
             try:
-                stake = self.current_stake if source == "AUTO" else BASE_STAKE
-                prop = await self.api.proposal(
-                    {
-                        "proposal": 1,
-                        "amount": stake,
-                        "basis": "stake",
-                        "contract_type": side,
-                        "currency": "USD",
-                        "duration": int(TRADE_DURATION_MIN),
-                        "duration_unit": "m",
-                        "symbol": symbol,
-                    }
-                )
-                buy = await self.api.buy(
-                    {"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])}
-                )
-                self.active_trade_info, self.active_market, self.trade_start_time = (
-                    int(buy["buy"]["contract_id"]),
-                    symbol,
-                    time.time(),
-                )
-                self.last_signal_reason, self.last_trade_side, self.last_trade_source = reason, side, source
-                if source == "AUTO":
-                    self.trades_today += 1
+                duration = int(EXPIRY_MIN.get(symbol, 2))
+                stake = self.current_stake
 
-                safe_symbol = str(symbol).replace("_", " ")
-                msg = f"🚀 {side} TRADE OPENED (${stake})\n🛒 Market: {safe_symbol}\n🧠 Source: {source}\n📝 Reason: {reason}"
+                prop = await self.api.proposal({
+                    "proposal": 1,
+                    "amount": stake,
+                    "basis": "stake",
+                    "contract_type": side,
+                    "currency": "USD",
+                    "duration": duration,
+                    "duration_unit": "m",
+                    "symbol": symbol
+                })
+                buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])})
+
+                self.active_trade_info = int(buy["buy"]["contract_id"])
+                self.active_market = symbol
+                self.trade_start_time = time.time()
+
+                # update caps
+                self.trades_today_total += 1
+                self.trades_today_by_symbol[symbol] += 1
+
+                # cooldowns
+                self.global_cooldown_until = time.time() + COOLDOWN_AFTER_TRADE_SEC
+                self.symbol_cooldown_until[symbol] = time.time() + COOLDOWN_PER_SYMBOL_SEC
+
+                msg = (
+                    f"🚀 {side} OPENED (${stake:.2f})\n"
+                    f"🛒 Market: {symbol.replace('_',' ')}\n"
+                    f"⏱ Expiry: {duration}m\n"
+                    f"📌 Strategy: Liquidity + Structure (A/B internal)\n"
+                    f"🧠 {reason}"
+                )
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
-                asyncio.create_task(self.check_result(self.active_trade_info, source))
-            except:
-                pass
 
-    async def check_result(self, cid: int, source: str):
-        await asyncio.sleep(TRADE_DURATION_SEC + 5)
+                asyncio.create_task(self.check_result(self.active_trade_info, symbol))
+
+            except Exception as e:
+                logger.error(f"Trade error: {e}")
+
+    async def check_result(self, cid: int, symbol: str):
+        # wait for expiry + small buffer
+        await asyncio.sleep(EXPIRY_MIN.get(symbol, 2) * 60 + 5)
+
         try:
             res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
-            profit = float(res["proposal_open_contract"].get("profit", 0))
-            if source == "AUTO":
-                self.total_profit_today += profit
-                if profit <= 0:
-                    self.consecutive_losses += 1
-                    self.total_losses_today += 1
-                    self.current_stake *= 2
-                else:
-                    self.consecutive_losses = 0
-                    self.current_stake = BASE_STAKE
+            profit = float(res["proposal_open_contract"].get("profit", 0.0))
+
+            self.total_profit_today += profit
+
+            if profit <= 0:
+                self.losses_today_total += 1
+                self.losses_today_by_symbol[symbol] += 1
+                self.consecutive_losses += 1
+
+                # disable symbol if loss cap reached
+                if self.losses_today_by_symbol[symbol] >= STOP_SYMBOL_AFTER_LOSSES:
+                    self.disabled_symbol_today[symbol] = True
+
+                # optional martingale kept as your earlier bot
+                self.current_stake *= 2
+            else:
+                self.consecutive_losses = 0
+                self.current_stake = BASE_STAKE
+
             await self.fetch_balance()
             await self.app.bot.send_message(
                 TELEGRAM_CHAT_ID,
-                f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} (${profit:.2f})\n💰 Balance: {self.balance}",
+                f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n💰 Balance: {self.balance}"
             )
+
         finally:
             self.active_trade_info = None
-            self.cooldown_until = time.time() + COOLDOWN_SEC
+            self.active_market = None
+
 
 # ========================= UI =========================
-bot_logic = DerivSniperBot()
+bot_logic = DerivBot()
 
 def main_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("▶️ START", callback_data="START_SCAN"),
-                InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN"),
-            ],
-            [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"), InlineKeyboardButton("🔄 REFRESH", callback_data="STATUS")],
-            [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY")],
-            [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"), InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")],
-        ]
-    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ START", callback_data="START_SCAN"),
+         InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
+        [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"),
+         InlineKeyboardButton("🔄 REFRESH", callback_data="STATUS")],
+        [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY")],
+        [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"),
+         InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
+    ])
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     await q.answer()
+
     if q.data == "SET_DEMO":
         bot_logic.active_token, bot_logic.account_type = DEMO_TOKEN, "DEMO"
         ok = await bot_logic.connect()
         await q.edit_message_text("✅ Connected to DEMO" if ok else "❌ DEMO Failed", reply_markup=main_keyboard())
+
     elif q.data == "SET_REAL":
         bot_logic.active_token, bot_logic.account_type = REAL_TOKEN, "LIVE"
         ok = await bot_logic.connect()
         await q.edit_message_text("⚠️ LIVE CONNECTED" if ok else "❌ LIVE Failed", reply_markup=main_keyboard())
+
     elif q.data == "START_SCAN":
         if not bot_logic.api:
             await q.edit_message_text("❌ Connect first.", reply_markup=main_keyboard())
             return
         bot_logic.is_scanning = True
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
-        await q.edit_message_text("🔍 SCANNER ACTIVE", reply_markup=main_keyboard())
+        await q.edit_message_text("🔍 SCANNER ACTIVE\n📌 Strategy: Liquidity + Structure (A/B internal)", reply_markup=main_keyboard())
+
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
         await q.edit_message_text("⏹️ Scanner stopped.", reply_markup=main_keyboard())
+
     elif q.data == "TEST_BUY":
-        await bot_logic.execute_trade("CALL", "R_10", "Manual Test", source="MANUAL")
+        await bot_logic.execute_trade("CALL", "R_10", "Manual test trade")
+
     elif q.data == "STATUS":
         await bot_logic.fetch_balance()
         now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
-        ok, gate = bot_logic.can_auto_trade()
+        ok, gate = bot_logic.gate("R_10")  # just to show global readiness
 
         trade_status = "No Active Trade"
         if bot_logic.active_trade_info and bot_logic.api:
             try:
                 res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
-                pnl = float(res["proposal_open_contract"].get("profit", 0))
-                rem = max(0, TRADE_DURATION_SEC - int(time.time() - bot_logic.trade_start_time))
-                icon = "PROFIT" if pnl > 0 else "LOSS"
-                mkt_clean = str(bot_logic.active_market).replace("_", " ")
-                trade_status = f"🚀 Active Trade ({mkt_clean})\n📈 PnL: {icon} (${pnl:.2f})\n⏳ Left: {rem}s"
+                pnl = float(res["proposal_open_contract"].get("profit", 0.0))
+                rem = int(max(0, (EXPIRY_MIN.get(bot_logic.active_market, 2) * 60) - (time.time() - bot_logic.trade_start_time)))
+                mkt = (bot_logic.active_market or "—").replace("_", " ")
+                trade_status = f"🚀 Active Trade ({mkt})\n📈 PnL: {pnl:+.2f}\n⏳ Left: {rem}s"
             except:
                 trade_status = "🚀 Active Trade: Syncing..."
 
         status_msg = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"📡 Markets: {', '.join(MARKETS).replace('_', ' ')}\n"
+            f"📌 Strategy: Price Action Liquidity + Structure (Setup A + Setup B)\n"
+            f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
-            f"💵 Total Profit: ${bot_logic.total_profit_today:.2f}\n"
-            f"🎯 Today: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
-            f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | 🧪 Next Stake: ${bot_logic.current_stake:.2f}\n"
-            f"🚦 Gate: {gate}\n💰 Balance: {bot_logic.balance}"
+            f"🎯 Trades Today: {bot_logic.trades_today_total}/{MAX_TRADES_PER_DAY_TOTAL}\n"
+            f"❌ Losses Today: {bot_logic.losses_today_total}/{STOP_DAY_AFTER_TOTAL_LOSSES}\n"
+            f"🧪 Next Stake: ${bot_logic.current_stake:.2f}\n"
+            f"💰 Balance: {bot_logic.balance}"
         )
 
         debug_lines = []
         for sym in MARKETS:
             d = bot_logic.market_debug.get(sym)
             if not d:
-                debug_lines.append(f"• {sym.replace('_',' ')}\n  ⏳ No scan data yet (still syncing)")
-                continue
-            debug_lines.append(fmt_scan_line(sym, d))
+                debug_lines.append(f"• {sym.replace('_',' ')}\n  ⏳ No scan data yet")
+            else:
+                debug_lines.append(fmt_scan(sym, d))
 
-        status_msg += "\n\n📌 LIVE SCAN (Simple)\n" + "\n\n".join(debug_lines)
-
+        status_msg += "\n\n📌 LIVE SCAN\n" + "\n\n".join(debug_lines)
         await q.edit_message_text(status_msg, reply_markup=main_keyboard())
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 Sniper Survival M5 (Indicators + Price Action Edition)", reply_markup=main_keyboard())
+    await u.message.reply_text(
+        "💎 Deriv Bot\n"
+        "📌 Strategy: Price Action Liquidity + Structure\n"
+        "✅ Setup A: Liquidity sweep reversal\n"
+        "✅ Setup B: Trend continuation\n"
+        "🕯 Entry: M1 | Bias: M5/M15 | Expiry: per index\n",
+        reply_markup=main_keyboard()
+    )
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
