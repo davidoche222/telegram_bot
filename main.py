@@ -300,18 +300,51 @@ class DerivSniperBot:
                     self.is_scanning = False
                     break
 
+                # ========================= CHANGE: MORE HISTORY =========================
                 data = await self.api.ticks_history(
-                    {"ticks_history": symbol, "end": "latest", "count": 1000, "style": "ticks"}
+                    {"ticks_history": symbol, "end": "latest", "count": 10000, "style": "ticks"}
                 )
+                # ======================================================================
+
                 candles = build_m1_candles_from_ticks(data["history"]["times"], data["history"]["prices"])
 
                 # Need enough 5-min candles for MFI(50) + buffer
                 if len(candles) < (MFI_PERIOD + 5):
+                    # ========================= CHANGE: DEBUG EVEN WHEN SKIPPING =========================
+                    last_o = float(candles[-1]["o"]) if candles else 0.0
+                    last_c = float(candles[-1]["c"]) if candles else 0.0
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "rsi": 0.0, "rsi_prev": 0.0,
+                        "mfi": 0.0, "mfi_prev": 0.0,
+                        "jaws": 0.0, "teeth": 0.0, "lips": 0.0,
+                        "awake": False, "allig_up": False, "allig_down": False,
+                        "c": last_c,
+                        "o": last_o,
+                        "waiting": f"Not enough M5 candles yet: {len(candles)}/{MFI_PERIOD + 5} (need more history)"
+                    }
+                    # ================================================================================
+
                     await asyncio.sleep(10)
                     continue
 
                 ind = calculate_indicators(candles)
                 if not ind:
+                    # ========================= CHANGE: DEBUG WHEN INDICATORS NOT READY =========================
+                    last_o = float(candles[-1]["o"])
+                    last_c = float(candles[-1]["c"])
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "rsi": 0.0, "rsi_prev": 0.0,
+                        "mfi": 0.0, "mfi_prev": 0.0,
+                        "jaws": 0.0, "teeth": 0.0, "lips": 0.0,
+                        "awake": False, "allig_up": False, "allig_down": False,
+                        "c": last_c,
+                        "o": last_o,
+                        "waiting": "Indicators not ready yet (likely not enough candles for RSI/MFI/Alligator shifts)"
+                    }
+                    # =========================================================================================
+
                     await asyncio.sleep(10)
                     continue
 
