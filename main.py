@@ -17,7 +17,7 @@ MARKETS = ["R_10", "R_25", "R_50"]
 
 COOLDOWN_SEC = 120 
 MAX_TRADES_PER_DAY = 40 
-MAX_CONSEC_LOSSES = 4 
+MAX_CONSEC_LOSSES = 10 
 
 BASE_STAKE = 1.00 # <--- Initial trade amount
 
