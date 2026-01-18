@@ -19,8 +19,7 @@ COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 40 
 MAX_CONSEC_LOSSES = 10 
 
-BASE_STAKE = 0.52 # Approx stake to get 0.50 profit
-TARGET_PROFIT = 0.50
+BASE_STAKE = 1.00 # <--- Initial trade amount
 
 TELEGRAM_TOKEN = "8253450930:AAHUhPk9TML-8kZlA9UaHZZvTUGdurN9MVY"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -103,7 +102,7 @@ class DerivSniperBot:
         self.consecutive_losses = 0
         self.total_profit_today = 0.0 # <--- ADDED PROFIT TRACKER
         self.balance = "0.00"
-        self.current_payout = BASE_STAKE + TARGET_PROFIT # <--- PAYOUT TRACKER
+        self.current_stake = BASE_STAKE # <--- ADDED MARTINGALE TRACKER
         self.trade_lock = asyncio.Lock()
         self.last_scan_symbol = "None"
         self.last_signal_reason = "None"
@@ -187,18 +186,15 @@ class DerivSniperBot:
         if not self.api or self.active_trade_info: return
         async with self.trade_lock:
             try:
-                # CHANGED: Using basis='payout' to fix the profit amount
-                payout = self.current_payout if source == "AUTO" else (BASE_STAKE + TARGET_PROFIT)
-                prop = await self.api.proposal({"proposal": 1, "amount": round(payout, 2), "basis": "payout", "contract_type": side, "currency": "USD", "duration": 5, "duration_unit": "m", "symbol": symbol})
+                stake = self.current_stake if source == "AUTO" else BASE_STAKE
+                prop = await self.api.proposal({"proposal": 1, "amount": stake, "basis": "stake", "contract_type": side, "currency": "USD", "duration": 5, "duration_unit": "m", "symbol": symbol})
                 buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])})
-                
-                actual_stake = float(buy["buy"]["buy_price"])
                 self.active_trade_info, self.active_market, self.trade_start_time = int(buy["buy"]["contract_id"]), symbol, time.time()
                 self.last_signal_reason, self.last_trade_side, self.last_trade_source = reason, side, source
                 if source == "AUTO": self.trades_today += 1
                 
                 safe_symbol = str(symbol).replace("_", " ")
-                msg = f"🚀 {side} TRADE OPENED (Risk: ${actual_stake:.2f})\n🛒 Market: {safe_symbol}\n🧠 Source: {source}"
+                msg = f"🚀 {side} TRADE OPENED (${stake})\n🛒 Market: {safe_symbol}\n🧠 Source: {source}"
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
                 asyncio.create_task(self.check_result(self.active_trade_info, source))
             except: pass
@@ -212,10 +208,10 @@ class DerivSniperBot:
                 self.total_profit_today += profit # Update total profit
                 if profit <= 0: 
                     self.consecutive_losses += 1; self.total_losses_today += 1
-                    self.current_payout *= 2 # <--- MARTINGALE 2X ON PAYOUT
+                    self.current_stake *= 2 # <--- MARTINGALE 2X
                 else: 
                     self.consecutive_losses = 0
-                    self.current_payout = BASE_STAKE + TARGET_PROFIT # <--- RESET
+                    self.current_stake = BASE_STAKE # <--- RESET MARTINGALE
             await self.fetch_balance()
             await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} (${profit:.2f})\n💰 Balance: {self.balance}")
         finally:
@@ -274,7 +270,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
             f"💵 Total Profit: ${bot_logic.total_profit_today:.2f}\n" # <--- ADDED TO STATUS
             f"🎯 Today: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
-            f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | 🧪 Payout Goal: ${bot_logic.current_payout:.2f}\n"
+            f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | 🧪 Next Stake: ${bot_logic.current_stake:.2f}\n"
             f"🚦 Gate: {gate}\n💰 Balance: {bot_logic.balance}"
         )
         await q.edit_message_text(status_msg, reply_markup=main_keyboard())
