@@ -35,12 +35,16 @@ TRADE_DURATION_MIN = (TIMEFRAME_SEC * EXPIRY_CANDLES) // 60  # 10 minutes
 TRADE_DURATION_SEC = TIMEFRAME_SEC * EXPIRY_CANDLES          # 600 seconds
 
 RSI_FAST_PERIOD = 1
-RSI_LEVEL_BUY = 20
-RSI_LEVEL_SELL = 80
+
+# ========================= OPTION A (TRADE MORE OFTEN) =========================
+# Loosen zones to 30/70
+RSI_LEVEL_BUY = 30
+RSI_LEVEL_SELL = 70
 
 MFI_PERIOD = 50
-MFI_LEVEL_BUY = 20
-MFI_LEVEL_SELL = 80
+MFI_LEVEL_BUY = 30
+MFI_LEVEL_SELL = 70
+# ============================================================================
 
 # Alligator: using periods=2, shifts=10 (as per your settings)
 ALLIGATOR_JAWS_PERIOD = 2
@@ -289,7 +293,7 @@ class DerivSniperBot:
                     self.is_scanning = False
                     break
 
-                # ========================= CHANGED: FETCH REAL M5 CANDLES (SUPPORTED) =========================
+                # ========================= FETCH REAL M5 CANDLES (SUPPORTED) =========================
                 need = max(200, MFI_PERIOD + ALLIGATOR_JAWS_SHIFT + 30)
                 res = await self.api.ticks_history({
                     "ticks_history": symbol,
@@ -304,7 +308,6 @@ class DerivSniperBot:
 
                 # Need enough 5-min candles for MFI(50) + buffer
                 if len(candles) < (MFI_PERIOD + 5):
-                    # keep debug info even when not enough history
                     self.market_debug[symbol] = {
                         "time": time.time(),
                         "rsi": 0.0, "rsi_prev": 0.0,
@@ -330,13 +333,13 @@ class DerivSniperBot:
                     await asyncio.sleep(10)
                     continue
 
-                # ========================= ADDED: DEBUG / WAITING MESSAGE =========================
+                # ========================= DEBUG / WAITING MESSAGE =========================
                 is_green = ind["c"] > ind["o"]
                 is_red = ind["c"] < ind["o"]
 
+                # OPTION A: remove is_awake requirement for signal readiness (still show it in debug)
                 buy_ready = (
-                    ind["is_awake"]
-                    and ind["allig_up"]
+                    ind["allig_up"]
                     and (ind["mfi"] <= MFI_LEVEL_BUY)
                     and (ind["rsi_fast"] <= RSI_LEVEL_BUY)
                     and (ind["mfi"] >= ind["mfi_prev"])
@@ -345,8 +348,7 @@ class DerivSniperBot:
                 )
 
                 sell_ready = (
-                    ind["is_awake"]
-                    and ind["allig_down"]
+                    ind["allig_down"]
                     and (ind["mfi"] >= MFI_LEVEL_SELL)
                     and (ind["rsi_fast"] >= RSI_LEVEL_SELL)
                     and (ind["mfi"] <= ind["mfi_prev"])
@@ -355,16 +357,15 @@ class DerivSniperBot:
                 )
 
                 waiting = []
-                if not ind["is_awake"]:
-                    waiting.append("Alligator sleeping (lines tangled/flat)")
-                else:
-                    if not ind["allig_up"] and not ind["allig_down"]:
-                        waiting.append("Alligator not in clear UP/DOWN order")
+
+                # No longer blocking on awake, but still informative
+                if not ind["allig_up"] and not ind["allig_down"]:
+                    waiting.append("Alligator not in clear UP/DOWN order")
 
                 if ind["mfi"] > MFI_LEVEL_BUY and ind["mfi"] < MFI_LEVEL_SELL:
-                    waiting.append("MFI not in extreme zone (need <=20 or >=80)")
+                    waiting.append(f"MFI not in zone (need <= {MFI_LEVEL_BUY} or >= {MFI_LEVEL_SELL})")
                 if ind["rsi_fast"] > RSI_LEVEL_BUY and ind["rsi_fast"] < RSI_LEVEL_SELL:
-                    waiting.append("RSI(1) not in extreme zone (need <=20 or >=80)")
+                    waiting.append(f"RSI(1) not in zone (need <= {RSI_LEVEL_BUY} or >= {RSI_LEVEL_SELL})")
 
                 if ind["allig_up"]:
                     if ind["mfi"] > MFI_LEVEL_BUY: waiting.append("MFI not low enough for BUY")
@@ -400,29 +401,28 @@ class DerivSniperBot:
                 }
                 # ===================================================================================
 
-                # ================= NEW STRATEGY LOGIC: RSI(1) + ALLIGATOR + MFI(50) =================
-
+                # ================= STRATEGY LOGIC (OPTION A) =================
                 # BUY (CALL)
-                if ind["is_awake"] and ind["allig_up"]:
+                if ind["allig_up"]:
                     if (ind["mfi"] <= MFI_LEVEL_BUY) and (ind["rsi_fast"] <= RSI_LEVEL_BUY):
                         if (ind["mfi"] >= ind["mfi_prev"]) and (ind["rsi_fast"] >= ind["rsi_fast_prev"]):
                             if is_green:
                                 await self.execute_trade(
                                     "CALL",
                                     symbol,
-                                    "M5 RSI(1)<=20 + MFI(50)<=20 + Alligator UP (Awake)",
+                                    f"M5 RSI(1)<= {RSI_LEVEL_BUY} + MFI({MFI_PERIOD})<= {MFI_LEVEL_BUY} + Alligator UP",
                                     source="AUTO",
                                 )
 
                 # SELL (PUT)
-                elif ind["is_awake"] and ind["allig_down"]:
+                elif ind["allig_down"]:
                     if (ind["mfi"] >= MFI_LEVEL_SELL) and (ind["rsi_fast"] >= RSI_LEVEL_SELL):
                         if (ind["mfi"] <= ind["mfi_prev"]) and (ind["rsi_fast"] <= ind["rsi_fast_prev"]):
                             if is_red:
                                 await self.execute_trade(
                                     "PUT",
                                     symbol,
-                                    "M5 RSI(1)>=80 + MFI(50)>=80 + Alligator DOWN (Awake)",
+                                    f"M5 RSI(1)>= {RSI_LEVEL_SELL} + MFI({MFI_PERIOD})>= {MFI_LEVEL_SELL} + Alligator DOWN",
                                     source="AUTO",
                                 )
 
@@ -571,7 +571,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"🚦 Gate: {gate}\n💰 Balance: {bot_logic.balance}"
         )
 
-        # ========================= ADDED: LIVE SCAN DEBUG =========================
+        # ========================= LIVE SCAN DEBUG =========================
         debug_lines = []
         for sym in MARKETS:
             d = bot_logic.market_debug.get(sym)
