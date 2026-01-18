@@ -240,6 +240,10 @@ class DerivSniperBot:
         self.last_trade_side = "None"
         self.last_trade_source = "None"
 
+        # ========================= ADDED: COMMUNICATION TRACKER =========================
+        self.market_debug = {}  # per symbol debug status
+        # =================================================================================
+
     async def connect(self) -> bool:
         try:
             if not self.active_token:
@@ -317,12 +321,79 @@ class DerivSniperBot:
                     await asyncio.sleep(10)
                     continue
 
+                # ========================= ADDED: DEBUG / WAITING MESSAGE =========================
+                is_green = ind["c"] > ind["o"]
+                is_red = ind["c"] < ind["o"]
+
+                buy_ready = (
+                    ind["is_awake"]
+                    and ind["allig_up"]
+                    and (ind["mfi"] <= MFI_LEVEL_BUY)
+                    and (ind["rsi_fast"] <= RSI_LEVEL_BUY)
+                    and (ind["mfi"] >= ind["mfi_prev"])
+                    and (ind["rsi_fast"] >= ind["rsi_fast_prev"])
+                    and is_green
+                )
+
+                sell_ready = (
+                    ind["is_awake"]
+                    and ind["allig_down"]
+                    and (ind["mfi"] >= MFI_LEVEL_SELL)
+                    and (ind["rsi_fast"] >= RSI_LEVEL_SELL)
+                    and (ind["mfi"] <= ind["mfi_prev"])
+                    and (ind["rsi_fast"] <= ind["rsi_fast_prev"])
+                    and is_red
+                )
+
+                waiting = []
+                if not ind["is_awake"]:
+                    waiting.append("Alligator sleeping (lines tangled/flat)")
+                else:
+                    if not ind["allig_up"] and not ind["allig_down"]:
+                        waiting.append("Alligator not in clear UP/DOWN order")
+
+                if ind["mfi"] > MFI_LEVEL_BUY and ind["mfi"] < MFI_LEVEL_SELL:
+                    waiting.append("MFI not in extreme zone (need <=20 or >=80)")
+                if ind["rsi_fast"] > RSI_LEVEL_BUY and ind["rsi_fast"] < RSI_LEVEL_SELL:
+                    waiting.append("RSI(1) not in extreme zone (need <=20 or >=80)")
+
+                if ind["allig_up"]:
+                    if ind["mfi"] > MFI_LEVEL_BUY: waiting.append("MFI not low enough for BUY")
+                    if ind["rsi_fast"] > RSI_LEVEL_BUY: waiting.append("RSI(1) not low enough for BUY")
+                    if ind["mfi"] < ind["mfi_prev"]: waiting.append("MFI not turning UP for BUY")
+                    if ind["rsi_fast"] < ind["rsi_fast_prev"]: waiting.append("RSI(1) not turning UP for BUY")
+                    if not is_green: waiting.append("Need GREEN candle for BUY")
+
+                if ind["allig_down"]:
+                    if ind["mfi"] < MFI_LEVEL_SELL: waiting.append("MFI not high enough for SELL")
+                    if ind["rsi_fast"] < RSI_LEVEL_SELL: waiting.append("RSI(1) not high enough for SELL")
+                    if ind["mfi"] > ind["mfi_prev"]: waiting.append("MFI not turning DOWN for SELL")
+                    if ind["rsi_fast"] > ind["rsi_fast_prev"]: waiting.append("RSI(1) not turning DOWN for SELL")
+                    if not is_red: waiting.append("Need RED candle for SELL")
+
+                waiting_msg = "✅ BUY READY" if buy_ready else ("✅ SELL READY" if sell_ready else (" | ".join(waiting) if waiting else "Waiting..."))
+
+                self.market_debug[symbol] = {
+                    "time": time.time(),
+                    "rsi": float(ind["rsi_fast"]),
+                    "rsi_prev": float(ind["rsi_fast_prev"]),
+                    "mfi": float(ind["mfi"]),
+                    "mfi_prev": float(ind["mfi_prev"]),
+                    "jaws": float(ind["jaws"]),
+                    "teeth": float(ind["teeth"]),
+                    "lips": float(ind["lips"]),
+                    "awake": bool(ind["is_awake"]),
+                    "allig_up": bool(ind["allig_up"]),
+                    "allig_down": bool(ind["allig_down"]),
+                    "c": float(ind["c"]),
+                    "o": float(ind["o"]),
+                    "waiting": waiting_msg
+                }
+                # ===================================================================================
+
                 # ================= NEW STRATEGY LOGIC: RSI(1) + ALLIGATOR + MFI(50) =================
                 # Main confirmation = MFI, and Alligator gives direction (must not be sleeping),
                 # RSI(1) gives quick trigger.
-
-                is_green = ind["c"] > ind["o"]
-                is_red = ind["c"] < ind["o"]
 
                 # BUY (CALL)
                 if ind["is_awake"] and ind["allig_up"]:
@@ -481,6 +552,27 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | 🧪 Next Stake: ${bot_logic.current_stake:.2f}\n"
             f"🚦 Gate: {gate}\n💰 Balance: {bot_logic.balance}"
         )
+
+        # ========================= ADDED: LIVE SCAN DEBUG =========================
+        debug_lines = []
+        for sym in MARKETS:
+            d = bot_logic.market_debug.get(sym)
+            if not d:
+                debug_lines.append(f"• {sym.replace('_',' ')}: (no scan data yet)")
+                continue
+
+            age = int(time.time() - d["time"])
+            debug_lines.append(
+                f"• {sym.replace('_',' ')} ({age}s ago)\n"
+                f"   RSI(1): {d['rsi']:.2f} (prev {d['rsi_prev']:.2f}) | MFI: {d['mfi']:.2f} (prev {d['mfi_prev']:.2f})\n"
+                f"   Alligator: lips {d['lips']:.2f} | teeth {d['teeth']:.2f} | jaws {d['jaws']:.2f} | awake={d['awake']}\n"
+                f"   Candle: O={d['o']:.2f} C={d['c']:.2f}\n"
+                f"   ⏳ Waiting: {d['waiting']}"
+            )
+
+        status_msg += "\n\n📌 LIVE SCAN DEBUG\n" + "\n".join(debug_lines)
+        # =======================================================================
+
         await q.edit_message_text(status_msg, reply_markup=main_keyboard())
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
