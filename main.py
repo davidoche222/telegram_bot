@@ -50,6 +50,18 @@ ALLIGATOR_JAWS_SHIFT = 10
 ALLIGATOR_TEETH_SHIFT = 10
 ALLIGATOR_LIPS_SHIFT = 10
 
+# ========================= PRICE ACTION SETTINGS (ADDED) =========================
+# This is the "price action strategy" added on top of your current one.
+# It uses: Engulfing + Pinbar at swing + RSI confirmation.
+PA_LOOKBACK_SWING = 8                 # swing check (last N candles)
+PA_PINBAR_WICK_RATIO = 2.2            # wick must be >= body * ratio
+PA_PINBAR_BODY_MAX_RANGE = 0.35       # body must be <= 35% of candle range
+
+RSI_CONFIRM_PERIOD = 14               # RSI confirmation for price action (stable)
+RSI_CONFIRM_BUY = 52                  # buy confirmation
+RSI_CONFIRM_SELL = 48                 # sell confirmation
+# ================================================================================
+
 # ========================= STRATEGY MATH =========================
 def calculate_ema(data, period):
     if len(data) < period:
@@ -71,7 +83,6 @@ def calculate_rsi(data, period=14):
     gain = delta.clip(min=0)
     loss = (-delta).clip(min=0)
 
-    # Wilder-style smoothing approximation using rolling mean for simplicity
     avg_gain = np.convolve(gain, np.ones(period), "valid") / period
     avg_loss = np.convolve(loss, np.ones(period), "valid") / period
     rs = avg_gain / (avg_loss + 1e-9)
@@ -79,7 +90,6 @@ def calculate_rsi(data, period=14):
     return rsi
 
 def _smma(values, period):
-    # Smoothed moving average (Wilder / SMMA)
     values = np.array(values, dtype=float)
     if len(values) < period:
         return np.array([])
@@ -91,7 +101,6 @@ def _smma(values, period):
     return out
 
 def calculate_mfi(high, low, close, volume, period=14):
-    # Money Flow Index using candle volume if available; otherwise defaults to 1 per candle.
     high = np.array(high, dtype=float)
     low = np.array(low, dtype=float)
     close = np.array(close, dtype=float)
@@ -107,7 +116,6 @@ def calculate_mfi(high, low, close, volume, period=14):
     pos_mf = np.where(tp_diff > 0, raw_mf[1:], 0.0)
     neg_mf = np.where(tp_diff < 0, raw_mf[1:], 0.0)
 
-    # rolling sums
     pos_sum = np.convolve(pos_mf, np.ones(period), "valid")
     neg_sum = np.convolve(neg_mf, np.ones(period), "valid")
 
@@ -115,25 +123,141 @@ def calculate_mfi(high, low, close, volume, period=14):
     mfi = 100 - (100 / (1 + mfr))
     return mfi
 
+# ========================= PRICE ACTION HELPERS (ADDED) =========================
+def _candle_parts(c):
+    o, h, l, cl = float(c["o"]), float(c["h"]), float(c["l"]), float(c["c"])
+    body = abs(cl - o)
+    rng = max(1e-9, h - l)
+    upper = h - max(o, cl)
+    lower = min(o, cl) - l
+    green = cl > o
+    red = cl < o
+    return o, h, l, cl, body, rng, upper, lower, green, red
+
+def _is_bullish_engulf(prev, cur):
+    po, ph, pl, pc, pbody, prng, pupper, plower, pgreen, pred = _candle_parts(prev)
+    co, ch, cl, cc, cbody, crng, cupper, clower, cgreen, cred = _candle_parts(cur)
+    if not (pred and cgreen):
+        return False
+    # engulf body
+    prev_low = min(po, pc)
+    prev_high = max(po, pc)
+    cur_low = min(co, cc)
+    cur_high = max(co, cc)
+    return (cur_low <= prev_low) and (cur_high >= prev_high) and (cbody > pbody * 0.9)
+
+def _is_bearish_engulf(prev, cur):
+    po, ph, pl, pc, pbody, prng, pupper, plower, pgreen, pred = _candle_parts(prev)
+    co, ch, cl, cc, cbody, crng, cupper, clower, cgreen, cred = _candle_parts(cur)
+    if not (pgreen and cred):
+        return False
+    prev_low = min(po, pc)
+    prev_high = max(po, pc)
+    cur_low = min(co, cc)
+    cur_high = max(co, cc)
+    return (cur_low <= prev_low) and (cur_high >= prev_high) and (cbody > pbody * 0.9)
+
+def _is_bullish_pinbar(cur):
+    o, h, l, c, body, rng, upper, lower, green, red = _candle_parts(cur)
+    # long lower wick, small body
+    if body / rng > PA_PINBAR_BODY_MAX_RANGE:
+        return False
+    if lower < body * PA_PINBAR_WICK_RATIO:
+        return False
+    if upper > lower * 0.65:
+        return False
+    return True
+
+def _is_bearish_pinbar(cur):
+    o, h, l, c, body, rng, upper, lower, green, red = _candle_parts(cur)
+    # long upper wick, small body
+    if body / rng > PA_PINBAR_BODY_MAX_RANGE:
+        return False
+    if upper < body * PA_PINBAR_WICK_RATIO:
+        return False
+    if lower > upper * 0.65:
+        return False
+    return True
+
+def _is_swing_low(candles, lookback):
+    if len(candles) < lookback + 1:
+        return False
+    cur = candles[-1]
+    cur_low = float(cur["l"])
+    prev_lows = [float(x["l"]) for x in candles[-(lookback+1):-1]]
+    return cur_low <= min(prev_lows)
+
+def _is_swing_high(candles, lookback):
+    if len(candles) < lookback + 1:
+        return False
+    cur = candles[-1]
+    cur_high = float(cur["h"])
+    prev_highs = [float(x["h"]) for x in candles[-(lookback+1):-1]]
+    return cur_high >= max(prev_highs)
+
+def detect_price_action_signal(candles, rsi_confirm_now, rsi_confirm_prev):
+    """
+    Returns dict:
+      { "side": "CALL"/"PUT"/None, "pattern": "...", "why": "..." }
+    """
+    if len(candles) < 3:
+        return {"side": None, "pattern": "NONE", "why": "Need more candles"}
+
+    prev = candles[-2]
+    cur = candles[-1]
+
+    bull_engulf = _is_bullish_engulf(prev, cur)
+    bear_engulf = _is_bearish_engulf(prev, cur)
+
+    bull_pin = _is_bullish_pinbar(cur) and _is_swing_low(candles, PA_LOOKBACK_SWING)
+    bear_pin = _is_bearish_pinbar(cur) and _is_swing_high(candles, PA_LOOKBACK_SWING)
+
+    rsi_buy_ok = (rsi_confirm_now >= RSI_CONFIRM_BUY) and (rsi_confirm_now >= rsi_confirm_prev)
+    rsi_sell_ok = (rsi_confirm_now <= RSI_CONFIRM_SELL) and (rsi_confirm_now <= rsi_confirm_prev)
+
+    # Priority: engulfing, then pinbar
+    if bull_engulf and rsi_buy_ok:
+        return {"side": "CALL", "pattern": "BULL ENGULF", "why": f"Engulfing + RSI({RSI_CONFIRM_PERIOD}) up"}
+    if bear_engulf and rsi_sell_ok:
+        return {"side": "PUT", "pattern": "BEAR ENGULF", "why": f"Engulfing + RSI({RSI_CONFIRM_PERIOD}) down"}
+    if bull_pin and rsi_buy_ok:
+        return {"side": "CALL", "pattern": "BULL PINBAR", "why": f"Pinbar @ swing low + RSI({RSI_CONFIRM_PERIOD}) up"}
+    if bear_pin and rsi_sell_ok:
+        return {"side": "PUT", "pattern": "BEAR PINBAR", "why": f"Pinbar @ swing high + RSI({RSI_CONFIRM_PERIOD}) down"}
+
+    # Explain what's missing (simple)
+    if bull_engulf:
+        return {"side": None, "pattern": "BULL ENGULF", "why": f"Waiting RSI({RSI_CONFIRM_PERIOD}) >= {RSI_CONFIRM_BUY} and rising"}
+    if bear_engulf:
+        return {"side": None, "pattern": "BEAR ENGULF", "why": f"Waiting RSI({RSI_CONFIRM_PERIOD}) <= {RSI_CONFIRM_SELL} and falling"}
+    if bull_pin:
+        return {"side": None, "pattern": "BULL PINBAR", "why": f"Waiting RSI({RSI_CONFIRM_PERIOD}) >= {RSI_CONFIRM_BUY} and rising"}
+    if bear_pin:
+        return {"side": None, "pattern": "BEAR PINBAR", "why": f"Waiting RSI({RSI_CONFIRM_PERIOD}) <= {RSI_CONFIRM_SELL} and falling"}
+
+    return {"side": None, "pattern": "NONE", "why": "No price action setup"}
+# ================================================================================
+
 def calculate_indicators(candles):
-    # candles have: o,h,l,c,v
     c = np.array([x["c"] for x in candles], dtype=float)
     o = np.array([x["o"] for x in candles], dtype=float)
     h = np.array([x["h"] for x in candles], dtype=float)
     l = np.array([x["l"] for x in candles], dtype=float)
     v = np.array([x.get("v", 1) for x in candles], dtype=float)
 
-    # RSI Fast (period=1)
     rsi_fast = calculate_rsi(c, RSI_FAST_PERIOD)
     if len(rsi_fast) < 2:
         return None
 
-    # MFI (period=50)
+    # ADDED: stable RSI confirmation for price action
+    rsi_conf = calculate_rsi(c, RSI_CONFIRM_PERIOD)
+    if len(rsi_conf) < 2:
+        return None
+
     mfi_vals = calculate_mfi(h, l, c, v, MFI_PERIOD)
     if len(mfi_vals) < 2:
         return None
 
-    # Alligator lines: SMMA of median price
     median = (h + l) / 2.0
     jaws = _smma(median, ALLIGATOR_JAWS_PERIOD)
     teeth = _smma(median, ALLIGATOR_TEETH_PERIOD)
@@ -141,7 +265,6 @@ def calculate_indicators(candles):
     if len(jaws) == 0 or len(teeth) == 0 or len(lips) == 0:
         return None
 
-    # Apply shift by referencing earlier values (shift forward visually means using older value).
     def shifted(arr, shift):
         if len(arr) <= shift:
             return np.array([])
@@ -151,22 +274,18 @@ def calculate_indicators(candles):
     teeth_s = shifted(teeth, ALLIGATOR_TEETH_SHIFT)
     lips_s = shifted(lips, ALLIGATOR_LIPS_SHIFT)
 
-    # align lengths by trimming to shortest
     min_len = min(len(jaws_s), len(teeth_s), len(lips_s), len(c))
     if min_len < 5:
         return None
 
-    # take last aligned
     jaws_v = jaws_s[-1]
     teeth_v = teeth_s[-1]
     lips_v = lips_s[-1]
 
-    # basic "awake" check: lines not too tangled
     spread = abs(lips_v - teeth_v) + abs(teeth_v - jaws_v)
     price_scale = max(1e-9, abs(c[-1]))
-    is_awake = spread > (price_scale * 1e-5)  # tiny but avoids totally flat
+    is_awake = spread > (price_scale * 1e-5)
 
-    # Trend direction by alligator ordering
     alligator_up = (lips_v > teeth_v > jaws_v)
     alligator_down = (lips_v < teeth_v < jaws_v)
 
@@ -176,6 +295,9 @@ def calculate_indicators(candles):
 
         "rsi_fast": rsi_fast[-1],
         "rsi_fast_prev": rsi_fast[-2],
+
+        "rsi_conf": rsi_conf[-1],
+        "rsi_conf_prev": rsi_conf[-2],
 
         "mfi": mfi_vals[-1],
         "mfi_prev": mfi_vals[-2],
@@ -190,7 +312,6 @@ def calculate_indicators(candles):
 
 # ========================= CHANGED: USE REAL DERIV CANDLES (via ticks_history style=candles) =========================
 def build_candles_from_deriv(candles_raw):
-    # Deriv candles response -> your internal candle format (flexible keys)
     out = []
     for x in candles_raw:
         out.append({
@@ -198,7 +319,7 @@ def build_candles_from_deriv(candles_raw):
             "h": float(x.get("high", x.get("h", 0))),
             "l": float(x.get("low",  x.get("l", 0))),
             "c": float(x.get("close", x.get("c", 0))),
-            "v": float(x.get("volume", x.get("v", 1)) or 1),  # if not provided, use 1
+            "v": float(x.get("volume", x.get("v", 1)) or 1),
         })
     return out
 
@@ -211,8 +332,9 @@ def fmt_scan_line(sym: str, d: dict) -> str:
     up = d.get("allig_up", False)
     down = d.get("allig_down", False)
     waiting = d.get("waiting", "Waiting...")
+    pa_pat = d.get("pa_pattern", "NONE")
+    pa_why = d.get("pa_why", "")
 
-    # Trend label
     if up:
         trend = "UP"
     elif down:
@@ -220,40 +342,18 @@ def fmt_scan_line(sym: str, d: dict) -> str:
     else:
         trend = "MIXED"
 
-    # Awake icon
     awake_icon = "✅ AWAKE" if awake else "😴 SLEEPING"
 
-    # Candle color label
     o = d.get("o", 0.0)
     c = d.get("c", 0.0)
     candle = "GREEN" if c > o else ("RED" if c < o else "FLAT")
 
-    # Clear missing conditions
-    missing = []
-    if not up and not down:
-        missing.append("Alligator trend (UP/DOWN)")
-    if "MFI not in zone" in waiting or "MFI not in extreme" in waiting:
-        missing.append("MFI zone")
-    if "RSI(1) not in zone" in waiting or "RSI(1) not in extreme" in waiting:
-        missing.append("RSI zone")
-    if "Need GREEN candle" in waiting:
-        missing.append("GREEN candle")
-    if "Need RED candle" in waiting:
-        missing.append("RED candle")
-
-    if not missing and waiting.startswith("✅"):
-        missing_txt = "Nothing ✅"
-    elif not missing:
-        missing_txt = "Waiting for conditions"
-    else:
-        missing_txt = ", ".join(missing)
-
     return (
         f"• {sym.replace('_',' ')} ({age}s)\n"
         f"  {awake_icon} | Trend: {trend}\n"
-        f"  MFI: {mfi:.0f} | RSI: {rsi:.0f} | Candle: {candle}\n"
-        f"  ⏳ {waiting}\n"
-        f"  Missing: {missing_txt}"
+        f"  MFI: {mfi:.0f} | RSI(1): {rsi:.0f} | Candle: {candle}\n"
+        f"  🧩 PA: {pa_pat} {('- ' + pa_why) if pa_why else ''}\n"
+        f"  ⏳ {waiting}"
     )
 
 # ========================= BOT CORE =========================
@@ -273,9 +373,9 @@ class DerivSniperBot:
         self.trades_today = 0
         self.total_losses_today = 0
         self.consecutive_losses = 0
-        self.total_profit_today = 0.0  # <--- ADDED PROFIT TRACKER
+        self.total_profit_today = 0.0
         self.balance = "0.00"
-        self.current_stake = BASE_STAKE  # <--- ADDED MARTINGALE TRACKER
+        self.current_stake = BASE_STAKE
         self.trade_lock = asyncio.Lock()
         self.last_scan_symbol = "None"
         self.last_signal_reason = "None"
@@ -283,9 +383,7 @@ class DerivSniperBot:
         self.last_trade_side = "None"
         self.last_trade_source = "None"
 
-        # ========================= ADDED: COMMUNICATION TRACKER =========================
-        self.market_debug = {}  # per symbol debug status
-        # =================================================================================
+        self.market_debug = {}
 
     async def connect(self) -> bool:
         try:
@@ -326,7 +424,6 @@ class DerivSniperBot:
         self.market_tasks = {sym: asyncio.create_task(self.scan_market(sym)) for sym in MARKETS}
         try:
             while self.is_scanning:
-                # safety timeout for a trade
                 if self.active_trade_info and (time.time() - self.trade_start_time > (TRADE_DURATION_SEC + 30)):
                     self.active_trade_info = None
                 await asyncio.sleep(1)
@@ -343,8 +440,7 @@ class DerivSniperBot:
                     self.is_scanning = False
                     break
 
-                # ========================= CHANGED: FETCH REAL M5 CANDLES (SUPPORTED) =========================
-                need = max(200, MFI_PERIOD + ALLIGATOR_JAWS_SHIFT + 30)
+                need = max(220, MFI_PERIOD + ALLIGATOR_JAWS_SHIFT + 60, RSI_CONFIRM_PERIOD + 60)
                 res = await self.api.ticks_history({
                     "ticks_history": symbol,
                     "end": "latest",
@@ -354,20 +450,19 @@ class DerivSniperBot:
                 })
                 candles_raw = res.get("candles", [])
                 candles = build_candles_from_deriv(candles_raw)
-                # ================================================================================
 
-                # Need enough 5-min candles for MFI(50) + buffer
                 if len(candles) < (MFI_PERIOD + 5):
                     self.market_debug[symbol] = {
                         "time": time.time(),
-                        "rsi": 0.0, "rsi_prev": 0.0,
-                        "mfi": 0.0, "mfi_prev": 0.0,
-                        "jaws": 0.0, "teeth": 0.0, "lips": 0.0,
+                        "rsi": 0.0,
+                        "mfi": 0.0,
                         "awake": False,
                         "allig_up": False, "allig_down": False,
                         "c": float(candles[-1]["c"]) if candles else 0.0,
                         "o": float(candles[-1]["o"]) if candles else 0.0,
-                        "waiting": f"Not enough M5 candles yet: {len(candles)}/{(MFI_PERIOD+5)} (need more history)"
+                        "pa_pattern": "NONE",
+                        "pa_why": "Waiting candles",
+                        "waiting": f"Not enough M5 candles yet ({len(candles)})"
                     }
                     await asyncio.sleep(10)
                     continue
@@ -383,10 +478,14 @@ class DerivSniperBot:
                     await asyncio.sleep(10)
                     continue
 
-                # ========================= DEBUG / WAITING MESSAGE =========================
                 is_green = ind["c"] > ind["o"]
                 is_red = ind["c"] < ind["o"]
 
+                # ===================== PRICE ACTION (ADDED) =====================
+                pa = detect_price_action_signal(candles, ind["rsi_conf"], ind["rsi_conf_prev"])
+                # ================================================================
+
+                # Existing strategy readiness
                 buy_ready = (
                     ind["is_awake"]
                     and ind["allig_up"]
@@ -396,7 +495,6 @@ class DerivSniperBot:
                     and (ind["rsi_fast"] >= ind["rsi_fast_prev"])
                     and is_green
                 )
-
                 sell_ready = (
                     ind["is_awake"]
                     and ind["allig_down"]
@@ -407,40 +505,23 @@ class DerivSniperBot:
                     and is_red
                 )
 
-                waiting = []
-                if not ind["is_awake"]:
-                    waiting.append("Alligator sleeping (lines tangled/flat)")
+                # Clean waiting message (now includes PA)
+                if pa["side"] == "CALL":
+                    waiting_msg = f"✅ PA BUY READY ({pa['pattern']})"
+                elif pa["side"] == "PUT":
+                    waiting_msg = f"✅ PA SELL READY ({pa['pattern']})"
+                elif buy_ready:
+                    waiting_msg = "✅ INDICATOR BUY READY"
+                elif sell_ready:
+                    waiting_msg = "✅ INDICATOR SELL READY"
                 else:
-                    if not ind["allig_up"] and not ind["allig_down"]:
-                        waiting.append("Alligator not in clear UP/DOWN order")
-
-                if ind["mfi"] > MFI_LEVEL_BUY and ind["mfi"] < MFI_LEVEL_SELL:
-                    waiting.append("MFI not in zone (need <= 20 or >= 80)")
-                if ind["rsi_fast"] > RSI_LEVEL_BUY and ind["rsi_fast"] < RSI_LEVEL_SELL:
-                    waiting.append("RSI(1) not in zone (need <= 20 or >= 80)")
-
-                if ind["allig_up"]:
-                    if ind["mfi"] > MFI_LEVEL_BUY: waiting.append("MFI not low enough for BUY")
-                    if ind["rsi_fast"] > RSI_LEVEL_BUY: waiting.append("RSI(1) not low enough for BUY")
-                    if ind["mfi"] < ind["mfi_prev"]: waiting.append("MFI not turning UP for BUY")
-                    if ind["rsi_fast"] < ind["rsi_fast_prev"]: waiting.append("RSI(1) not turning UP for BUY")
-                    if not is_green: waiting.append("Need GREEN candle for BUY")
-
-                if ind["allig_down"]:
-                    if ind["mfi"] < MFI_LEVEL_SELL: waiting.append("MFI not high enough for SELL")
-                    if ind["rsi_fast"] < RSI_LEVEL_SELL: waiting.append("RSI(1) not high enough for SELL")
-                    if ind["mfi"] > ind["mfi_prev"]: waiting.append("MFI not turning DOWN for SELL")
-                    if ind["rsi_fast"] > ind["rsi_fast_prev"]: waiting.append("RSI(1) not turning DOWN for SELL")
-                    if not is_red: waiting.append("Need RED candle for SELL")
-
-                waiting_msg = "✅ BUY READY" if buy_ready else ("✅ SELL READY" if sell_ready else (" | ".join(waiting) if waiting else "Waiting..."))
+                    # simple reason summary
+                    waiting_msg = pa["why"] if pa["pattern"] != "NONE" else "Waiting setup..."
 
                 self.market_debug[symbol] = {
                     "time": time.time(),
                     "rsi": float(ind["rsi_fast"]),
-                    "rsi_prev": float(ind["rsi_fast_prev"]),
                     "mfi": float(ind["mfi"]),
-                    "mfi_prev": float(ind["mfi_prev"]),
                     "jaws": float(ind["jaws"]),
                     "teeth": float(ind["teeth"]),
                     "lips": float(ind["lips"]),
@@ -449,51 +530,62 @@ class DerivSniperBot:
                     "allig_down": bool(ind["allig_down"]),
                     "c": float(ind["c"]),
                     "o": float(ind["o"]),
+                    "pa_pattern": pa["pattern"],
+                    "pa_why": pa["why"],
                     "waiting": waiting_msg
                 }
-                # ===================================================================================
 
-                # ================= STRATEGY LOGIC: RSI(1) + ALLIGATOR + MFI(50) =================
+                # ========================= EXECUTION PRIORITY =========================
+                # 1) Price Action trade first (because it's your new strategy)
+                # 2) If no PA trade, then use old indicator strategy
 
-                # BUY (CALL)
-                if ind["is_awake"] and ind["allig_up"]:
-                    if (ind["mfi"] <= MFI_LEVEL_BUY) and (ind["rsi_fast"] <= RSI_LEVEL_BUY):
-                        if (ind["mfi"] >= ind["mfi_prev"]) and (ind["rsi_fast"] >= ind["rsi_fast_prev"]):
-                            if is_green:
-                                await self.execute_trade(
-                                    "CALL",
-                                    symbol,
-                                    "M5 RSI(1)<=20 + MFI(50)<=20 + Alligator UP (Awake)",
-                                    source="AUTO",
-                                )
+                if pa["side"] == "CALL":
+                    await self.execute_trade(
+                        "CALL",
+                        symbol,
+                        f"PA {pa['pattern']} + RSI({RSI_CONFIRM_PERIOD}) confirm",
+                        source="AUTO",
+                    )
 
-                # SELL (PUT)
-                elif ind["is_awake"] and ind["allig_down"]:
-                    if (ind["mfi"] >= MFI_LEVEL_SELL) and (ind["rsi_fast"] >= RSI_LEVEL_SELL):
-                        if (ind["mfi"] <= ind["mfi_prev"]) and (ind["rsi_fast"] <= ind["rsi_fast_prev"]):
-                            if is_red:
-                                await self.execute_trade(
-                                    "PUT",
-                                    symbol,
-                                    "M5 RSI(1)>=80 + MFI(50)>=80 + Alligator DOWN (Awake)",
-                                    source="AUTO",
-                                )
+                elif pa["side"] == "PUT":
+                    await self.execute_trade(
+                        "PUT",
+                        symbol,
+                        f"PA {pa['pattern']} + RSI({RSI_CONFIRM_PERIOD}) confirm",
+                        source="AUTO",
+                    )
+
+                else:
+                    # OLD strategy (kept)
+                    if buy_ready:
+                        await self.execute_trade(
+                            "CALL",
+                            symbol,
+                            "M5 RSI(1)<=20 + MFI(50)<=20 + Alligator UP (Awake)",
+                            source="AUTO",
+                        )
+                    elif sell_ready:
+                        await self.execute_trade(
+                            "PUT",
+                            symbol,
+                            "M5 RSI(1)>=80 + MFI(50)>=80 + Alligator DOWN (Awake)",
+                            source="AUTO",
+                        )
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Scanner Error ({symbol}): {e}")
-
-                # Always show something in STATUS instead of "no scan data yet"
                 self.market_debug[symbol] = {
                     "time": time.time(),
-                    "rsi": 0.0, "rsi_prev": 0.0,
-                    "mfi": 0.0, "mfi_prev": 0.0,
-                    "jaws": 0.0, "teeth": 0.0, "lips": 0.0,
+                    "rsi": 0.0,
+                    "mfi": 0.0,
                     "awake": False,
                     "allig_up": False, "allig_down": False,
                     "c": 0.0,
                     "o": 0.0,
+                    "pa_pattern": "NONE",
+                    "pa_why": "",
                     "waiting": f"⚠️ Scan error: {str(e)[:120]}"
                 }
             await asyncio.sleep(5)
@@ -529,7 +621,7 @@ class DerivSniperBot:
                     self.trades_today += 1
 
                 safe_symbol = str(symbol).replace("_", " ")
-                msg = f"🚀 {side} TRADE OPENED (${stake})\n🛒 Market: {safe_symbol}\n🧠 Source: {source}"
+                msg = f"🚀 {side} TRADE OPENED (${stake})\n🛒 Market: {safe_symbol}\n🧠 Source: {source}\n📝 Reason: {reason}"
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
                 asyncio.create_task(self.check_result(self.active_trade_info, source))
             except:
@@ -601,6 +693,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await bot_logic.fetch_balance()
         now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
         ok, gate = bot_logic.can_auto_trade()
+
         trade_status = "No Active Trade"
         if bot_logic.active_trade_info and bot_logic.api:
             try:
@@ -624,7 +717,6 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"🚦 Gate: {gate}\n💰 Balance: {bot_logic.balance}"
         )
 
-        # ========================= IMPROVED: LIVE SCAN DEBUG (SIMPLE) =========================
         debug_lines = []
         for sym in MARKETS:
             d = bot_logic.market_debug.get(sym)
@@ -634,12 +726,11 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             debug_lines.append(fmt_scan_line(sym, d))
 
         status_msg += "\n\n📌 LIVE SCAN (Simple)\n" + "\n\n".join(debug_lines)
-        # =======================================================================
 
         await q.edit_message_text(status_msg, reply_markup=main_keyboard())
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text("💎 Sniper Survival M5 (RSI(1) + Alligator + MFI(50) Edition)", reply_markup=main_keyboard())
+    await u.message.reply_text("💎 Sniper Survival M5 (Indicators + Price Action Edition)", reply_markup=main_keyboard())
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
