@@ -91,7 +91,7 @@ def _smma(values, period):
     return out
 
 def calculate_mfi(high, low, close, volume, period=14):
-    # Money Flow Index using tick-count volume per candle (since synth indices don't provide real volume).
+    # Money Flow Index using candle volume if available; otherwise defaults to 1 per candle.
     high = np.array(high, dtype=float)
     low = np.array(low, dtype=float)
     close = np.array(close, dtype=float)
@@ -188,30 +188,19 @@ def calculate_indicators(candles):
         "allig_down": alligator_down,
     }
 
-def build_m1_candles_from_ticks(times, prices):
-    # NOTE: kept the function name the same, but it now builds 5-minute candles (M5) for the strategy.
-    if not times or not prices:
-        return []
-    candles = []
-    # bucket by 5 minutes
-    bucket = TIMEFRAME_SEC
-    curr_t0 = times[0] - (times[0] % bucket)
-
-    o = h = l = c = float(prices[0])
-    v = 0  # tick count per candle
-
-    for t, p in zip(times, prices):
-        t0 = t - (t % bucket)
-        p = float(p)
-        if t0 != curr_t0:
-            candles.append({"o": o, "h": h, "l": l, "c": c, "v": v})
-            curr_t0, o, h, l, c, v = t0, p, p, p, p, 0
-        else:
-            h, l, c = max(h, p), min(l, p), p
-        v += 1
-
-    candles.append({"o": o, "h": h, "l": l, "c": c, "v": v})
-    return candles
+# ========================= CHANGED: USE REAL DERIV CANDLES =========================
+def build_candles_from_deriv(candles_raw):
+    # Deriv candles response -> your internal candle format
+    out = []
+    for x in candles_raw:
+        out.append({
+            "o": float(x.get("open", 0)),
+            "h": float(x.get("high", 0)),
+            "l": float(x.get("low", 0)),
+            "c": float(x.get("close", 0)),
+            "v": float(x.get("volume", 1) or 1),  # if not provided, use 1
+        })
+    return out
 
 # ========================= BOT CORE =========================
 class DerivSniperBot:
@@ -300,51 +289,37 @@ class DerivSniperBot:
                     self.is_scanning = False
                     break
 
-                # ========================= CHANGE: MORE HISTORY =========================
-                data = await self.api.ticks_history(
-                    {"ticks_history": symbol, "end": "latest", "count": 10000, "style": "ticks"}
-                )
-                # ======================================================================
-
-                candles = build_m1_candles_from_ticks(data["history"]["times"], data["history"]["prices"])
+                # ========================= CHANGED: FETCH REAL M5 CANDLES =========================
+                need = max(200, MFI_PERIOD + ALLIGATOR_JAWS_SHIFT + 30)
+                res = await self.api.candles({
+                    "candles": symbol,
+                    "end": "latest",
+                    "count": need,
+                    "granularity": TIMEFRAME_SEC
+                })
+                candles_raw = res.get("candles", [])
+                candles = build_candles_from_deriv(candles_raw)
+                # ================================================================================
 
                 # Need enough 5-min candles for MFI(50) + buffer
                 if len(candles) < (MFI_PERIOD + 5):
-                    # ========================= CHANGE: DEBUG EVEN WHEN SKIPPING =========================
-                    last_o = float(candles[-1]["o"]) if candles else 0.0
-                    last_c = float(candles[-1]["c"]) if candles else 0.0
+                    # keep debug info even when not enough history
                     self.market_debug[symbol] = {
                         "time": time.time(),
                         "rsi": 0.0, "rsi_prev": 0.0,
                         "mfi": 0.0, "mfi_prev": 0.0,
                         "jaws": 0.0, "teeth": 0.0, "lips": 0.0,
-                        "awake": False, "allig_up": False, "allig_down": False,
-                        "c": last_c,
-                        "o": last_o,
-                        "waiting": f"Not enough M5 candles yet: {len(candles)}/{MFI_PERIOD + 5} (need more history)"
+                        "awake": False,
+                        "allig_up": False, "allig_down": False,
+                        "c": float(candles[-1]["c"]) if candles else 0.0,
+                        "o": float(candles[-1]["o"]) if candles else 0.0,
+                        "waiting": f"Not enough M5 candles yet: {len(candles)}/{(MFI_PERIOD+5)} (need more history)"
                     }
-                    # ================================================================================
-
                     await asyncio.sleep(10)
                     continue
 
                 ind = calculate_indicators(candles)
                 if not ind:
-                    # ========================= CHANGE: DEBUG WHEN INDICATORS NOT READY =========================
-                    last_o = float(candles[-1]["o"])
-                    last_c = float(candles[-1]["c"])
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "rsi": 0.0, "rsi_prev": 0.0,
-                        "mfi": 0.0, "mfi_prev": 0.0,
-                        "jaws": 0.0, "teeth": 0.0, "lips": 0.0,
-                        "awake": False, "allig_up": False, "allig_down": False,
-                        "c": last_c,
-                        "o": last_o,
-                        "waiting": "Indicators not ready yet (likely not enough candles for RSI/MFI/Alligator shifts)"
-                    }
-                    # =========================================================================================
-
                     await asyncio.sleep(10)
                     continue
 
@@ -425,13 +400,10 @@ class DerivSniperBot:
                 # ===================================================================================
 
                 # ================= NEW STRATEGY LOGIC: RSI(1) + ALLIGATOR + MFI(50) =================
-                # Main confirmation = MFI, and Alligator gives direction (must not be sleeping),
-                # RSI(1) gives quick trigger.
 
                 # BUY (CALL)
                 if ind["is_awake"] and ind["allig_up"]:
                     if (ind["mfi"] <= MFI_LEVEL_BUY) and (ind["rsi_fast"] <= RSI_LEVEL_BUY):
-                        # extra safety: both are turning up (momentum shift)
                         if (ind["mfi"] >= ind["mfi_prev"]) and (ind["rsi_fast"] >= ind["rsi_fast_prev"]):
                             if is_green:
                                 await self.execute_trade(
@@ -444,7 +416,6 @@ class DerivSniperBot:
                 # SELL (PUT)
                 elif ind["is_awake"] and ind["allig_down"]:
                     if (ind["mfi"] >= MFI_LEVEL_SELL) and (ind["rsi_fast"] >= RSI_LEVEL_SELL):
-                        # extra safety: both are turning down from the top (momentum shift)
                         if (ind["mfi"] <= ind["mfi_prev"]) and (ind["rsi_fast"] <= ind["rsi_fast_prev"]):
                             if is_red:
                                 await self.execute_trade(
