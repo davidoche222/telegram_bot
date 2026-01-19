@@ -24,9 +24,14 @@ logger = logging.getLogger(__name__)
 # ========================= RISK / LIMITS =========================
 MAX_TRADES_PER_DAY_TOTAL = 40                 # ✅ changed from 10 -> 40
 MAX_TRADES_PER_MARKET_PER_DAY = 3
-STOP_DAY_AFTER_TOTAL_LOSSES = 3
-STOP_SYMBOL_AFTER_LOSSES = 2
-MAX_CONSECUTIVE_LOSSES = 7                    # ✅ stop after 7 loss streak
+
+# ✅ IMPORTANT CHANGE:
+# Bot will NOT stop on "total daily losses" or "per-symbol losses" anymore.
+# It will ONLY stop after 7 consecutive losses.
+STOP_DAY_AFTER_TOTAL_LOSSES = 10**9
+STOP_SYMBOL_AFTER_LOSSES = 10**9
+
+MAX_CONSECUTIVE_LOSSES = 7                    # ✅ stop after 7 loss streak ONLY
 
 COOLDOWN_AFTER_TRADE_SEC = 120
 COOLDOWN_PER_SYMBOL_SEC = 120
@@ -69,7 +74,7 @@ CHOP_PAUSE_SEC = 600
 SPIKE_MULTIPLIER = 2.0
 AVG_RANGE_LOOKBACK = 20
 
-# ========================= EMA STRATEGY SETTINGS (NEW) =========================
+# ========================= EMA STRATEGY SETTINGS =========================
 EMA_FAST = 20
 EMA_SLOW = 50
 EMA_PULLBACK_TOL_PCT = 0.0006   # how close price must come to EMA20 (0.06%)
@@ -144,6 +149,7 @@ def bull_engulf(prev, cur):
 def bear_engulf(prev, cur):
     return (prev["c"] > prev["o"]) and (cur["c"] < cur["o"]) and (cur["c"] <= prev["o"]) and (cur["o"] >= prev["c"])
 
+# (left here though not used by EMA strategy)
 def find_swings(candles, n=2):
     highs = []
     lows = []
@@ -159,6 +165,7 @@ def find_swings(candles, n=2):
             lows.append(i)
     return highs, lows
 
+# (left here though not used by EMA strategy)
 def determine_bias(struct_candles):
     highs_idx, lows_idx = find_swings(struct_candles, SWING_N)
 
@@ -213,10 +220,7 @@ def fmt_scan(sym, d):
         reason = f"{setup} → {signal}"
     else:
         status = "⏳ WAIT"
-        if waiting:
-            reason = waiting
-        else:
-            reason = "Waiting for setup"
+        reason = waiting if waiting else "Waiting for setup"
 
     levels = d.get("levels", "")
     ind = d.get("ind", "")
@@ -267,10 +271,6 @@ class DerivBot:
         self.wins_today_total = 0
         self.trades_today_by_symbol = {m: 0 for m in MARKETS}
         self.losses_today_by_symbol = {m: 0 for m in MARKETS}
-        self.disabled_symbol_today = {m: False for m in MARKETS}
-
-        self.symbol_cooldown_until = {m: 0.0 for m in MARKETS}
-        self.symbol_chop_until = {m: 0.0 for m in MARKETS}
 
         self.balance = "0.00"
         self.start_balance_value = None
@@ -291,6 +291,10 @@ class DerivBot:
         # ✅ anti-overtrade: trade only once per CLOSED M1 candle
         self.last_signal_candle_t = {m: 0 for m in MARKETS}
 
+        # keep these for existing UI/gate messages
+        self.symbol_cooldown_until = {m: 0.0 for m in MARKETS}
+        self.symbol_chop_until = {m: 0.0 for m in MARKETS}
+
     def reset_day_if_needed(self):
         now = datetime.now(ZoneInfo("Africa/Lagos"))
         key = now.strftime("%Y-%m-%d")
@@ -301,15 +305,14 @@ class DerivBot:
             self.wins_today_total = 0
             self.trades_today_by_symbol = {m: 0 for m in MARKETS}
             self.losses_today_by_symbol = {m: 0 for m in MARKETS}
-            self.disabled_symbol_today = {m: False for m in MARKETS}
-            self.symbol_cooldown_until = {m: 0.0 for m in MARKETS}
-            self.symbol_chop_until = {m: 0.0 for m in MARKETS}
             self.total_profit_today = 0.0
             self.current_stake = BASE_STAKE
             self.consecutive_losses = 0
             self.start_balance_value = None
             self.start_balance_text = None
             self.last_signal_candle_t = {m: 0 for m in MARKETS}
+            self.symbol_cooldown_until = {m: 0.0 for m in MARKETS}
+            self.symbol_chop_until = {m: 0.0 for m in MARKETS}
 
     async def connect(self) -> bool:
         try:
@@ -342,13 +345,11 @@ class DerivBot:
     def gate(self, symbol: str):
         self.reset_day_if_needed()
 
+        # ✅ ONLY STOP RULE:
         if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
             return False, f"Stopped: loss streak {self.consecutive_losses}/{MAX_CONSECUTIVE_LOSSES}"
 
-        if self.disabled_symbol_today.get(symbol, False):
-            return False, "Symbol disabled (loss limit)"
-        if self.losses_today_total >= STOP_DAY_AFTER_TOTAL_LOSSES:
-            return False, "Stopped: daily loss limit"
+        # ✅ still keep trade caps (not “stop” rules)
         if self.trades_today_total >= MAX_TRADES_PER_DAY_TOTAL:
             return False, "Daily trade limit reached"
         if self.trades_today_by_symbol.get(symbol, 0) >= MAX_TRADES_PER_MARKET_PER_DAY:
@@ -449,26 +450,15 @@ class DerivBot:
                     await asyncio.sleep(3)
                     continue
 
-                # ✅ use only CLOSED candle for signals
-                c_prev = m1[-3]     # candle before confirmation
-                c_confirm = m1[-2]  # last closed candle (confirmation)
+                c_prev = m1[-3]
+                c_confirm = m1[-2]
                 confirm_t = int(c_confirm.get("t", 0) or 0)
 
-                # ✅ anti-overtrade: only one trade decision per closed candle
                 if confirm_t != 0 and self.last_signal_candle_t[symbol] == confirm_t:
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "bias": "-",
-                        "setup": "-",
-                        "signal": "-",
-                        "levels": "",
-                        "ind": "",
-                        "waiting": "Waiting: next M1 candle close"
-                    }
+                    self.market_debug[symbol] = {"time": time.time(), "bias": "-", "setup": "-", "signal": "-", "levels": "", "ind": "", "waiting": "Waiting: next M1 candle close"}
                     await asyncio.sleep(2)
                     continue
 
-                # Chop filter (unchanged)
                 last10 = m1[-(CHOP_LOOKBACK+1):-1]
                 dojis = sum(1 for x in last10 if is_doji(x))
                 if dojis >= CHOP_DOJI_COUNT:
@@ -485,7 +475,7 @@ class DerivBot:
                     await asyncio.sleep(2)
                     continue
 
-                # ✅ EMA strategy: trend from STRUCT timeframe (M5/M15) via EMA20/EMA50
+                # === EMA bias on STRUCT TF ===
                 struct_closes = [x["c"] for x in struct]
                 ema20_s = calculate_ema(struct_closes, EMA_FAST)
                 ema50_s = calculate_ema(struct_closes, EMA_SLOW)
@@ -503,7 +493,6 @@ class DerivBot:
                 else:
                     bias = "RANGE"
 
-                # ✅ avoid flat EMA (no trend strength)
                 sep = abs(ema20_struct - ema50_struct) / max(1e-9, ema50_struct)
                 if sep < EMA_MIN_SEPARATION_PCT:
                     self.market_debug[symbol] = {
@@ -519,7 +508,7 @@ class DerivBot:
                     await asyncio.sleep(2)
                     continue
 
-                # ✅ M1 EMA for pullback entry
+                # === EMA on M1 ===
                 closes_m1 = [x["c"] for x in m1]
                 ema20_m1_arr = calculate_ema(closes_m1, EMA_FAST)
                 ema50_m1_arr = calculate_ema(closes_m1, EMA_SLOW)
@@ -527,14 +516,12 @@ class DerivBot:
                     await asyncio.sleep(2)
                     continue
 
-                ema20_m1 = float(ema20_m1_arr[-2])  # align with last CLOSED candle
+                ema20_m1 = float(ema20_m1_arr[-2])
                 ema50_m1 = float(ema50_m1_arr[-2])
 
-                # Optional RSI (kept, but now used as confirmation)
                 rsi_arr = calculate_rsi(closes_m1, RSI_PERIOD)
                 rsi_now = float(rsi_arr[-1]) if len(rsi_arr) > 0 else 50.0
 
-                # Spike filter (unchanged)
                 avg_rng = avg_range(m1[-(AVG_RANGE_LOOKBACK+1):-1], AVG_RANGE_LOOKBACK)
                 sig_rng = candle_range(c_confirm)
                 if sig_rng > SPIKE_MULTIPLIER * avg_rng:
@@ -551,18 +538,13 @@ class DerivBot:
                     await asyncio.sleep(2)
                     continue
 
-                # ✅ Pullback test: candle touches/near EMA20
                 price = float(c_confirm["c"])
                 tol = price * EMA_PULLBACK_TOL_PCT
-
                 touched_ema20 = (c_confirm["l"] <= (ema20_m1 + tol)) and (c_confirm["h"] >= (ema20_m1 - tol))
 
-                # ✅ Entry confirmation: rejection wick OR engulfing
                 bullish_confirm = strong_bull_close(c_confirm) or bull_engulf(c_prev, c_confirm)
                 bearish_confirm = strong_bear_close(c_confirm) or bear_engulf(c_prev, c_confirm)
 
-                # ✅ RSI confirmation (single-indicator confirm). If USE_RSI_FILTER=True:
-                # BUY: RSI > 50 ; SELL: RSI < 50
                 rsi_buy_ok = (not USE_RSI_FILTER) or (rsi_now > 50)
                 rsi_sell_ok = (not USE_RSI_FILTER) or (rsi_now < 50)
 
@@ -573,28 +555,12 @@ class DerivBot:
                 ind_txt = f"RSI(14): {rsi_now:.0f} | Doji:{dojis}/10 | avgR:{avg_rng:.2f}"
 
                 if buy_ready:
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "bias": bias,
-                        "setup": "EMA Pullback",
-                        "signal": "BUY (RISE)",
-                        "levels": levels_txt,
-                        "ind": ind_txt,
-                        "waiting": "✅ Trend UP + pullback to EMA20 + bullish confirm"
-                    }
+                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": "EMA Pullback", "signal": "BUY (RISE)", "levels": levels_txt, "ind": ind_txt, "waiting": "✅ Trend UP + pullback to EMA20 + bullish confirm"}
                     self.last_signal_candle_t[symbol] = confirm_t
                     await self.execute_trade("CALL", symbol, f"EMA20/50 BUY | {levels_txt} | RSI {rsi_now:.0f}")
 
                 elif sell_ready:
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "bias": bias,
-                        "setup": "EMA Pullback",
-                        "signal": "SELL (FALL)",
-                        "levels": levels_txt,
-                        "ind": ind_txt,
-                        "waiting": "✅ Trend DOWN + pullback to EMA20 + bearish confirm"
-                    }
+                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": "EMA Pullback", "signal": "SELL (FALL)", "levels": levels_txt, "ind": ind_txt, "waiting": "✅ Trend DOWN + pullback to EMA20 + bearish confirm"}
                     self.last_signal_candle_t[symbol] = confirm_t
                     await self.execute_trade("PUT", symbol, f"EMA20/50 SELL | {levels_txt} | RSI {rsi_now:.0f}")
 
@@ -612,15 +578,7 @@ class DerivBot:
                     if USE_RSI_FILTER:
                         why.append("RSI confirm ON (>50 buy / <50 sell)")
 
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "bias": bias,
-                        "setup": "-",
-                        "signal": "-",
-                        "levels": levels_txt,
-                        "ind": ind_txt,
-                        "waiting": " | ".join(why)
-                    }
+                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": "-", "signal": "-", "levels": levels_txt, "ind": ind_txt, "waiting": " | ".join(why)}
                     self.last_signal_candle_t[symbol] = confirm_t
 
             except asyncio.CancelledError:
@@ -701,10 +659,6 @@ class DerivBot:
                 self.losses_today_total += 1
                 self.losses_today_by_symbol[symbol] += 1
                 self.consecutive_losses += 1
-
-                if self.losses_today_by_symbol[symbol] >= STOP_SYMBOL_AFTER_LOSSES:
-                    self.disabled_symbol_today[symbol] = True
-
                 self.current_stake *= 2
 
             await self.fetch_balance()
@@ -817,7 +771,8 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         "💎 Deriv Bot\n"
         "📌 Strategy: EMA20/EMA50 Pullback + RSI Confirm\n"
-        "🕯 Entry: M1 (confirm candle) | Trend: M5/M15 (EMA bias) | Expiry: 3 minutes\n",
+        "🕯 Entry: M1 (confirm candle) | Trend: M5/M15 (EMA bias) | Expiry: 3 minutes\n"
+        "🛑 Stop rule: ONLY after 7 consecutive losses\n",
         reply_markup=main_keyboard()
     )
 
