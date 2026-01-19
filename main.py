@@ -69,6 +69,12 @@ CHOP_PAUSE_SEC = 600
 SPIKE_MULTIPLIER = 2.0
 AVG_RANGE_LOOKBACK = 20
 
+# ========================= EMA STRATEGY SETTINGS (NEW) =========================
+EMA_FAST = 20
+EMA_SLOW = 50
+EMA_PULLBACK_TOL_PCT = 0.0006   # how close price must come to EMA20 (0.06%)
+EMA_MIN_SEPARATION_PCT = 0.0004 # avoid flat markets; require EMA20-EMA50 separation (0.04%)
+
 # ========================= FETCH THROTTLES (RATE LIMIT FIX) =========================
 M1_FETCH_MIN_INTERVAL_SEC = 15  # per symbol
 
@@ -97,6 +103,17 @@ def calculate_rsi(closes, period=14):
     rs = avg_gain / (avg_loss + 1e-9)
     rsi = 100 - (100 / (1 + rs))
     return rsi
+
+def calculate_ema(values, period):
+    values = np.array(values, dtype=float)
+    if len(values) < period:
+        return np.array([])
+    k = 2.0 / (period + 1.0)
+    ema = np.zeros_like(values)
+    ema[0] = values[0]
+    for i in range(1, len(values)):
+        ema[i] = values[i] * k + ema[i-1] * (1.0 - k)
+    return ema
 
 def candle_range(c):
     return max(1e-9, c["h"] - c["l"])
@@ -196,9 +213,7 @@ def fmt_scan(sym, d):
         reason = f"{setup} → {signal}"
     else:
         status = "⏳ WAIT"
-        if "Need sweep+reject+confirm" in waiting and "pullback+break" in waiting:
-            reason = "Waiting: Sweep+Reject+Confirm (A) or Pullback+Break (B)"
-        elif waiting:
+        if waiting:
             reason = waiting
         else:
             reason = "Waiting for setup"
@@ -249,7 +264,7 @@ class DerivBot:
         self.day_key = None
         self.trades_today_total = 0
         self.losses_today_total = 0
-        self.wins_today_total = 0                  # ✅ track wins
+        self.wins_today_total = 0
         self.trades_today_by_symbol = {m: 0 for m in MARKETS}
         self.losses_today_by_symbol = {m: 0 for m in MARKETS}
         self.disabled_symbol_today = {m: False for m in MARKETS}
@@ -258,8 +273,8 @@ class DerivBot:
         self.symbol_chop_until = {m: 0.0 for m in MARKETS}
 
         self.balance = "0.00"
-        self.start_balance_value = None            # ✅ used for status profit/loss
-        self.start_balance_text = None             # ✅ used for status profit/loss
+        self.start_balance_value = None
+        self.start_balance_text = None
         self.total_profit_today = 0.0
         self.current_stake = BASE_STAKE
         self.consecutive_losses = 0
@@ -272,6 +287,9 @@ class DerivBot:
         self.last_fetch_m1 = {m: 0.0 for m in MARKETS}
         self.last_fetch_struct = {m: 0.0 for m in MARKETS}
         self.rate_backoff_until = {m: 0.0 for m in MARKETS}
+
+        # ✅ anti-overtrade: trade only once per CLOSED M1 candle
+        self.last_signal_candle_t = {m: 0 for m in MARKETS}
 
     def reset_day_if_needed(self):
         now = datetime.now(ZoneInfo("Africa/Lagos"))
@@ -289,10 +307,9 @@ class DerivBot:
             self.total_profit_today = 0.0
             self.current_stake = BASE_STAKE
             self.consecutive_losses = 0
-
-            # ✅ reset day start balance (will be set on next balance fetch)
             self.start_balance_value = None
             self.start_balance_text = None
+            self.last_signal_candle_t = {m: 0 for m in MARKETS}
 
     async def connect(self) -> bool:
         try:
@@ -315,19 +332,16 @@ class DerivBot:
             bal_ccy = bal["balance"]["currency"]
             self.balance = f"{bal_value:.2f} {bal_ccy}"
 
-            # ✅ capture start-of-day balance once
             self.reset_day_if_needed()
             if self.start_balance_value is None:
                 self.start_balance_value = bal_value
                 self.start_balance_text = self.balance
-
         except:
             pass
 
     def gate(self, symbol: str):
         self.reset_day_if_needed()
 
-        # ✅ stop after 7 consecutive losses
         if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
             return False, f"Stopped: loss streak {self.consecutive_losses}/{MAX_CONSECUTIVE_LOSSES}"
 
@@ -430,18 +444,31 @@ class DerivBot:
                 struct = await self.get_struct(symbol)
                 m1 = await self.get_m1(symbol)
 
-                if len(struct) < 50 or len(m1) < 30:
+                if len(struct) < 50 or len(m1) < 60:
                     self.market_debug[symbol] = {"time": time.time(), "bias": "…", "setup": "-", "signal": "-", "levels": "", "ind": "", "waiting": "Syncing candles..."}
                     await asyncio.sleep(3)
                     continue
 
-                if len(m1) < 5:
+                # ✅ use only CLOSED candle for signals
+                c_prev = m1[-3]     # candle before confirmation
+                c_confirm = m1[-2]  # last closed candle (confirmation)
+                confirm_t = int(c_confirm.get("t", 0) or 0)
+
+                # ✅ anti-overtrade: only one trade decision per closed candle
+                if confirm_t != 0 and self.last_signal_candle_t[symbol] == confirm_t:
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "bias": "-",
+                        "setup": "-",
+                        "signal": "-",
+                        "levels": "",
+                        "ind": "",
+                        "waiting": "Waiting: next M1 candle close"
+                    }
                     await asyncio.sleep(2)
                     continue
 
-                c_confirm = m1[-2]
-                c_sweep = m1[-3]
-
+                # Chop filter (unchanged)
                 last10 = m1[-(CHOP_LOOKBACK+1):-1]
                 dojis = sum(1 for x in last10 if is_doji(x))
                 if dojis >= CHOP_DOJI_COUNT:
@@ -458,21 +485,56 @@ class DerivBot:
                     await asyncio.sleep(2)
                     continue
 
-                bias, liq_high, liq_low = determine_bias(struct)
-
-                if bias == "RANGE" or liq_high is None or liq_low is None:
-                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": "-", "signal": "-", "levels": "Need clearer swings", "ind": "", "waiting": "No-trade: RANGE bias"}
+                # ✅ EMA strategy: trend from STRUCT timeframe (M5/M15) via EMA20/EMA50
+                struct_closes = [x["c"] for x in struct]
+                ema20_s = calculate_ema(struct_closes, EMA_FAST)
+                ema50_s = calculate_ema(struct_closes, EMA_SLOW)
+                if len(ema20_s) == 0 or len(ema50_s) == 0:
                     await asyncio.sleep(2)
                     continue
 
+                ema20_struct = float(ema20_s[-1])
+                ema50_struct = float(ema50_s[-1])
+
+                if ema20_struct > ema50_struct:
+                    bias = "UP"
+                elif ema20_struct < ema50_struct:
+                    bias = "DOWN"
+                else:
+                    bias = "RANGE"
+
+                # ✅ avoid flat EMA (no trend strength)
+                sep = abs(ema20_struct - ema50_struct) / max(1e-9, ema50_struct)
+                if sep < EMA_MIN_SEPARATION_PCT:
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "bias": bias,
+                        "setup": "-",
+                        "signal": "-",
+                        "levels": "",
+                        "ind": f"RSI(14): - | Doji:{dojis}/10",
+                        "waiting": "EMAs too close (choppy trend) → wait"
+                    }
+                    self.last_signal_candle_t[symbol] = confirm_t
+                    await asyncio.sleep(2)
+                    continue
+
+                # ✅ M1 EMA for pullback entry
                 closes_m1 = [x["c"] for x in m1]
+                ema20_m1_arr = calculate_ema(closes_m1, EMA_FAST)
+                ema50_m1_arr = calculate_ema(closes_m1, EMA_SLOW)
+                if len(ema20_m1_arr) == 0 or len(ema50_m1_arr) == 0:
+                    await asyncio.sleep(2)
+                    continue
+
+                ema20_m1 = float(ema20_m1_arr[-2])  # align with last CLOSED candle
+                ema50_m1 = float(ema50_m1_arr[-2])
+
+                # Optional RSI (kept, but now used as confirmation)
                 rsi_arr = calculate_rsi(closes_m1, RSI_PERIOD)
                 rsi_now = float(rsi_arr[-1]) if len(rsi_arr) > 0 else 50.0
-                rsi_prev = float(rsi_arr[-2]) if len(rsi_arr) > 1 else rsi_now
 
-                price = float(c_sweep["c"])
-                buf = price * SWEEP_BUFFER_PCT
-
+                # Spike filter (unchanged)
                 avg_rng = avg_range(m1[-(AVG_RANGE_LOOKBACK+1):-1], AVG_RANGE_LOOKBACK)
                 sig_rng = candle_range(c_confirm)
                 if sig_rng > SPIKE_MULTIPLIER * avg_rng:
@@ -481,69 +543,85 @@ class DerivBot:
                         "bias": bias,
                         "setup": "-",
                         "signal": "-",
-                        "levels": f"H:{liq_high:.2f}  L:{liq_low:.2f}  buf:{buf:.2f}",
+                        "levels": "",
                         "ind": f"RSI(14): {rsi_now:.0f} | Doji:{dojis}/10 | avgR:{avg_rng:.2f}",
                         "waiting": "Spike candle → skip"
                     }
+                    self.last_signal_candle_t[symbol] = confirm_t
                     await asyncio.sleep(2)
                     continue
 
-                sweep_sell = (c_sweep["h"] >= (liq_high + buf)) and (c_sweep["c"] < liq_high)
-                confirm_sell = (bear_engulf(c_sweep, c_confirm) or strong_bear_close(c_confirm))
-                rsi_sell_ok = (rsi_now < RSI_HI and rsi_prev >= RSI_HI) or (rsi_prev > RSI_HI) or (rsi_now > RSI_HI)
-                sell_A_ready = sweep_sell and confirm_sell and ((not USE_RSI_FILTER) or rsi_sell_ok)
+                # ✅ Pullback test: candle touches/near EMA20
+                price = float(c_confirm["c"])
+                tol = price * EMA_PULLBACK_TOL_PCT
 
-                sweep_buy = (c_sweep["l"] <= (liq_low - buf)) and (c_sweep["c"] > liq_low)
-                confirm_buy = (bull_engulf(c_sweep, c_confirm) or strong_bull_close(c_confirm))
-                rsi_buy_ok = (rsi_now > RSI_LO and rsi_prev <= RSI_LO) or (rsi_prev < RSI_LO) or (rsi_now < RSI_LO)
-                buy_A_ready = sweep_buy and confirm_buy and ((not USE_RSI_FILTER) or rsi_buy_ok)
+                touched_ema20 = (c_confirm["l"] <= (ema20_m1 + tol)) and (c_confirm["h"] >= (ema20_m1 - tol))
 
-                pb1 = m1[-4]
-                pb2 = m1[-3]
-                cont = m1[-2]
-                prev_for_break = m1[-3]
+                # ✅ Entry confirmation: rejection wick OR engulfing
+                bullish_confirm = strong_bull_close(c_confirm) or bull_engulf(c_prev, c_confirm)
+                bearish_confirm = strong_bear_close(c_confirm) or bear_engulf(c_prev, c_confirm)
 
-                if bias == "UP":
-                    pullback_ok = (pb1["c"] < pb1["o"]) and (pb2["c"] < pb2["o"])
-                    continuation_ok = (cont["c"] > cont["o"]) and (cont["c"] > prev_for_break["h"]) and strong_bull_close(cont)
-                    rsi_ok = (rsi_now > 50)
-                    buy_B_ready = pullback_ok and continuation_ok and ((not USE_RSI_FILTER) or rsi_ok)
-                    sell_B_ready = False
-                elif bias == "DOWN":
-                    pullback_ok = (pb1["c"] > pb1["o"]) and (pb2["c"] > pb2["o"])
-                    continuation_ok = (cont["c"] < cont["o"]) and (cont["c"] < prev_for_break["l"]) and strong_bear_close(cont)
-                    rsi_ok = (rsi_now < 50)
-                    sell_B_ready = pullback_ok and continuation_ok and ((not USE_RSI_FILTER) or rsi_ok)
-                    buy_B_ready = False
-                else:
-                    buy_B_ready = False
-                    sell_B_ready = False
+                # ✅ RSI confirmation (single-indicator confirm). If USE_RSI_FILTER=True:
+                # BUY: RSI > 50 ; SELL: RSI < 50
+                rsi_buy_ok = (not USE_RSI_FILTER) or (rsi_now > 50)
+                rsi_sell_ok = (not USE_RSI_FILTER) or (rsi_now < 50)
 
-                levels_txt = f"H:{liq_high:.2f}  L:{liq_low:.2f}  buf:{buf:.2f}"
+                buy_ready = (bias == "UP") and touched_ema20 and bullish_confirm and rsi_buy_ok and (ema20_m1 > ema50_m1)
+                sell_ready = (bias == "DOWN") and touched_ema20 and bearish_confirm and rsi_sell_ok and (ema20_m1 < ema50_m1)
+
+                levels_txt = f"EMA20:{ema20_m1:.2f} EMA50:{ema50_m1:.2f} | Struct EMA20:{ema20_struct:.2f} EMA50:{ema50_struct:.2f}"
                 ind_txt = f"RSI(14): {rsi_now:.0f} | Doji:{dojis}/10 | avgR:{avg_rng:.2f}"
 
-                if buy_A_ready:
-                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": "A-Reversal", "signal": "BUY (RISE)", "levels": levels_txt, "ind": ind_txt, "waiting": "✅ Liquidity sweep low + bullish confirm"}
-                    await self.execute_trade("CALL", symbol, f"Setup A BUY | {levels_txt} | RSI {rsi_now:.0f}")
+                if buy_ready:
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "bias": bias,
+                        "setup": "EMA Pullback",
+                        "signal": "BUY (RISE)",
+                        "levels": levels_txt,
+                        "ind": ind_txt,
+                        "waiting": "✅ Trend UP + pullback to EMA20 + bullish confirm"
+                    }
+                    self.last_signal_candle_t[symbol] = confirm_t
+                    await self.execute_trade("CALL", symbol, f"EMA20/50 BUY | {levels_txt} | RSI {rsi_now:.0f}")
 
-                elif sell_A_ready:
-                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": "A-Reversal", "signal": "SELL (FALL)", "levels": levels_txt, "ind": ind_txt, "waiting": "✅ Liquidity sweep high + bearish confirm"}
-                    await self.execute_trade("PUT", symbol, f"Setup A SELL | {levels_txt} | RSI {rsi_now:.0f}")
-
-                elif buy_B_ready:
-                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": "B-Continuation", "signal": "BUY (RISE)", "levels": levels_txt, "ind": ind_txt, "waiting": "✅ Pullback then continuation break"}
-                    await self.execute_trade("CALL", symbol, f"Setup B BUY | Bias {bias} | RSI {rsi_now:.0f}")
-
-                elif sell_B_ready:
-                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": "B-Continuation", "signal": "SELL (FALL)", "levels": levels_txt, "ind": ind_txt, "waiting": "✅ Pullback then continuation break"}
-                    await self.execute_trade("PUT", symbol, f"Setup B SELL | Bias {bias} | RSI {rsi_now:.0f}")
+                elif sell_ready:
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "bias": bias,
+                        "setup": "EMA Pullback",
+                        "signal": "SELL (FALL)",
+                        "levels": levels_txt,
+                        "ind": ind_txt,
+                        "waiting": "✅ Trend DOWN + pullback to EMA20 + bearish confirm"
+                    }
+                    self.last_signal_candle_t[symbol] = confirm_t
+                    await self.execute_trade("PUT", symbol, f"EMA20/50 SELL | {levels_txt} | RSI {rsi_now:.0f}")
 
                 else:
-                    notes = []
+                    why = []
+                    if bias == "UP":
+                        why.append("Need UP pullback to EMA20 + bullish confirm")
+                    elif bias == "DOWN":
+                        why.append("Need DOWN pullback to EMA20 + bearish confirm")
+                    else:
+                        why.append("No trend bias")
+
+                    if not touched_ema20:
+                        why.append("No EMA20 touch")
                     if USE_RSI_FILTER:
-                        notes.append("RSI filter ON")
-                    notes.append("Need sweep+reject+confirm (A) OR pullback+break (B)")
-                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": "-", "signal": "-", "levels": levels_txt, "ind": ind_txt, "waiting": " | ".join(notes)}
+                        why.append("RSI confirm ON (>50 buy / <50 sell)")
+
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "bias": bias,
+                        "setup": "-",
+                        "signal": "-",
+                        "levels": levels_txt,
+                        "ind": ind_txt,
+                        "waiting": " | ".join(why)
+                    }
+                    self.last_signal_candle_t[symbol] = confirm_t
 
             except asyncio.CancelledError:
                 break
@@ -596,7 +674,7 @@ class DerivBot:
                     f"🚀 {side} OPENED (${stake:.2f})\n"
                     f"🛒 Market: {symbol.replace('_',' ')}\n"
                     f"⏱ Expiry: {duration}m\n"
-                    f"📌 Strategy: Liquidity + Structure (A/B internal)\n"
+                    f"📌 Strategy: EMA20/EMA50 Pullback + RSI Confirm\n"
                     f"🧠 {reason}"
                 )
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
@@ -676,7 +754,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             return
         bot_logic.is_scanning = True
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
-        await q.edit_message_text("🔍 SCANNER ACTIVE\n📌 Strategy: Liquidity + Structure (A/B internal)", reply_markup=main_keyboard())
+        await q.edit_message_text("🔍 SCANNER ACTIVE\n📌 Strategy: EMA20/EMA50 Pullback + RSI Confirm", reply_markup=main_keyboard())
 
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
@@ -690,10 +768,8 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
         _ok, gate = bot_logic.gate("R_10")
 
-        # ✅ Profit/Loss display
         pl_line = "P/L Today: (start balance not set yet)"
         if bot_logic.start_balance_value is not None:
-            # parse current balance numeric part
             try:
                 cur_val = float(bot_logic.balance.split()[0])
                 pl = cur_val - float(bot_logic.start_balance_value)
@@ -715,7 +791,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         status_msg = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"📌 Strategy: Liquidity + Structure (Setup A + Setup B)\n"
+            f"📌 Strategy: EMA20/EMA50 Pullback + RSI Confirm\n"
             f"🚦 Gate: {gate}\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
@@ -740,10 +816,8 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         "💎 Deriv Bot\n"
-        "📌 Strategy: Liquidity + Structure\n"
-        "✅ Setup A: Liquidity sweep reversal\n"
-        "✅ Setup B: Trend continuation\n"
-        "🕯 Entry: M1 | Bias: M5/M15 | Expiry: 3 minutes (ALL markets)\n",
+        "📌 Strategy: EMA20/EMA50 Pullback + RSI Confirm\n"
+        "🕯 Entry: M1 (confirm candle) | Trend: M5/M15 (EMA bias) | Expiry: 3 minutes\n",
         reply_markup=main_keyboard()
     )
 
