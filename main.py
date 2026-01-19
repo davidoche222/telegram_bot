@@ -22,10 +22,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ========================= RISK / LIMITS =========================
-MAX_TRADES_PER_DAY_TOTAL = 10
+MAX_TRADES_PER_DAY_TOTAL = 40                 # ✅ changed from 10 -> 40
 MAX_TRADES_PER_MARKET_PER_DAY = 3
 STOP_DAY_AFTER_TOTAL_LOSSES = 3
 STOP_SYMBOL_AFTER_LOSSES = 2
+MAX_CONSECUTIVE_LOSSES = 7                    # ✅ stop after 7 loss streak
 
 COOLDOWN_AFTER_TRADE_SEC = 120
 COOLDOWN_PER_SYMBOL_SEC = 120
@@ -69,16 +70,14 @@ SPIKE_MULTIPLIER = 2.0
 AVG_RANGE_LOOKBACK = 20
 
 # ========================= FETCH THROTTLES (RATE LIMIT FIX) =========================
-# ✅ key fix: do NOT fetch candles every 2s
-M1_FETCH_MIN_INTERVAL_SEC = 15                 # per symbol
-# struct fetched per timeframe (300/900), automatically
+M1_FETCH_MIN_INTERVAL_SEC = 15  # per symbol
 
 # ========================= HELPERS =========================
 def build_candles_from_deriv(candles_raw):
     out = []
     for x in candles_raw:
         out.append({
-            "t": int(x.get("epoch", x.get("t", 0)) or 0),  # keep timestamp
+            "t": int(x.get("epoch", x.get("t", 0)) or 0),
             "o": float(x.get("open", x.get("o", 0))),
             "h": float(x.get("high", x.get("h", 0))),
             "l": float(x.get("low",  x.get("l", 0))),
@@ -250,6 +249,7 @@ class DerivBot:
         self.day_key = None
         self.trades_today_total = 0
         self.losses_today_total = 0
+        self.wins_today_total = 0                  # ✅ track wins
         self.trades_today_by_symbol = {m: 0 for m in MARKETS}
         self.losses_today_by_symbol = {m: 0 for m in MARKETS}
         self.disabled_symbol_today = {m: False for m in MARKETS}
@@ -258,6 +258,8 @@ class DerivBot:
         self.symbol_chop_until = {m: 0.0 for m in MARKETS}
 
         self.balance = "0.00"
+        self.start_balance_value = None            # ✅ used for status profit/loss
+        self.start_balance_text = None             # ✅ used for status profit/loss
         self.total_profit_today = 0.0
         self.current_stake = BASE_STAKE
         self.consecutive_losses = 0
@@ -265,7 +267,6 @@ class DerivBot:
 
         self.market_debug = {}
 
-        # ✅ CACHES (rate-limit fix)
         self.cache_m1 = {m: [] for m in MARKETS}
         self.cache_struct = {m: [] for m in MARKETS}
         self.last_fetch_m1 = {m: 0.0 for m in MARKETS}
@@ -279,6 +280,7 @@ class DerivBot:
             self.day_key = key
             self.trades_today_total = 0
             self.losses_today_total = 0
+            self.wins_today_total = 0
             self.trades_today_by_symbol = {m: 0 for m in MARKETS}
             self.losses_today_by_symbol = {m: 0 for m in MARKETS}
             self.disabled_symbol_today = {m: False for m in MARKETS}
@@ -287,6 +289,10 @@ class DerivBot:
             self.total_profit_today = 0.0
             self.current_stake = BASE_STAKE
             self.consecutive_losses = 0
+
+            # ✅ reset day start balance (will be set on next balance fetch)
+            self.start_balance_value = None
+            self.start_balance_text = None
 
     async def connect(self) -> bool:
         try:
@@ -305,12 +311,25 @@ class DerivBot:
             return
         try:
             bal = await self.api.balance({"balance": 1})
-            self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
+            bal_value = float(bal["balance"]["balance"])
+            bal_ccy = bal["balance"]["currency"]
+            self.balance = f"{bal_value:.2f} {bal_ccy}"
+
+            # ✅ capture start-of-day balance once
+            self.reset_day_if_needed()
+            if self.start_balance_value is None:
+                self.start_balance_value = bal_value
+                self.start_balance_text = self.balance
+
         except:
             pass
 
     def gate(self, symbol: str):
         self.reset_day_if_needed()
+
+        # ✅ stop after 7 consecutive losses
+        if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+            return False, f"Stopped: loss streak {self.consecutive_losses}/{MAX_CONSECUTIVE_LOSSES}"
 
         if self.disabled_symbol_today.get(symbol, False):
             return False, "Symbol disabled (loss limit)"
@@ -376,7 +395,7 @@ class DerivBot:
         except Exception as e:
             msg = str(e)
             if "rate limit" in msg.lower() and "ticks_history" in msg.lower():
-                self.rate_backoff_until[symbol] = now + 20  # back off 20s
+                self.rate_backoff_until[symbol] = now + 20
             raise
 
     async def get_struct(self, symbol: str):
@@ -404,32 +423,15 @@ class DerivBot:
             try:
                 ok, g = self.gate(symbol)
                 if not ok:
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "bias": "-",
-                        "setup": "-",
-                        "signal": "-",
-                        "levels": "",
-                        "ind": "",
-                        "waiting": f"🚦 {g}"
-                    }
+                    self.market_debug[symbol] = {"time": time.time(), "bias": "-", "setup": "-", "signal": "-", "levels": "", "ind": "", "waiting": f"🚦 {g}"}
                     await asyncio.sleep(2)
                     continue
 
-                # ✅ use cached + throttled candle fetching
                 struct = await self.get_struct(symbol)
                 m1 = await self.get_m1(symbol)
 
                 if len(struct) < 50 or len(m1) < 30:
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "bias": "…",
-                        "setup": "-",
-                        "signal": "-",
-                        "levels": "",
-                        "ind": "",
-                        "waiting": "Syncing candles..."
-                    }
+                    self.market_debug[symbol] = {"time": time.time(), "bias": "…", "setup": "-", "signal": "-", "levels": "", "ind": "", "waiting": "Syncing candles..."}
                     await asyncio.sleep(3)
                     continue
 
@@ -459,15 +461,7 @@ class DerivBot:
                 bias, liq_high, liq_low = determine_bias(struct)
 
                 if bias == "RANGE" or liq_high is None or liq_low is None:
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "bias": bias,
-                        "setup": "-",
-                        "signal": "-",
-                        "levels": "Need clearer swings",
-                        "ind": "",
-                        "waiting": "No-trade: RANGE bias"
-                    }
+                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": "-", "signal": "-", "levels": "Need clearer swings", "ind": "", "waiting": "No-trade: RANGE bias"}
                     await asyncio.sleep(2)
                     continue
 
@@ -494,7 +488,6 @@ class DerivBot:
                     await asyncio.sleep(2)
                     continue
 
-                # ========================= SETUP A: LIQUIDITY REVERSAL =========================
                 sweep_sell = (c_sweep["h"] >= (liq_high + buf)) and (c_sweep["c"] < liq_high)
                 confirm_sell = (bear_engulf(c_sweep, c_confirm) or strong_bear_close(c_confirm))
                 rsi_sell_ok = (rsi_now < RSI_HI and rsi_prev >= RSI_HI) or (rsi_prev > RSI_HI) or (rsi_now > RSI_HI)
@@ -505,7 +498,6 @@ class DerivBot:
                 rsi_buy_ok = (rsi_now > RSI_LO and rsi_prev <= RSI_LO) or (rsi_prev < RSI_LO) or (rsi_now < RSI_LO)
                 buy_A_ready = sweep_buy and confirm_buy and ((not USE_RSI_FILTER) or rsi_buy_ok)
 
-                # ========================= SETUP B: STRUCTURE CONTINUATION =========================
                 pb1 = m1[-4]
                 pb2 = m1[-3]
                 cont = m1[-2]
@@ -558,26 +550,10 @@ class DerivBot:
             except Exception as e:
                 msg = str(e)
                 if "rate limit" in msg.lower() and "ticks_history" in msg.lower():
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "bias": "-",
-                        "setup": "-",
-                        "signal": "-",
-                        "levels": "",
-                        "ind": "",
-                        "waiting": "⚠️ Rate limit hit for ticks_history → backing off 20s"
-                    }
+                    self.market_debug[symbol] = {"time": time.time(), "bias": "-", "setup": "-", "signal": "-", "levels": "", "ind": "", "waiting": "⚠️ Rate limit hit for ticks_history → backing off 20s"}
                 else:
                     logger.error(f"Scan error {symbol}: {e}")
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "bias": "-",
-                        "setup": "-",
-                        "signal": "-",
-                        "levels": "",
-                        "ind": "",
-                        "waiting": f"⚠️ Error: {msg[:120]}"
-                    }
+                    self.market_debug[symbol] = {"time": time.time(), "bias": "-", "setup": "-", "signal": "-", "levels": "", "ind": "", "waiting": f"⚠️ Error: {msg[:120]}"}
 
             await asyncio.sleep(2)
 
@@ -639,7 +615,11 @@ class DerivBot:
 
             self.total_profit_today += profit
 
-            if profit <= 0:
+            if profit > 0:
+                self.wins_today_total += 1
+                self.consecutive_losses = 0
+                self.current_stake = BASE_STAKE
+            else:
                 self.losses_today_total += 1
                 self.losses_today_by_symbol[symbol] += 1
                 self.consecutive_losses += 1
@@ -648,19 +628,19 @@ class DerivBot:
                     self.disabled_symbol_today[symbol] = True
 
                 self.current_stake *= 2
-            else:
-                self.consecutive_losses = 0
-                self.current_stake = BASE_STAKE
 
             await self.fetch_balance()
             await self.app.bot.send_message(
                 TELEGRAM_CHAT_ID,
-                f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n💰 Balance: {self.balance}"
+                f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n"
+                f"📊 Today: ✅{self.wins_today_total} / ❌{self.losses_today_total} | Streak ❌{self.consecutive_losses}/{MAX_CONSECUTIVE_LOSSES}\n"
+                f"💰 Balance: {self.balance}"
             )
 
         finally:
             self.active_trade_info = None
             self.active_market = None
+
 
 # ========================= UI =========================
 bot_logic = DerivBot()
@@ -710,6 +690,17 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
         _ok, gate = bot_logic.gate("R_10")
 
+        # ✅ Profit/Loss display
+        pl_line = "P/L Today: (start balance not set yet)"
+        if bot_logic.start_balance_value is not None:
+            # parse current balance numeric part
+            try:
+                cur_val = float(bot_logic.balance.split()[0])
+                pl = cur_val - float(bot_logic.start_balance_value)
+                pl_line = f"P/L Today: {pl:+.2f} (Start: {bot_logic.start_balance_text} → Now: {bot_logic.balance})"
+            except:
+                pl_line = f"P/L Today: (calc error) | Start: {bot_logic.start_balance_text} | Now: {bot_logic.balance}"
+
         trade_status = "No Active Trade"
         if bot_logic.active_trade_info and bot_logic.api:
             try:
@@ -717,19 +708,20 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 pnl = float(res["proposal_open_contract"].get("profit", 0.0))
                 rem = int(max(0, (EXPIRY_MIN.get(bot_logic.active_market, 3) * 60) - (time.time() - bot_logic.trade_start_time)))
                 mkt = (bot_logic.active_market or "—").replace("_", " ")
-                trade_status = f"🚀 Active Trade ({mkt})\n📈 PnL: {pnl:+.2f}\n⏳ Left: {rem}s"
+                trade_status = f"🚀 Active Trade ({mkt})\n📈 Live PnL: {pnl:+.2f}\n⏳ Left: {rem}s"
             except:
                 trade_status = "🚀 Active Trade: Syncing..."
 
         status_msg = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"📌 Strategy: Price Action Liquidity + Structure (Setup A + Setup B)\n"
+            f"📌 Strategy: Liquidity + Structure (Setup A + Setup B)\n"
             f"🚦 Gate: {gate}\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
-            f"🎯 Trades Today: {bot_logic.trades_today_total}/{MAX_TRADES_PER_DAY_TOTAL}\n"
-            f"❌ Losses Today: {bot_logic.losses_today_total}/{STOP_DAY_AFTER_TOTAL_LOSSES}\n"
+            f"{pl_line}\n"
+            f"📊 Today: ✅ Wins {bot_logic.wins_today_total} | ❌ Losses {bot_logic.losses_today_total} | Total {bot_logic.trades_today_total}/{MAX_TRADES_PER_DAY_TOTAL}\n"
+            f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSECUTIVE_LOSSES}\n"
             f"🧪 Next Stake: ${bot_logic.current_stake:.2f}\n"
             f"💰 Balance: {bot_logic.balance}"
         )
@@ -748,7 +740,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         "💎 Deriv Bot\n"
-        "📌 Strategy: Price Action Liquidity + Structure\n"
+        "📌 Strategy: Liquidity + Structure\n"
         "✅ Setup A: Liquidity sweep reversal\n"
         "✅ Setup B: Trend continuation\n"
         "🕯 Entry: M1 | Bias: M5/M15 | Expiry: 3 minutes (ALL markets)\n",
