@@ -28,6 +28,7 @@ MAX_TRADES_PER_MARKET_PER_DAY = 3
 STOP_DAY_AFTER_TOTAL_LOSSES = 10**9
 STOP_SYMBOL_AFTER_LOSSES = 10**9
 MAX_CONSECUTIVE_LOSSES = 7
+
 COOLDOWN_AFTER_TRADE_SEC = 120
 COOLDOWN_PER_SYMBOL_SEC = 120
 BASE_STAKE = 1.00
@@ -36,23 +37,31 @@ BASE_STAKE = 1.00
 ENTRY_TF_SEC = 60
 STRUCT_TF_SEC = {"R_10": 300, "R_25": 300, "R_50": 900, "R_75": 900, "R_100": 900}
 EXPIRY_MIN = {"R_10": 3, "R_25": 3, "R_50": 3, "R_75": 3, "R_100": 3}
-SWING_N = 2
+
 RSI_PERIOD = 14
+
 DOJI_BODY_PCT = 0.25
 CHOP_DOJI_COUNT = 6
 CHOP_LOOKBACK = 10
 CHOP_PAUSE_SEC = 600
+
 SPIKE_MULTIPLIER = 2.0
 AVG_RANGE_LOOKBACK = 20
 
-# ========================= UPDATED STRICT EMA & ATR SETTINGS =========================
+# ========================= EMA & ATR SETTINGS =========================
 EMA_FAST = 20
 EMA_SLOW = 50
+
 ATR_PERIOD = 14
-ATR_TOUCH_MULT = 0.25  # How close to EMA price must be (in ATR units)
+ATR_TOUCH_MULT = 0.25  # EMA20 touch tolerance in ATR units
 EMA_MIN_SEPARATION_PCT = 0.001
 RSI_BUY_MIN = 52
 RSI_SELL_MAX = 48
+
+# ✅ NEW: ATR volatility filter (makes signals stronger)
+# Use ATR / AvgRange ratio so it adapts per market.
+ATR_RATIO_MIN = 0.60   # below this = too quiet / weak movement
+ATR_RATIO_MAX = 1.80   # above this = too wild / messy movement (spike filter still catches extremes)
 
 M1_FETCH_MIN_INTERVAL_SEC = 15
 
@@ -98,14 +107,19 @@ def calculate_atr(candles, period=14):
         return 0.0
     tr_list = []
     for i in range(1, len(candles)):
-        h, l, pc = candles[i]['h'], candles[i]['l'], candles[i-1]['c']
+        h, l, pc = candles[i]["h"], candles[i]["l"], candles[i-1]["c"]
         tr = max(h - l, abs(h - pc), abs(l - pc))
         tr_list.append(tr)
     return float(np.mean(tr_list[-period:]))
 
-def candle_range(c): return max(1e-9, c["h"] - c["l"])
-def candle_body(c): return abs(c["c"] - c["o"])
-def is_doji(c): return candle_body(c) <= DOJI_BODY_PCT * candle_range(c)
+def candle_range(c):
+    return max(1e-9, c["h"] - c["l"])
+
+def candle_body(c):
+    return abs(c["c"] - c["o"])
+
+def is_doji(c):
+    return candle_body(c) <= DOJI_BODY_PCT * candle_range(c)
 
 def avg_range(candles, lookback=20):
     if len(candles) < lookback + 1:
@@ -129,29 +143,25 @@ def bear_engulf(prev, cur):
 
 def fmt_scan(sym, d):
     age = int(time.time() - d.get("time", time.time()))
-    bias, setup, signal = d.get("bias", "?"), d.get("setup", "-"), d.get("signal", "-")
-    waiting = (d.get("waiting", "") or "").strip()
+    status = d.get("status", "⏳ WAIT")
+    bias = d.get("bias", "?")
+    reason = d.get("reason", d.get("waiting", "Waiting for setup"))
+    levels = d.get("levels", "")
+    ind = d.get("ind", "")
 
-    if "🚦" in waiting:
-        status, reason = "🚦 COOLDOWN", waiting.replace("🚦", "").strip()
-    elif "Chop" in waiting:
-        status, reason = "🟨 CHOP", waiting
-    elif "Spike" in waiting:
-        status, reason = "🟧 SPIKE", waiting
-    elif "rate limit" in waiting.lower():
-        status, reason = "🛑 RATE LIMIT", waiting
-    elif bias == "RANGE":
-        status, reason = "🚫 NO TRADE", "Market is RANGE"
-    elif signal != "-" and ("BUY" in signal or "SELL" in signal):
-        status, reason = "✅ SIGNAL", f"{setup} → {signal}"
-    else:
-        status, reason = "⏳ WAIT", waiting if waiting else "Waiting for setup"
+    lines = []
+    lines.append(f"• {sym.replace('_',' ')} ({age}s)  |  {status}  |  Trend: {bias}")
+    lines.append(f"  - {reason}")
+    if levels:
+        lines.append(f"  - Levels: {levels}")
+    if ind:
+        lines.append(f"  - {ind}")
+    return "\n".join(lines)
 
-    levels, ind = d.get("levels", ""), d.get("ind", "")
-    out = [f"{sym.replace('_',' ')} ({age}s) → {status} | Trend: {bias}", f"Reason: {reason}"]
-    if levels: out.append(f"Levels: {levels}")
-    if ind: out.append(f"Indicators: {ind}")
-    return "\n".join(out)
+def fmt_secs_left(ts):
+    if not ts:
+        return 0
+    return max(0, int(ts - time.time()))
 
 # ========================= BOT CORE =========================
 class DerivBot:
@@ -173,7 +183,6 @@ class DerivBot:
         self.trades_today_total = 0
         self.losses_today_total, self.wins_today_total = 0, 0
         self.trades_today_by_symbol = {m: 0 for m in MARKETS}
-        self.losses_today_by_symbol = {m: 0 for m in MARKETS}
 
         self.balance, self.start_balance_value, self.start_balance_text = "0.00", None, None
         self.current_stake, self.consecutive_losses = BASE_STAKE, 0
@@ -197,7 +206,6 @@ class DerivBot:
             self.trades_today_total = 0
             self.losses_today_total, self.wins_today_total = 0, 0
             self.trades_today_by_symbol = {m: 0 for m in MARKETS}
-            self.losses_today_by_symbol = {m: 0 for m in MARKETS}
             self.current_stake = BASE_STAKE
             self.consecutive_losses = 0
             self.start_balance_value, self.start_balance_text = None, None
@@ -267,7 +275,6 @@ class DerivBot:
         self.market_tasks = {sym: asyncio.create_task(self.scan_symbol(sym)) for sym in MARKETS}
         try:
             while self.is_scanning:
-                # safety clear if stuck
                 if self.active_trade_info and (time.time() - self.trade_start_time > (EXPIRY_MIN.get(self.active_market, 3) * 60 + 90)):
                     self.active_trade_info = None
                     self.active_market = None
@@ -314,16 +321,15 @@ class DerivBot:
     async def scan_symbol(self, symbol: str):
         while self.is_scanning:
             try:
-                ok, g = self.gate(symbol)
+                ok, gate_reason = self.gate(symbol)
                 if not ok:
                     self.market_debug[symbol] = {
                         "time": time.time(),
+                        "status": "🚦 GATED",
                         "bias": "-",
-                        "setup": "-",
-                        "signal": "-",
+                        "reason": gate_reason,
                         "levels": "",
-                        "ind": "",
-                        "waiting": f"🚦 {g}"
+                        "ind": ""
                     }
                     await asyncio.sleep(2)
                     continue
@@ -332,47 +338,43 @@ class DerivBot:
                 if len(struct) < 50 or len(m1) < 60:
                     self.market_debug[symbol] = {
                         "time": time.time(),
+                        "status": "⏳ SYNC",
                         "bias": "…",
-                        "setup": "-",
-                        "signal": "-",
+                        "reason": "Syncing candles...",
                         "levels": "",
-                        "ind": "",
-                        "waiting": "Syncing Data..."
+                        "ind": ""
                     }
                     await asyncio.sleep(3)
                     continue
 
-                # ✅ use only CLOSED candle for signals
                 c_prev, c_confirm = m1[-3], m1[-2]
                 confirm_t = int(c_confirm.get("t", 0) or 0)
 
-                # ✅ anti-overtrade: once per closed candle per symbol
+                # anti-overtrade: once per closed candle
                 if confirm_t and self.last_signal_candle_t[symbol] == confirm_t:
                     self.market_debug[symbol] = {
                         "time": time.time(),
+                        "status": "⏳ WAIT",
                         "bias": self.market_debug.get(symbol, {}).get("bias", "-"),
-                        "setup": "-",
-                        "signal": "-",
+                        "reason": "Waiting: next M1 candle close",
                         "levels": "",
-                        "ind": "",
-                        "waiting": "Waiting: next M1 candle close"
+                        "ind": ""
                     }
                     await asyncio.sleep(2)
                     continue
 
-                # Chop Filter (and show it)
+                # Chop filter
                 last10 = m1[-(CHOP_LOOKBACK + 1):-1]
                 dojis = sum(1 for x in last10 if is_doji(x))
                 if dojis >= CHOP_DOJI_COUNT:
                     self.symbol_chop_until[symbol] = time.time() + CHOP_PAUSE_SEC
                     self.market_debug[symbol] = {
                         "time": time.time(),
+                        "status": "🟨 CHOP",
                         "bias": "-",
-                        "setup": "-",
-                        "signal": "-",
+                        "reason": f"Chop detected → pausing {CHOP_PAUSE_SEC//60}m",
                         "levels": "",
-                        "ind": f"Doji:{dojis}/{CHOP_LOOKBACK}",
-                        "waiting": "Chop detected → pausing 10m"
+                        "ind": f"Doji:{dojis}/{CHOP_LOOKBACK}"
                     }
                     self.last_signal_candle_t[symbol] = confirm_t
                     await asyncio.sleep(2)
@@ -405,22 +407,49 @@ class DerivBot:
                 avg_rng = avg_range(m1[-(AVG_RANGE_LOOKBACK + 1):-1], AVG_RANGE_LOOKBACK)
                 sig_rng = candle_range(c_confirm)
 
-                # ✅ Spike filter: HARD BLOCK
+                # Spike filter (hard block)
                 if sig_rng > SPIKE_MULTIPLIER * avg_rng:
                     self.market_debug[symbol] = {
                         "time": time.time(),
+                        "status": "🟧 SPIKE",
                         "bias": bias,
-                        "setup": "-",
-                        "signal": "-",
+                        "reason": "Spike candle detected → skip",
                         "levels": f"avgR:{avg_rng:.4f} sigR:{sig_rng:.4f}",
-                        "ind": f"RSI:{rsi_now:.0f} | Doji:{dojis}/{CHOP_LOOKBACK}",
-                        "waiting": "Spike candle detected → skip"
+                        "ind": f"RSI:{rsi_now:.0f} | ATR:{atr_now:.4f} | Doji:{dojis}/{CHOP_LOOKBACK}"
                     }
                     self.last_signal_candle_t[symbol] = confirm_t
                     await asyncio.sleep(2)
                     continue
 
-                # Logic Confluence (UNCHANGED)
+                # ✅ NEW: ATR volatility filter (stronger entries)
+                atr_ratio = (atr_now / (avg_rng + 1e-9)) if avg_rng > 0 else 0.0
+                if atr_ratio < ATR_RATIO_MIN:
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "status": "🚫 FILTER",
+                        "bias": bias,
+                        "reason": f"ATR too low (quiet market) → skip | ratio={atr_ratio:.2f}",
+                        "levels": f"avgR:{avg_rng:.4f}",
+                        "ind": f"RSI:{rsi_now:.0f} | ATR:{atr_now:.4f} | Doji:{dojis}/{CHOP_LOOKBACK}"
+                    }
+                    self.last_signal_candle_t[symbol] = confirm_t
+                    await asyncio.sleep(2)
+                    continue
+
+                if atr_ratio > ATR_RATIO_MAX:
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "status": "🚫 FILTER",
+                        "bias": bias,
+                        "reason": f"ATR too high (too volatile) → skip | ratio={atr_ratio:.2f}",
+                        "levels": f"avgR:{avg_rng:.4f}",
+                        "ind": f"RSI:{rsi_now:.0f} | ATR:{atr_now:.4f} | Doji:{dojis}/{CHOP_LOOKBACK}"
+                    }
+                    self.last_signal_candle_t[symbol] = confirm_t
+                    await asyncio.sleep(2)
+                    continue
+
+                # Core logic (unchanged)
                 tol = atr_now * ATR_TOUCH_MULT
                 touched_ema20 = (c_confirm["l"] <= (ema20_m1 + tol)) and (c_confirm["h"] >= (ema20_m1 - tol))
                 bullish_confirm = strong_bull_close(c_confirm) or bull_engulf(c_prev, c_confirm)
@@ -428,43 +457,78 @@ class DerivBot:
 
                 rsi_buy_ok = (rsi_now > RSI_BUY_MIN) and (rsi_now < 70)
                 rsi_sell_ok = (rsi_now < RSI_SELL_MAX) and (rsi_now > 30)
-                trend_sep_ok = abs(ema20_m1 - ema50_m1) > (ema50_m1 * EMA_MIN_SEPARATION_PCT)
+                trend_sep = abs(ema20_m1 - ema50_m1) / max(1e-9, abs(ema50_m1))
+                trend_sep_ok = trend_sep > EMA_MIN_SEPARATION_PCT
 
-                levels_txt = f"EMA20:{ema20_m1:.2f} | ATR-Tol:{tol:.4f}"
-                ind_txt = f"RSI:{rsi_now:.0f} | Doji:{dojis}/{CHOP_LOOKBACK}"
+                levels_txt = f"EMA20:{ema20_m1:.2f} EMA50:{ema50_m1:.2f} | tol(ATR):{tol:.4f} | sep:{trend_sep:.4f}"
+                ind_txt = f"RSI:{rsi_now:.0f} | ATR:{atr_now:.4f} (ratio:{atr_ratio:.2f}) | Doji:{dojis}/{CHOP_LOOKBACK}"
 
                 wait_reason = "Waiting for setup"
                 if bias == "RANGE":
-                    wait_reason = "Structural Trend is Neutral"
+                    wait_reason = "Structural trend is neutral"
                 elif not trend_sep_ok:
-                    wait_reason = "EMA Separation too low"
+                    wait_reason = "EMA20/EMA50 too close (flat)"
                 elif not touched_ema20:
-                    wait_reason = "Price hasn't touched EMA20 zone"
+                    wait_reason = "Price has not touched EMA20 zone yet"
                 elif bias == "UP" and not rsi_buy_ok:
                     wait_reason = f"RSI {rsi_now:.0f} too weak for BUY"
                 elif bias == "DOWN" and not rsi_sell_ok:
                     wait_reason = f"RSI {rsi_now:.0f} too weak for SELL"
+                elif bias == "UP" and not bullish_confirm:
+                    wait_reason = "Need bullish confirm (strong close / engulf)"
+                elif bias == "DOWN" and not bearish_confirm:
+                    wait_reason = "Need bearish confirm (strong close / engulf)"
 
                 buy_ready = (bias == "UP") and touched_ema20 and bullish_confirm and rsi_buy_ok and trend_sep_ok
                 sell_ready = (bias == "DOWN") and touched_ema20 and bearish_confirm and rsi_sell_ok and trend_sep_ok
 
                 if buy_ready:
-                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": "ATR Pullback", "signal": "BUY", "levels": levels_txt, "ind": ind_txt, "waiting": "✅ EXECUTION"}
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "status": "✅ SIGNAL",
+                        "bias": bias,
+                        "reason": "Trend UP + EMA20 pullback + bullish confirm + RSI OK",
+                        "levels": levels_txt,
+                        "ind": ind_txt
+                    }
                     self.last_signal_candle_t[symbol] = confirm_t
                     await self.execute_trade("CALL", symbol, f"ATR BUY | RSI {rsi_now:.0f}")
+
                 elif sell_ready:
-                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": "ATR Pullback", "signal": "SELL", "levels": levels_txt, "ind": ind_txt, "waiting": "✅ EXECUTION"}
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "status": "✅ SIGNAL",
+                        "bias": bias,
+                        "reason": "Trend DOWN + EMA20 pullback + bearish confirm + RSI OK",
+                        "levels": levels_txt,
+                        "ind": ind_txt
+                    }
                     self.last_signal_candle_t[symbol] = confirm_t
                     await self.execute_trade("PUT", symbol, f"ATR SELL | RSI {rsi_now:.0f}")
+
                 else:
-                    self.market_debug[symbol] = {"time": time.time(), "bias": bias, "setup": "-", "signal": "-", "levels": levels_txt, "ind": ind_txt, "waiting": wait_reason}
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "status": "⏳ WAIT",
+                        "bias": bias,
+                        "reason": wait_reason,
+                        "levels": levels_txt,
+                        "ind": ind_txt
+                    }
                     self.last_signal_candle_t[symbol] = confirm_t
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Scan error {symbol}: {e}")
-                self.market_debug[symbol] = {"time": time.time(), "bias": "-", "setup": "-", "signal": "-", "levels": "", "ind": "", "waiting": f"⚠️ Error: {str(e)[:120]}"}
+                self.market_debug[symbol] = {
+                    "time": time.time(),
+                    "status": "⚠️ ERROR",
+                    "bias": "-",
+                    "reason": str(e)[:160],
+                    "levels": "",
+                    "ind": ""
+                }
             await asyncio.sleep(2)
 
     async def execute_trade(self, side: str, symbol: str, reason: str):
@@ -498,13 +562,16 @@ class DerivBot:
                 self.trades_today_total += 1
                 self.trades_today_by_symbol[symbol] += 1
 
-                # ✅ cooldowns were missing before
+                # cooldowns
                 self.global_cooldown_until = time.time() + COOLDOWN_AFTER_TRADE_SEC
                 self.symbol_cooldown_until[symbol] = time.time() + COOLDOWN_PER_SYMBOL_SEC
 
                 await self.app.bot.send_message(
                     TELEGRAM_CHAT_ID,
-                    f"🚀 {side} OPENED (${stake:.2f})\n🛒 {symbol}\n⏱ Expiry: {duration}m\n🧠 {reason}"
+                    f"🚀 {side} OPENED (${stake:.2f})\n"
+                    f"🛒 {symbol.replace('_',' ')}\n"
+                    f"⏱ Expiry: {duration}m\n"
+                    f"🧠 {reason}"
                 )
                 asyncio.create_task(self.check_result(self.active_trade_info, symbol))
 
@@ -523,7 +590,6 @@ class DerivBot:
                 self.current_stake = BASE_STAKE
             else:
                 self.losses_today_total += 1
-                self.losses_today_by_symbol[symbol] += 1
                 self.consecutive_losses += 1
                 self.current_stake *= 2
 
@@ -538,7 +604,6 @@ class DerivBot:
         finally:
             self.active_trade_info = None
             self.active_market = None
-
 
 # ========================= UI =========================
 bot_logic = DerivBot()
@@ -574,7 +639,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             return
         bot_logic.is_scanning = True
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
-        await q.edit_message_text("🔍 SCANNING ACTIVE\n📌 Strategy: ATR Pullback (EMA20/50 + RSI)", reply_markup=main_keyboard())
+        await q.edit_message_text("🔍 SCANNING ACTIVE\n📌 Strategy: EMA20/50 Pullback + RSI + ATR Filters", reply_markup=main_keyboard())
 
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
@@ -587,8 +652,8 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await bot_logic.fetch_balance()
 
         now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
-        _ok, gate = bot_logic.gate("R_10")
 
+        # P/L today
         pl_line = "P/L Today: (start balance not set yet)"
         if bot_logic.start_balance_value is not None:
             try:
@@ -598,46 +663,62 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except:
                 pl_line = f"P/L Today: (calc error) | Start: {bot_logic.start_balance_text} | Now: {bot_logic.balance}"
 
+        # cooldown info
+        g_cd = fmt_secs_left(bot_logic.global_cooldown_until)
+        cd_line = f"Cooldowns: Global {g_cd}s"
+        # show per-symbol cooldown short summary
+        sym_cd_bits = []
+        for s in MARKETS:
+            scd = fmt_secs_left(bot_logic.symbol_cooldown_until.get(s, 0.0))
+            if scd > 0:
+                sym_cd_bits.append(f"{s.replace('_',' ')} {scd}s")
+        if sym_cd_bits:
+            cd_line += " | " + ", ".join(sym_cd_bits)
+
+        # active trade info
         trade_status = "No Active Trade"
         if bot_logic.active_trade_info and bot_logic.api:
             try:
-                res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
+                res = await bot_logic.api.proposal_open_contract({
+                    "proposal_open_contract": 1,
+                    "contract_id": bot_logic.active_trade_info
+                })
                 pnl = float(res["proposal_open_contract"].get("profit", 0.0))
                 rem = int(max(0, (EXPIRY_MIN.get(bot_logic.active_market, 3) * 60) - (time.time() - bot_logic.trade_start_time)))
                 mkt = (bot_logic.active_market or "—").replace("_", " ")
-                trade_status = f"🚀 Active Trade ({mkt})\n📈 Live PnL: {pnl:+.2f}\n⏳ Left: {rem}s"
+                trade_status = f"🚀 Active Trade: {mkt} | PnL: {pnl:+.2f} | Left: {rem}s"
             except:
                 trade_status = "🚀 Active Trade: Syncing..."
 
-        status_msg = (
+        header = (
             f"🕒 Time (WAT): {now_time}\n"
-            f"🤖 Bot: {'ON' if bot_logic.is_scanning else 'OFF'} ({bot_logic.account_type})\n"
-            f"📌 Strategy: ATR Pullback (EMA20/50 + RSI)\n"
-            f"🚦 Gate: {gate}\n"
-            f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
-            f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
+            f"🤖 Bot: {'ON ✅' if bot_logic.is_scanning else 'OFF ⛔'} ({bot_logic.account_type})\n"
+            f"📌 Strategy: EMA20/50 Pullback + RSI + ATR Touch + ATR Volatility Filter\n"
+            f"{trade_status}\n"
+            f"━━━━━━━━━━━━━━━\n"
             f"{pl_line}\n"
-            f"📊 Today: ✅ Wins {bot_logic.wins_today_total} | ❌ Losses {bot_logic.losses_today_total} | Total {bot_logic.trades_today_total}/{MAX_TRADES_PER_DAY_TOTAL}\n"
+            f"📊 Today: ✅{bot_logic.wins_today_total} ❌{bot_logic.losses_today_total} | Trades {bot_logic.trades_today_total}/{MAX_TRADES_PER_DAY_TOTAL}\n"
             f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSECUTIVE_LOSSES}\n"
             f"🧪 Next Stake: ${bot_logic.current_stake:.2f}\n"
-            f"💰 Balance: {bot_logic.balance}"
+            f"💰 Balance: {bot_logic.balance}\n"
+            f"{cd_line}\n"
         )
 
         debug_lines = []
         for sym in MARKETS:
             d = bot_logic.market_debug.get(sym)
             if not d:
-                debug_lines.append(f"{sym.replace('_',' ')} → ⏳ No scan data yet")
+                debug_lines.append(f"• {sym.replace('_',' ')} → ⏳ No scan data yet (press START)")
             else:
                 debug_lines.append(fmt_scan(sym, d))
 
-        status_msg += "\n\n📌 LIVE SCAN\n\n" + "\n\n".join(debug_lines)
+        status_msg = header + "\n━━━━━━━━━━━━━━━\n📌 LIVE SCAN\n\n" + "\n\n".join(debug_lines)
         await q.edit_message_text(status_msg, reply_markup=main_keyboard())
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         "💎 Deriv Bot\n"
-        "📌 Strategy: ATR Pullback (EMA20/50 + RSI)\n"
+        "📌 Strategy: EMA20/50 Pullback + RSI + ATR Filters\n"
         "🕯 Entry: M1 | Trend: M5/M15 | Expiry: 3 minutes\n",
         reply_markup=main_keyboard()
     )
