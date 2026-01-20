@@ -45,6 +45,9 @@ AO_SLOW = 34
 # Contract expiry for binary
 DURATION_MIN = 5  # ✅ requested: 5 minute expiry
 
+# ===== CROSS STRATEGY SETTINGS (NEW) =====
+PSAR_MIN_DIST_MULT = 0.50   # PSAR must be at least 0.5 * candle range away from close (tune 0.3–1.0)
+
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period):
     values = np.array(values, dtype=float)
@@ -202,6 +205,11 @@ class DerivSniperBot:
         # anti-overtrade: only once per newly closed candle per market
         self.last_processed_closed_t0 = {m: 0 for m in MARKETS}
 
+        # ✅ Cross-state per symbol (ONE trade per cross)
+        self.last_cross_dir = {m: None for m in MARKETS}   # "BULL" / "BEAR" / None
+        self.last_cross_t0 = {m: 0 for m in MARKETS}       # time of cross candle
+        self.cross_traded = {m: False for m in MARKETS}    # prevents multiple trades per cross
+
     async def connect(self) -> bool:
         try:
             if not self.active_token:
@@ -270,122 +278,215 @@ class DerivSniperBot:
 
                 candles = await self.fetch_real_m1_candles(symbol)
 
-                if len(candles) < max(EMA_PERIOD + 5, AO_SLOW + 5):
+                need = max(EMA_PERIOD + 10, AO_SLOW + 10, 60)
+                if len(candles) < need:
                     self.market_debug[symbol] = {
                         "time": time.time(),
                         "gate": "Waiting for more candles",
-                        "why": ["Not enough candle history yet for EMA50/AO/PSAR."],
+                        "why": [f"Not enough candle history yet (need {need}, have {len(candles)})."],
                     }
                     await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
 
                 ok_gate, gate = self.can_auto_trade()
 
-                # last fully closed candle: use candles[-2]
-                closed = candles[-2]
-                closed_t0 = int(closed["t0"])
-                o, h, l, c = float(closed["o"]), float(closed["h"]), float(closed["l"]), float(closed["c"])
+                # candles[-1] might be current forming; candles[-2] is last closed.
+                prev2 = candles[-4]          # candle BEFORE cross candle
+                cross_candle = candles[-3]   # Candle A (cross candle)
+                confirm = candles[-2]        # Candle B (2nd candle after cross)
 
+                cross_t0 = int(cross_candle["t0"])
+                confirm_t0 = int(confirm["t0"])
+
+                prev2_close = float(prev2["c"])
+                cross_close = float(cross_candle["c"])
+                confirm_close = float(confirm["c"])
+
+                confirm_o = float(confirm["o"])
+                confirm_h = float(confirm["h"])
+                confirm_l = float(confirm["l"])
+                confirm_range = max(1e-9, confirm_h - confirm_l)
+
+                # Indicators aligned with candles list
                 closes = [x["c"] for x in candles]
                 ema50_arr = calculate_ema(closes, EMA_PERIOD)
-                if len(ema50_arr) < 3:
+                if len(ema50_arr) < 10:
                     self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["EMA50 not ready yet."]}
                     await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
-                ema50 = float(ema50_arr[-2])
+
+                ema_prev2 = float(ema50_arr[-4])
+                ema_cross = float(ema50_arr[-3])
+                ema_confirm = float(ema50_arr[-2])
 
                 psar_list = calculate_psar(candles, PSAR_AF_STEP, PSAR_AF_MAX)
-                if not psar_list or len(psar_list) < 3:
+                if not psar_list or len(psar_list) < 10:
                     self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["PSAR not ready yet."]}
                     await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
-                psar = float(psar_list[-2])
+                psar_confirm = float(psar_list[-2])
 
                 ao_arr = calculate_ao(candles)
-                if len(ao_arr) < 2:
+                if len(ao_arr) < 5:
                     self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["AO not ready yet."]}
                     await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
-                ao = float(ao_arr[-1])
+
+                ao_now = float(ao_arr[-1])
                 ao_prev = float(ao_arr[-2])
+                ao_prev2 = float(ao_arr[-3])
 
-                # Interpretations
-                price_above_ema = c > ema50
-                price_below_ema = c < ema50
+                # ---------------- CROSS EVENT DETECTION ----------------
+                bull_cross = (cross_close > ema_cross) and (prev2_close <= ema_prev2)
+                bear_cross = (cross_close < ema_cross) and (prev2_close >= ema_prev2)
 
-                psar_below_candle = psar < l   # below the whole candle
-                psar_above_candle = psar > h   # above the whole candle
+                # If we see a NEW cross candle, store it and reset traded flag
+                if bull_cross and self.last_cross_t0[symbol] != cross_t0:
+                    self.last_cross_dir[symbol] = "BULL"
+                    self.last_cross_t0[symbol] = cross_t0
+                    self.cross_traded[symbol] = False
 
-                ao_rising = ao > ao_prev
-                ao_falling = ao < ao_prev
+                elif bear_cross and self.last_cross_t0[symbol] != cross_t0:
+                    self.last_cross_dir[symbol] = "BEAR"
+                    self.last_cross_t0[symbol] = cross_t0
+                    self.cross_traded[symbol] = False
 
-                # Strategy conditions
-                call_ready = price_above_ema and psar_below_candle and (ao > 0) and ao_rising
-                put_ready  = price_below_ema and psar_above_candle and (ao < 0) and ao_falling
+                # If price has crossed back against the stored direction, block this cycle
+                if self.last_cross_dir[symbol] == "BULL" and confirm_close < ema_confirm:
+                    self.cross_traded[symbol] = True
+                if self.last_cross_dir[symbol] == "BEAR" and confirm_close > ema_confirm:
+                    self.cross_traded[symbol] = True
 
-                # Build "why" (very communicative)
+                # ---------------- CONFIRMATIONS ON 2ND CANDLE ----------------
+                psar_below_confirm = psar_confirm < confirm_l
+                psar_above_confirm = psar_confirm > confirm_h
+                psar_dist = abs(confirm_close - psar_confirm)
+                psar_far = psar_dist >= (PSAR_MIN_DIST_MULT * confirm_range)
+
+                ao_turn_up = (ao_prev2 > ao_prev) and (ao_prev < ao_now)      # falling -> rising
+                ao_turn_down = (ao_prev2 < ao_prev) and (ao_prev > ao_now)    # rising -> falling
+
+                call_ready = (
+                    self.last_cross_dir[symbol] == "BULL"
+                    and self.last_cross_t0[symbol] == cross_t0
+                    and not self.cross_traded[symbol]
+                    and (confirm_close > ema_confirm)
+                    and psar_below_confirm
+                    and psar_far
+                    and ao_turn_up
+                )
+
+                put_ready = (
+                    self.last_cross_dir[symbol] == "BEAR"
+                    and self.last_cross_t0[symbol] == cross_t0
+                    and not self.cross_traded[symbol]
+                    and (confirm_close < ema_confirm)
+                    and psar_above_confirm
+                    and psar_far
+                    and ao_turn_down
+                )
+
+                # ---------------- STATUS / WHY (COMMUNICATIVE) ----------------
                 why = []
-                if not price_above_ema and not price_below_ema:
-                    why.append("Price is exactly on EMA50 (no clear side).")
 
-                if not psar_below_candle and price_above_ema:
-                    why.append("CALL missing: PSAR is not below candle (needs bullish SAR under candle).")
-                if not psar_above_candle and price_below_ema:
-                    why.append("PUT missing: PSAR is not above candle (needs bearish SAR above candle).")
+                if not ok_gate:
+                    why.append(f"Gate blocked: {gate}")
 
-                if price_above_ema:
-                    if not (ao > 0):
-                        why.append("CALL missing: AO must be > 0 (bull momentum).")
-                    if not ao_rising:
-                        why.append("CALL missing: AO must be rising (AO now <= previous).")
+                if self.last_cross_dir[symbol] is None:
+                    why.append("Waiting: no EMA50 cross detected yet.")
+                else:
+                    cross_time = fmt_time_hhmmss(self.last_cross_t0[symbol])
+                    why.append(f"Last EMA50 cross: {self.last_cross_dir[symbol]} at {cross_time}.")
+                    if self.cross_traded[symbol]:
+                        why.append("Already traded this cross (waiting for a NEW cross).")
+                    else:
+                        why.append("Waiting for 2nd candle confirmation after the cross.")
 
-                if price_below_ema:
-                    if not (ao < 0):
-                        why.append("PUT missing: AO must be < 0 (bear momentum).")
-                    if not ao_falling:
-                        why.append("PUT missing: AO must be falling (AO now >= previous).")
+                if self.last_cross_dir[symbol] == "BULL" and not self.cross_traded[symbol]:
+                    if not (confirm_close > ema_confirm):
+                        why.append("CALL missing: 2nd candle did not HOLD above EMA50.")
+                    if not psar_below_confirm:
+                        why.append("CALL missing: PSAR must be BELOW the whole confirm candle.")
+                    if not psar_far:
+                        why.append(f"CALL missing: PSAR not far enough (dist {psar_dist:.4f} < {PSAR_MIN_DIST_MULT:.2f}×range).")
+                    if not ao_turn_up:
+                        why.append("CALL missing: AO must just TURN UP (was falling then rising).")
+
+                if self.last_cross_dir[symbol] == "BEAR" and not self.cross_traded[symbol]:
+                    if not (confirm_close < ema_confirm):
+                        why.append("PUT missing: 2nd candle did not HOLD below EMA50.")
+                    if not psar_above_confirm:
+                        why.append("PUT missing: PSAR must be ABOVE the whole confirm candle.")
+                    if not psar_far:
+                        why.append(f"PUT missing: PSAR not far enough (dist {psar_dist:.4f} < {PSAR_MIN_DIST_MULT:.2f}×range).")
+                    if not ao_turn_down:
+                        why.append("PUT missing: AO must just TURN DOWN (was rising then falling).")
 
                 if call_ready:
-                    why = ["✅ CALL ready: close>EMA50 + PSAR below candle + AO>0 and rising."]
+                    why = ["✅ CALL READY: EMA50 cross + 2nd candle hold + PSAR far below + AO turned up."]
                 elif put_ready:
-                    why = ["✅ PUT ready: close<EMA50 + PSAR above candle + AO<0 and falling."]
+                    why = ["✅ PUT READY: EMA50 cross + 2nd candle hold + PSAR far above + AO turned down."]
                 elif not why:
-                    why = ["Waiting for setup conditions to align."]
+                    why = ["Waiting for conditions."]
 
-                # Update status always
+                signal = "CALL" if call_ready else "PUT" if put_ready else None
+
                 self.market_debug[symbol] = {
                     "time": time.time(),
                     "gate": gate,
-                    "last_closed": closed_t0,
-                    "price": c,
-                    "o": o, "h": h, "l": l,
-                    "ema50": ema50,
-                    "psar": psar,
-                    "ao": ao,
-                    "ao_prev": ao_prev,
-                    "price_vs_ema": "ABOVE" if price_above_ema else "BELOW" if price_below_ema else "ON",
-                    "psar_pos": "BELOW" if psar_below_candle else "ABOVE" if psar_above_candle else "INSIDE",
-                    "ao_dir": "RISING" if ao_rising else "FALLING" if ao_falling else "FLAT",
-                    "signal": "CALL" if call_ready else "PUT" if put_ready else None,
-                    "why": why,
+                    "last_closed": confirm_t0,
+                    "signal": signal,
+                    "why": why[:8],
+
+                    "c_prev2": prev2_close,
+                    "c_cross": cross_close,
+                    "c_confirm": confirm_close,
+                    "o_confirm": confirm_o,
+                    "h_confirm": confirm_h,
+                    "l_confirm": confirm_l,
+
+                    "ema_prev2": float(ema_prev2),
+                    "ema_cross": float(ema_cross),
+                    "ema_confirm": float(ema_confirm),
+                    "psar_confirm": float(psar_confirm),
+                    "psar_dist": float(psar_dist),
+                    "psar_far": bool(psar_far),
+
+                    "ao_now": float(ao_now),
+                    "ao_prev": float(ao_prev),
+                    "ao_prev2": float(ao_prev2),
+                    "ao_turn": "UP" if ao_turn_up else "DOWN" if ao_turn_down else "NO_TURN",
+
+                    "cross_dir": self.last_cross_dir[symbol],
+                    "cross_t0": self.last_cross_t0[symbol],
+                    "cross_traded": self.cross_traded[symbol],
                 }
 
-                # Gate blocks trading
                 if not ok_gate:
                     await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
 
-                # Only once per closed candle
-                if self.last_processed_closed_t0[symbol] == closed_t0:
+                if self.last_processed_closed_t0[symbol] == confirm_t0:
                     await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
-                self.last_processed_closed_t0[symbol] = closed_t0
+                self.last_processed_closed_t0[symbol] = confirm_t0
 
-                # Execute trades
                 if call_ready:
-                    await self.execute_trade("CALL", symbol, reason="EMA50 + PSAR(BULL) + AO>0 rising", source="AUTO")
+                    self.cross_traded[symbol] = True
+                    await self.execute_trade(
+                        "CALL",
+                        symbol,
+                        reason="EMA50 CROSS → 2nd candle + PSAR far + AO turn UP",
+                        source="AUTO"
+                    )
                 elif put_ready:
-                    await self.execute_trade("PUT", symbol, reason="EMA50 + PSAR(BEAR) + AO<0 falling", source="AUTO")
+                    self.cross_traded[symbol] = True
+                    await self.execute_trade(
+                        "PUT",
+                        symbol,
+                        reason="EMA50 CROSS → 2nd candle + PSAR far + AO turn DOWN",
+                        source="AUTO"
+                    )
 
             except asyncio.CancelledError:
                 break
@@ -474,6 +575,7 @@ class DerivSniperBot:
 # ========================= UI =========================
 bot_logic = DerivSniperBot()
 
+
 def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("▶️ START", callback_data="START_SCAN"),
@@ -485,6 +587,7 @@ def main_keyboard():
          InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
     ])
 
+
 def format_market_detail(sym: str, d: dict) -> str:
     if not d:
         return f"📍 {sym.replace('_',' ')}\nStatus: ⏳ No scan data yet"
@@ -492,35 +595,43 @@ def format_market_detail(sym: str, d: dict) -> str:
     age = int(time.time() - d.get("time", time.time()))
     gate = d.get("gate", "—")
     last_closed = d.get("last_closed", 0)
+    signal = d.get("signal") or "—"
 
-    why = "\n".join([f"• {x}" for x in (d.get("why", ["Waiting..."])[:6])])
+    why = "\n".join([f"• {x}" for x in (d.get("why", ["Waiting..."])[:8])])
 
-    if "price" not in d:
+    if "ema_confirm" not in d:
         return (
             f"📍 {sym.replace('_',' ')} ({age}s ago)\n"
             f"Gate: {gate}\n"
+            f"Signal: {signal}\n"
             f"Why:\n{why}\n"
             f"Last closed M1 candle: {fmt_time_hhmmss(last_closed)}"
         )
-
-    price = d["price"]
-    ema50 = d["ema50"]
-    psar = d["psar"]
-    ao = d["ao"]
-    ao_prev = d["ao_prev"]
 
     return (
         f"📍 {sym.replace('_',' ')} ({age}s ago)\n"
         f"Gate: {gate}\n"
         f"Last closed M1 candle: {fmt_time_hhmmss(last_closed)}\n"
-        f"Signal: {d.get('signal') or '—'}\n"
+        f"Signal: {signal}\n"
         f"Why:\n{why}\n"
-        f"Data:\n"
-        f"• Close: {price:.2f}\n"
-        f"• EMA50: {ema50:.2f} | Candle is: {d.get('price_vs_ema')}\n"
-        f"• PSAR: {psar:.2f} | PSAR is: {d.get('psar_pos')} (needs BELOW for CALL, ABOVE for PUT)\n"
-        f"• AO: {ao:+.4f} ({d.get('ao_dir')}) | Prev: {ao_prev:+.4f}\n"
+        f"Cross State:\n"
+        f"• Last cross: {d.get('cross_dir') or '—'} @ {fmt_time_hhmmss(d.get('cross_t0', 0))}\n"
+        f"• Traded this cross?: {'YES' if d.get('cross_traded') else 'NO'}\n"
+        f"Data (Cross → Confirm):\n"
+        f"• Prev2 Close: {d.get('c_prev2', 0):.2f} | EMA: {d.get('ema_prev2', 0):.2f}\n"
+        f"• Cross Close:  {d.get('c_cross', 0):.2f} | EMA: {d.get('ema_cross', 0):.2f}\n"
+        f"• Confirm Close:{d.get('c_confirm', 0):.2f} | EMA: {d.get('ema_confirm', 0):.2f}\n"
+        f"Confirm Candle:\n"
+        f"• O:{d.get('o_confirm', 0):.2f} H:{d.get('h_confirm', 0):.2f} L:{d.get('l_confirm', 0):.2f}\n"
+        f"PSAR:\n"
+        f"• PSAR(confirm): {d.get('psar_confirm', 0):.2f} | dist={d.get('psar_dist', 0):.4f} | far? {'YES' if d.get('psar_far') else 'NO'}\n"
+        f"AO (turn check):\n"
+        f"• AO prev2: {d.get('ao_prev2', 0):+.4f}\n"
+        f"• AO prev1: {d.get('ao_prev', 0):+.4f}\n"
+        f"• AO now:   {d.get('ao_now', 0):+.4f}\n"
+        f"• AO turn:  {d.get('ao_turn', 'NO_TURN')}\n"
     )
+
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
@@ -543,7 +654,10 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic.is_scanning = True
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
         await q.edit_message_text(
-            f"🔍 SCANNER ACTIVE\n📌 Strategy: EMA50 + Parabolic SAR + Awesome Oscillator\n🕯 Timeframe: M1\n⏱ Expiry: {DURATION_MIN}m",
+            f"🔍 SCANNER ACTIVE\n"
+            f"📌 Strategy: EMA50 CROSS (enter on 2nd candle) + PSAR far + AO turn\n"
+            f"🕯 Timeframe: M1\n"
+            f"⏱ Expiry: {DURATION_MIN}m",
             reply_markup=main_keyboard()
         )
 
@@ -574,7 +688,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"📌 Strategy: EMA50 + PSAR + AO (M1)\n"
+            f"📌 Strategy: EMA50 CROSS (2nd candle) + PSAR far + AO turn (M1)\n"
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
@@ -591,11 +705,16 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         await q.edit_message_text(header + details, reply_markup=main_keyboard())
 
+
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        "💎 Deriv Bot\n📌 Strategy: EMA50 + Parabolic SAR + Awesome Oscillator\n🕯 Timeframe: M1\n",
+        "💎 Deriv Bot\n"
+        "📌 Strategy: EMA50 CROSS (enter 2nd candle) + PSAR far + AO turn\n"
+        "🕯 Timeframe: M1\n"
+        f"⏱ Expiry: {DURATION_MIN}m\n",
         reply_markup=main_keyboard()
     )
+
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
