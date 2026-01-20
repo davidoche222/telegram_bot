@@ -431,6 +431,7 @@ class DerivSniperBot:
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
 
+                # Store more fields so STATUS can show a clean checklist
                 self.market_debug[symbol] = {
                     "time": time.time(),
                     "gate": gate,
@@ -441,13 +442,16 @@ class DerivSniperBot:
                     "c_prev2": prev2_close,
                     "c_cross": cross_close,
                     "c_confirm": confirm_close,
+
                     "o_confirm": confirm_o,
                     "h_confirm": confirm_h,
                     "l_confirm": confirm_l,
+                    "confirm_range": confirm_range,
 
                     "ema_prev2": float(ema_prev2),
                     "ema_cross": float(ema_cross),
                     "ema_confirm": float(ema_confirm),
+
                     "psar_confirm": float(psar_confirm),
                     "psar_dist": float(psar_dist),
                     "psar_far": bool(psar_far),
@@ -456,6 +460,14 @@ class DerivSniperBot:
                     "ao_prev": float(ao_prev),
                     "ao_prev2": float(ao_prev2),
                     "ao_turn": "UP" if ao_turn_up else "DOWN" if ao_turn_down else "NO_TURN",
+
+                    "psar_below_confirm": bool(psar_below_confirm),
+                    "psar_above_confirm": bool(psar_above_confirm),
+                    "ao_turn_up": bool(ao_turn_up),
+                    "ao_turn_down": bool(ao_turn_down),
+
+                    "bull_cross": bool(bull_cross),
+                    "bear_cross": bool(bear_cross),
 
                     "cross_dir": self.last_cross_dir[symbol],
                     "cross_t0": self.last_cross_t0[symbol],
@@ -588,49 +600,103 @@ def main_keyboard():
     ])
 
 
+# ✅ NEW: nicer icons for checklist
+def ok_icon(v: bool) -> str:
+    return "✅" if v else "❌"
+
+
+def yn(v: bool) -> str:
+    return "YES" if v else "NO"
+
+
 def format_market_detail(sym: str, d: dict) -> str:
+    name = sym.replace("_", " ")
     if not d:
-        return f"📍 {sym.replace('_',' ')}\nStatus: ⏳ No scan data yet"
+        return f"📍 {name}\n⏳ No scan data yet."
 
     age = int(time.time() - d.get("time", time.time()))
     gate = d.get("gate", "—")
     last_closed = d.get("last_closed", 0)
     signal = d.get("signal") or "—"
 
-    why = "\n".join([f"• {x}" for x in (d.get("why", ["Waiting..."])[:8])])
+    # Small top summary first (easy to read)
+    lines = [
+        f"📍 {name}  ({age}s ago)",
+        f"🧱 Gate: {gate}",
+        f"🕯 Last closed M1: {fmt_time_hhmmss(last_closed)}",
+        f"🎯 Signal: {signal}",
+    ]
 
+    # If indicators not ready yet
     if "ema_confirm" not in d:
-        return (
-            f"📍 {sym.replace('_',' ')} ({age}s ago)\n"
-            f"Gate: {gate}\n"
-            f"Signal: {signal}\n"
-            f"Why:\n{why}\n"
-            f"Last closed M1 candle: {fmt_time_hhmmss(last_closed)}"
-        )
+        why = d.get("why", ["Waiting..."])
+        lines.append("📝 Note:")
+        lines.extend([f"• {x}" for x in why[:5]])
+        return "\n".join(lines)
 
-    return (
-        f"📍 {sym.replace('_',' ')} ({age}s ago)\n"
-        f"Gate: {gate}\n"
-        f"Last closed M1 candle: {fmt_time_hhmmss(last_closed)}\n"
-        f"Signal: {signal}\n"
-        f"Why:\n{why}\n"
-        f"Cross State:\n"
-        f"• Last cross: {d.get('cross_dir') or '—'} @ {fmt_time_hhmmss(d.get('cross_t0', 0))}\n"
-        f"• Traded this cross?: {'YES' if d.get('cross_traded') else 'NO'}\n"
-        f"Data (Cross → Confirm):\n"
-        f"• Prev2 Close: {d.get('c_prev2', 0):.2f} | EMA: {d.get('ema_prev2', 0):.2f}\n"
-        f"• Cross Close:  {d.get('c_cross', 0):.2f} | EMA: {d.get('ema_cross', 0):.2f}\n"
-        f"• Confirm Close:{d.get('c_confirm', 0):.2f} | EMA: {d.get('ema_confirm', 0):.2f}\n"
-        f"Confirm Candle:\n"
-        f"• O:{d.get('o_confirm', 0):.2f} H:{d.get('h_confirm', 0):.2f} L:{d.get('l_confirm', 0):.2f}\n"
-        f"PSAR:\n"
-        f"• PSAR(confirm): {d.get('psar_confirm', 0):.2f} | dist={d.get('psar_dist', 0):.4f} | far? {'YES' if d.get('psar_far') else 'NO'}\n"
-        f"AO (turn check):\n"
-        f"• AO prev2: {d.get('ao_prev2', 0):+.4f}\n"
-        f"• AO prev1: {d.get('ao_prev', 0):+.4f}\n"
-        f"• AO now:   {d.get('ao_now', 0):+.4f}\n"
-        f"• AO turn:  {d.get('ao_turn', 'NO_TURN')}\n"
-    )
+    cross_dir = d.get("cross_dir")
+    cross_time = fmt_time_hhmmss(d.get("cross_t0", 0)) if cross_dir else "—"
+
+    # Compact “Cross state”
+    lines += [
+        "────────────",
+        f"🔁 Cross: {cross_dir or '—'} @ {cross_time} | Traded: {yn(bool(d.get('cross_traded')))}",
+        "────────────",
+    ]
+
+    # Clean numbers (short + useful)
+    c_cross = d.get("c_cross", 0.0)
+    c_confirm = d.get("c_confirm", 0.0)
+    ema_confirm = d.get("ema_confirm", 0.0)
+    psar_confirm = d.get("psar_confirm", 0.0)
+
+    lines += [
+        f"📈 Price: CrossClose={c_cross:.2f} | ConfirmClose={c_confirm:.2f}",
+        f"📏 EMA50(confirm): {ema_confirm:.2f}",
+        f"📍 PSAR(confirm): {psar_confirm:.2f} | Far: {yn(bool(d.get('psar_far')))}",
+        f"📊 AO: prev2={d.get('ao_prev2', 0):+.4f} → prev1={d.get('ao_prev', 0):+.4f} → now={d.get('ao_now', 0):+.4f}",
+        f"🔄 AO turn: {d.get('ao_turn', 'NO_TURN')}",
+        "────────────",
+    ]
+
+    # Checklist depends on cross direction
+    is_bull = cross_dir == "BULL"
+    is_bear = cross_dir == "BEAR"
+
+    # Compute checklist conditions for readability
+    hold_above = bool(c_confirm > ema_confirm)
+    hold_below = bool(c_confirm < ema_confirm)
+
+    psar_below = bool(d.get("psar_below_confirm"))
+    psar_above = bool(d.get("psar_above_confirm"))
+    psar_far = bool(d.get("psar_far"))
+
+    ao_turn_up = bool(d.get("ao_turn_up"))
+    ao_turn_down = bool(d.get("ao_turn_down"))
+
+    if is_bull and not d.get("cross_traded", False):
+        lines += [
+            "✅ Entry checklist (CALL) — must all be ✅:",
+            f"{ok_icon(hold_above)} Confirm candle HOLD above EMA50",
+            f"{ok_icon(psar_below)} PSAR below confirm candle",
+            f"{ok_icon(psar_far)} PSAR far enough (filter)",
+            f"{ok_icon(ao_turn_up)} AO just turned UP",
+        ]
+    elif is_bear and not d.get("cross_traded", False):
+        lines += [
+            "✅ Entry checklist (PUT) — must all be ✅:",
+            f"{ok_icon(hold_below)} Confirm candle HOLD below EMA50",
+            f"{ok_icon(psar_above)} PSAR above confirm candle",
+            f"{ok_icon(psar_far)} PSAR far enough (filter)",
+            f"{ok_icon(ao_turn_down)} AO just turned DOWN",
+        ]
+    else:
+        # General reason (short)
+        why = d.get("why", ["Waiting..."])
+        lines.append("📝 Note:")
+        lines.extend([f"• {x}" for x in why[:4]])
+
+    return "\n".join(lines)
 
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -681,25 +747,26 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 rem = max(0, int(DURATION_MIN * 60) - int(time.time() - bot_logic.trade_start_time))
                 icon = "✅ PROFIT" if pnl > 0 else "❌ LOSS" if pnl < 0 else "➖ FLAT"
                 mkt_clean = str(bot_logic.active_market).replace("_", " ")
-                trade_status = f"🚀 Active Trade ({mkt_clean})\n📈 PnL: {icon} ({pnl:+.2f})\n⏳ Left: {rem}s"
+                trade_status = f"🚀 Active Trade: {mkt_clean} | {icon} ({pnl:+.2f}) | ⏳ {rem}s left"
             except:
                 trade_status = "🚀 Active Trade: Syncing..."
 
+        # ✅ Cleaner header (short lines, easier scanning)
         header = (
-            f"🕒 Time (WAT): {now_time}\n"
-            f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"📌 Strategy: EMA50 CROSS (2nd candle) + PSAR far + AO turn (M1)\n"
-            f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
-            f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
-            f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
-            f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
-            f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
-            f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | 🧪 Next Stake: ${bot_logic.current_stake:.2f}\n"
-            f"🚦 Gate: {gate}\n"
+            f"📊 BOT STATUS\n"
+            f"🕒 {now_time} (WAT)\n"
+            f"🤖 Mode: {'ACTIVE ✅' if bot_logic.is_scanning else 'OFFLINE ⛔'} | Account: {bot_logic.account_type}\n"
+            f"📌 Strategy: EMA50 CROSS (2nd candle) + PSAR far + AO turn | TF: M1 | Expiry: {DURATION_MIN}m\n"
+            f"────────────\n"
+            f"{trade_status}\n"
+            f"────────────\n"
+            f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today} | 📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
+            f"💵 P/L Today: {bot_logic.total_profit_today:+.2f} | 🧪 Next Stake: ${bot_logic.current_stake:.2f}\n"
+            f"⏳ Cooldown: {max(0, int(bot_logic.cooldown_until - time.time()))}s | 🚦 Gate: {gate}\n"
             f"💰 Balance: {bot_logic.balance}\n"
         )
 
-        details = "\n\n📌 LIVE SCAN (Detailed)\n\n" + "\n\n".join(
+        details = "\n\n🧭 LIVE SCAN (per market)\n\n" + "\n\n".join(
             [format_market_detail(sym, bot_logic.market_debug.get(sym, {})) for sym in MARKETS]
         )
 
