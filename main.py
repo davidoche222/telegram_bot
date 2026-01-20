@@ -17,7 +17,7 @@ APP_ID = 1089
 MARKETS = ["R_10", "R_25", "R_50"]
 
 COOLDOWN_SEC = 120
-MAX_TRADES_PER_DAY = 100
+MAX_TRADES_PER_DAY = 40
 MAX_CONSEC_LOSSES = 10
 BASE_STAKE = 1.00
 
@@ -28,8 +28,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ========================= STRATEGY SETTINGS =========================
-TF_SEC = 60                # M1 candles
-TICKS_COUNT = 1200         # more ticks = smoother candles
+TF_SEC = 60                # M1 candles (REAL candles from Deriv)
+CANDLES_COUNT = 300        # enough for EMA50 + AO + PSAR
 SCAN_SLEEP_SEC = 2
 
 EMA_PERIOD = 50
@@ -43,7 +43,7 @@ AO_FAST = 5
 AO_SLOW = 34
 
 # Contract expiry for binary
-DURATION_MIN = 5 # change to 1 if you want very fast; 3 is usually "fairer" than 1
+DURATION_MIN = 5  # ✅ requested: 5 minute expiry
 
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period):
@@ -147,26 +147,21 @@ def calculate_psar(candles, af_step=0.02, af_max=0.2):
     return psar
 
 
-def build_m1_candles_from_ticks(times, prices):
-    if not times or not prices:
-        return []
-    candles = []
-    curr_t0 = times[0] - (times[0] % 60)
-    o = h = l = c = float(prices[0])
-
-    for t, p in zip(times, prices):
-        t0 = t - (t % 60)
-        p = float(p)
-        if t0 != curr_t0:
-            candles.append({"o": o, "h": h, "l": l, "c": c, "t0": curr_t0})
-            curr_t0, o, h, l, c = t0, p, p, p, p
-        else:
-            h = max(h, p)
-            l = min(l, p)
-            c = p
-
-    candles.append({"o": o, "h": h, "l": l, "c": c, "t0": curr_t0})
-    return candles
+def build_candles_from_deriv(candles_raw):
+    """
+    ✅ REAL Deriv candles (no tick-building).
+    Deriv returns: epoch/open/high/low/close
+    """
+    out = []
+    for x in candles_raw:
+        out.append({
+            "t0": int(x.get("epoch", 0)),
+            "o": float(x.get("open", 0)),
+            "h": float(x.get("high", 0)),
+            "l": float(x.get("low", 0)),
+            "c": float(x.get("close", 0)),
+        })
+    return out
 
 
 def fmt_time_hhmmss(epoch):
@@ -256,6 +251,16 @@ class DerivSniperBot:
                 t.cancel()
             self.market_tasks.clear()
 
+    async def fetch_real_m1_candles(self, symbol: str):
+        data = await self.api.ticks_history({
+            "ticks_history": symbol,
+            "end": "latest",
+            "count": CANDLES_COUNT,
+            "style": "candles",
+            "granularity": TF_SEC
+        })
+        return build_candles_from_deriv(data.get("candles", []))
+
     async def scan_market(self, symbol: str):
         while self.is_scanning:
             try:
@@ -263,13 +268,8 @@ class DerivSniperBot:
                     self.is_scanning = False
                     break
 
-                data = await self.api.ticks_history({
-                    "ticks_history": symbol,
-                    "end": "latest",
-                    "count": TICKS_COUNT,
-                    "style": "ticks"
-                })
-                candles = build_m1_candles_from_ticks(data["history"]["times"], data["history"]["prices"])
+                candles = await self.fetch_real_m1_candles(symbol)
+
                 if len(candles) < max(EMA_PERIOD + 5, AO_SLOW + 5):
                     self.market_debug[symbol] = {
                         "time": time.time(),
@@ -281,7 +281,7 @@ class DerivSniperBot:
 
                 ok_gate, gate = self.can_auto_trade()
 
-                # last fully closed candle = candles[-2]
+                # last fully closed candle: use candles[-2]
                 closed = candles[-2]
                 closed_t0 = int(closed["t0"])
                 o, h, l, c = float(closed["o"]), float(closed["h"]), float(closed["l"]), float(closed["c"])
@@ -400,7 +400,7 @@ class DerivSniperBot:
             return
 
         async with self.trade_lock:
-            ok, gate = self.can_auto_trade()
+            ok, _gate = self.can_auto_trade()
             if not ok:
                 return
 
@@ -493,7 +493,7 @@ def format_market_detail(sym: str, d: dict) -> str:
     gate = d.get("gate", "—")
     last_closed = d.get("last_closed", 0)
 
-    why = "\n".join([f"• {x}" for x in (d.get("why", ["Waiting..."])[:5])])
+    why = "\n".join([f"• {x}" for x in (d.get("why", ["Waiting..."])[:6])])
 
     if "price" not in d:
         return (
@@ -543,7 +543,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic.is_scanning = True
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
         await q.edit_message_text(
-            f"🔍 SCANNER ACTIVE\n📌 Strategy: EMA50 + Parabolic SAR + Awesome Oscillator\n⏱ Expiry: {DURATION_MIN}m",
+            f"🔍 SCANNER ACTIVE\n📌 Strategy: EMA50 + Parabolic SAR + Awesome Oscillator\n🕯 Timeframe: M1\n⏱ Expiry: {DURATION_MIN}m",
             reply_markup=main_keyboard()
         )
 
