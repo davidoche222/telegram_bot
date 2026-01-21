@@ -42,7 +42,7 @@ PSAR_AF_MAX = 0.2
 RSI_PERIOD = 14
 
 # Contract expiry for binary
-DURATION_MIN = 1  # ✅ requested: 5 minute expiry (left unchanged)
+DURATION_MIN = 5  # ✅ requested: 5 minute expiry (left unchanged)
 
 # ===== CROSS STRATEGY SETTINGS (kept as-is; strategy no longer uses it) =====
 PSAR_MIN_DIST_MULT = 0.50
@@ -278,7 +278,7 @@ class DerivSniperBot:
 
                 ok_gate, gate = self.can_auto_trade()
 
-                # ========================= NEW STRATEGY (ONLY STRATEGY CHANGED) =========================
+                # ========================= STRATEGY =========================
                 # candles[-1] forming; candles[-2] last closed candle
                 confirm = candles[-2]
                 confirm_t0 = int(confirm["t0"])
@@ -332,7 +332,7 @@ class DerivSniperBot:
 
                 spike_block = (avg_body > 0 and last_body > spike_mult * avg_body)
 
-                # Trend separation filter
+                # Trend separation filter (trend strength)
                 ema_diff = abs(ema20 - ema50)
                 flat_block = ema_diff < ema_diff_min
 
@@ -369,47 +369,73 @@ class DerivSniperBot:
                     and not flat_block
                 )
 
-                # ---------------- STATUS / WHY ----------------
-                why = []
+                signal = "CALL" if call_ready else "PUT" if put_ready else None
 
+                # ---------------- SIMPLE STATUS LABELS (requested) ----------------
+                if uptrend:
+                    trend_label = "UPTREND"
+                elif downtrend:
+                    trend_label = "DOWNTREND"
+                else:
+                    trend_label = "SIDEWAYS"
+
+                if ema20 > ema50:
+                    ema_label = "EMA20 ABOVE EMA50"
+                elif ema20 < ema50:
+                    ema_label = "EMA20 BELOW EMA50"
+                else:
+                    ema_label = "EMA20 = EMA50"
+
+                trend_strength = "STRONG" if not flat_block else "WEAK"
+                pullback_label = "PULLBACK TOUCHED ✅" if touched_ema20 else "WAITING PULLBACK…"
+
+                block_label = []
+                if spike_block:
+                    block_label.append("SPIKE BLOCK")
+                if flat_block:
+                    block_label.append("WEAK/FLAT TREND")
+                block_label = " | ".join(block_label) if block_label else "OK"
+
+                # Keep a short readable why (optional)
+                why = []
                 if not ok_gate:
                     why.append(f"Gate blocked: {gate}")
-
-                why += [
-                    f"{'✅' if uptrend else '❌'} Trend: EMA20 > EMA50 (CALL needs uptrend)",
-                    f"{'✅' if downtrend else '❌'} Trend: EMA20 < EMA50 (PUT needs downtrend)",
-                    f"{'✅' if touched_ema20 else '❌'} Pullback: candle touched EMA20",
-                    f"{'✅' if bull_confirm else '❌'} Candle bullish (CALL confirm)",
-                    f"{'✅' if bear_confirm else '❌'} Candle bearish (PUT confirm)",
-                    f"{'✅' if call_rsi_ok else '❌'} RSI in CALL zone ({rsi_call_min:.0f}-{rsi_call_max:.0f})",
-                    f"{'✅' if put_rsi_ok else '❌'} RSI in PUT zone ({rsi_put_min:.0f}-{rsi_put_max:.0f})",
-                    f"{'✅' if not spike_block else '❌'} Spike filter passed (mult={spike_mult})",
-                    f"{'✅' if not flat_block else '❌'} Trend separation ok (emaDiff={ema_diff:.4f}, min={ema_diff_min})",
-                ]
-
-                signal = "CALL" if call_ready else "PUT" if put_ready else None
-                if call_ready:
-                    why = [f"✅ CALL READY: {symbol} | EMA20>EMA50 + touch EMA20 + bullish close + RSI ok + filters pass"]
-                elif put_ready:
-                    why = [f"✅ PUT READY: {symbol} | EMA20<EMA50 + touch EMA20 + bearish close + RSI ok + filters pass"]
+                if signal:
+                    why.append(f"READY: {signal}")
+                else:
+                    if trend_label == "SIDEWAYS":
+                        why.append("Waiting: trend direction")
+                    elif not (trend_strength == "STRONG"):
+                        why.append("Waiting: strong trend")
+                    elif not touched_ema20:
+                        why.append("Waiting: pullback to EMA20")
+                    else:
+                        why.append("Waiting: confirmation / RSI")
 
                 self.market_debug[symbol] = {
                     "time": time.time(),
                     "gate": gate,
                     "last_closed": confirm_t0,
                     "signal": signal,
-                    "why": why[:10],
 
+                    # ✅ SIMPLE STATUS
+                    "trend_label": trend_label,
+                    "ema_label": ema_label,
+                    "trend_strength": trend_strength,
+                    "pullback_label": pullback_label,
+                    "block_label": block_label,
+
+                    # Raw values (optional)
                     "ema20": ema20,
                     "ema50": ema50,
                     "ema_diff": ema_diff,
-
                     "rsi_now": rsi_now,
-
                     "avg_body": avg_body,
                     "last_body": last_body,
                     "spike_block": spike_block,
                     "flat_block": flat_block,
+
+                    "why": why[:10],
                 }
 
                 if not ok_gate:
@@ -426,7 +452,6 @@ class DerivSniperBot:
                     await self.execute_trade("CALL", symbol, reason="EMA20/EMA50 trend + EMA20 pullback + RSI filter", source="AUTO")
                 elif put_ready:
                     await self.execute_trade("PUT", symbol, reason="EMA20/EMA50 trend + EMA20 pullback + RSI filter", source="AUTO")
-                # ========================= END NEW STRATEGY =========================
 
             except asyncio.CancelledError:
                 break
@@ -495,7 +520,7 @@ class DerivSniperBot:
                 else:
                     self.consecutive_losses = 0
 
-                # ✅ requested: remove martingale (always fixed stake)
+                # ✅ remove martingale (always fixed stake)
                 self.current_stake = BASE_STAKE
 
             await self.fetch_balance()
@@ -527,6 +552,7 @@ def main_keyboard():
          InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
     ])
 
+# ✅ UPDATED: simpler status display
 def format_market_detail(sym: str, d: dict) -> str:
     if not d:
         return f"📍 {sym.replace('_',' ')}\n⏳ No scan data yet"
@@ -536,32 +562,22 @@ def format_market_detail(sym: str, d: dict) -> str:
     last_closed = d.get("last_closed", 0)
     signal = d.get("signal") or "—"
 
-    why_lines = d.get("why", ["Waiting..."])[:10]
-    why = "\n".join([f"• {x}" for x in why_lines])
+    trend_label = d.get("trend_label", "—")
+    ema_label = d.get("ema_label", "—")
+    trend_strength = d.get("trend_strength", "—")
+    pullback_label = d.get("pullback_label", "—")
+    block_label = d.get("block_label", "—")
 
-    # New strategy detail view
-    if "ema20" in d and "ema50" in d:
-        return (
-            f"📍 {sym.replace('_',' ')} ({age}s)\n"
-            f"Gate: {gate}\n"
-            f"Last closed: {fmt_time_hhmmss(last_closed)}\n"
-            f"Signal: {signal}\n"
-            f"──────────────\n"
-            f"EMA20: {d.get('ema20', 0):.2f} | EMA50: {d.get('ema50', 0):.2f} | Diff: {d.get('ema_diff', 0):.4f}\n"
-            f"RSI(now): {d.get('rsi_now', 0):.2f}\n"
-            f"Spike: {'BLOCK' if d.get('spike_block') else 'OK'} | Flat: {'BLOCK' if d.get('flat_block') else 'OK'}\n"
-            f"Body: last={d.get('last_body', 0):.4f} | avg20={d.get('avg_body', 0):.4f}\n"
-            f"──────────────\n"
-            f"Checklist / Notes:\n{why}"
-        )
-
-    # Fallback (should rarely hit)
     return (
         f"📍 {sym.replace('_',' ')} ({age}s)\n"
         f"Gate: {gate}\n"
         f"Last closed: {fmt_time_hhmmss(last_closed)}\n"
+        f"────────────────\n"
+        f"Trend: {trend_label} ({trend_strength})\n"
+        f"{ema_label}\n"
+        f"{pullback_label}\n"
+        f"Filters: {block_label}\n"
         f"Signal: {signal}\n"
-        f"Why:\n{why}"
     )
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -630,7 +646,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"💰 Balance: {bot_logic.balance}\n"
         )
 
-        details = "\n\n📌 LIVE SCAN (Readable)\n\n" + "\n\n".join(
+        details = "\n\n📌 LIVE SCAN (Simple)\n\n" + "\n\n".join(
             [format_market_detail(sym, bot_logic.market_debug.get(sym, {})) for sym in MARKETS]
         )
 
