@@ -29,8 +29,10 @@ logger = logging.getLogger(__name__)
 
 # ========================= STRATEGY SETTINGS =========================
 TF_SEC = 60                # M1 candles (REAL candles from Deriv)
-CANDLES_COUNT = 300        # enough for EMA50 + RSI + PSAR
-SCAN_SLEEP_SEC = 2
+
+# ✅ Stability change: reduce API pressure
+CANDLES_COUNT = 200        # was 300 (still enough for EMA50 + RSI)
+SCAN_SLEEP_SEC = 5         # was 2 (reduces throttling / disconnects)
 
 EMA_PERIOD = 50
 
@@ -212,6 +214,47 @@ class DerivSniperBot:
             logger.error(f"Connect error: {e}")
             return False
 
+    # ========================= SELF-HEALING (ADDED) =========================
+    async def safe_reconnect(self) -> bool:
+        """Reconnect Deriv API safely after disconnect/throttle/auth issues."""
+        try:
+            if self.api:
+                try:
+                    await self.api.disconnect()
+                except:
+                    pass
+        except:
+            pass
+        self.api = None
+        return await self.connect()
+
+    async def safe_ticks_history(self, payload: dict, retries: int = 3):
+        """
+        Retry wrapper for ticks_history to handle throttling / temporary disconnects.
+        Does NOT change strategy logic, only stability.
+        """
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                if not self.api:
+                    ok = await self.safe_reconnect()
+                    if not ok:
+                        raise RuntimeError("Reconnect failed")
+                return await self.api.ticks_history(payload)
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+
+                # reconnect on common connection/auth failures
+                if any(k in msg for k in ["disconnect", "connection", "websocket", "not connected", "authorize", "auth"]):
+                    await self.safe_reconnect()
+
+                # small backoff for rate limiting / server hiccups
+                await asyncio.sleep(1.25 * attempt)
+
+        raise last_err
+    # ========================= END SELF-HEALING =========================
+
     async def fetch_balance(self):
         if not self.api:
             return
@@ -249,13 +292,14 @@ class DerivSniperBot:
             self.market_tasks.clear()
 
     async def fetch_real_m1_candles(self, symbol: str):
-        data = await self.api.ticks_history({
+        payload = {
             "ticks_history": symbol,
             "end": "latest",
             "count": CANDLES_COUNT,
             "style": "candles",
             "granularity": TF_SEC
-        })
+        }
+        data = await self.safe_ticks_history(payload, retries=3)
         return build_candles_from_deriv(data.get("candles", []))
 
     async def _sync_to_next_candle_open(self, last_closed_t0: int):
