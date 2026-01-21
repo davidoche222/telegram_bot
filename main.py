@@ -41,8 +41,8 @@ PSAR_AF_MAX = 0.2
 # RSI
 RSI_PERIOD = 14
 
-# Contract expiry for binary
-DURATION_MIN = 5  # ✅ requested: 5 minute expiry (left unchanged)
+# ✅ UPDATED (your new idea needs 1-minute expiry)
+DURATION_MIN = 1
 
 # ===== CROSS STRATEGY SETTINGS (kept as-is; strategy no longer uses it) =====
 PSAR_MIN_DIST_MULT = 0.50
@@ -258,6 +258,20 @@ class DerivSniperBot:
         })
         return build_candles_from_deriv(data.get("candles", []))
 
+    async def _sync_to_next_candle_open(self, last_closed_t0: int):
+        """
+        last_closed_t0 is the OPEN time of the last closed candle.
+        Next candle open = last_closed_t0 + TF_SEC.
+        We sleep a tiny bit so we enter near the new candle open.
+        """
+        next_open = int(last_closed_t0) + int(TF_SEC)
+        now = time.time()
+        wait = (next_open - now) + 0.15  # small buffer
+        if wait > 0:
+            await asyncio.sleep(min(wait, 2.0))  # never sleep too long
+        else:
+            await asyncio.sleep(0.15)
+
     async def scan_market(self, symbol: str):
         while self.is_scanning:
             try:
@@ -266,7 +280,7 @@ class DerivSniperBot:
                     break
 
                 candles = await self.fetch_real_m1_candles(symbol)
-                need = max(50 + 10, RSI_PERIOD + 10, 60)  # strategy uses EMA20/EMA50
+                need = max(60, RSI_PERIOD + 10, 60)  # enough for EMA50 & RSI
                 if len(candles) < need:
                     self.market_debug[symbol] = {
                         "time": time.time(),
@@ -278,9 +292,14 @@ class DerivSniperBot:
 
                 ok_gate, gate = self.can_auto_trade()
 
-                # ========================= STRATEGY =========================
-                # candles[-1] forming; candles[-2] last closed candle
+                # ========================= STRATEGY (YOUR NEW IDEA) =========================
+                # We use TWO closed candles:
+                # - pullback_candle = candles[-3] (must touch EMA20)
+                # - confirm_candle  = candles[-2] (must close green/red)
+                pullback = candles[-3]
                 confirm = candles[-2]
+
+                pullback_t0 = int(pullback["t0"])
                 confirm_t0 = int(confirm["t0"])
 
                 closes = [x["c"] for x in candles]
@@ -293,10 +312,10 @@ class DerivSniperBot:
                     await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
 
-                ema20 = float(ema20_arr[-2])
+                ema20 = float(ema20_arr[-2])  # EMA at confirm candle close
                 ema50 = float(ema50_arr[-2])
 
-                # RSI14
+                # RSI14 on confirm candle close
                 rsi_arr = calculate_rsi(closes, RSI_PERIOD)
                 if len(rsi_arr) < 10 or np.isnan(rsi_arr[-2]):
                     self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["RSI not ready yet."]}
@@ -304,13 +323,18 @@ class DerivSniperBot:
                     continue
                 rsi_now = float(rsi_arr[-2])
 
-                # Confirm candle
+                # ---- Pullback candle touches EMA20 ----
+                pb_high = float(pullback["h"])
+                pb_low = float(pullback["l"])
+                touched_ema20 = (pb_low <= ema20 <= pb_high)
+
+                # ---- Confirmation candle color (forms green/red then we enter next candle) ----
                 c_open = float(confirm["o"])
                 c_close = float(confirm["c"])
-                c_high = float(confirm["h"])
-                c_low = float(confirm["l"])
+                bull_confirm = c_close > c_open
+                bear_confirm = c_close < c_open
 
-                # Spike filter: avg body over last 20 closed candles
+                # Spike filter on CONFIRM candle body
                 bodies = [abs(float(candles[i]["c"]) - float(candles[i]["o"])) for i in range(-22, -2)]
                 if len(bodies) >= 10:
                     avg_body = float(np.mean(bodies))
@@ -332,16 +356,9 @@ class DerivSniperBot:
 
                 spike_block = (avg_body > 0 and last_body > spike_mult * avg_body)
 
-                # Trend separation filter (trend strength)
+                # Trend strength (separation)
                 ema_diff = abs(ema20 - ema50)
                 flat_block = ema_diff < ema_diff_min
-
-                # Pullback touch EMA20
-                touched_ema20 = (c_low <= ema20 <= c_high)
-
-                # Candle confirmation
-                bull_confirm = c_close > c_open
-                bear_confirm = c_close < c_open
 
                 # Trend direction
                 uptrend = ema20 > ema50
@@ -351,6 +368,8 @@ class DerivSniperBot:
                 call_rsi_ok = (rsi_call_min <= rsi_now <= rsi_call_max)
                 put_rsi_ok = (rsi_put_min <= rsi_now <= rsi_put_max)
 
+                # ✅ Entry is based on:
+                # Trend + pullback touches EMA20 (previous candle) + confirm candle color + RSI + filters
                 call_ready = (
                     uptrend
                     and touched_ema20
@@ -371,7 +390,7 @@ class DerivSniperBot:
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
 
-                # ---------------- SIMPLE STATUS LABELS (requested) ----------------
+                # ---------------- SIMPLE STATUS LABELS ----------------
                 if uptrend:
                     trend_label = "UPTREND"
                 elif downtrend:
@@ -396,21 +415,20 @@ class DerivSniperBot:
                     block_label.append("WEAK/FLAT TREND")
                 block_label = " | ".join(block_label) if block_label else "OK"
 
-                # Keep a short readable why (optional)
                 why = []
                 if not ok_gate:
                     why.append(f"Gate blocked: {gate}")
                 if signal:
-                    why.append(f"READY: {signal}")
+                    why.append(f"READY: {signal} (enter next candle)")
                 else:
                     if trend_label == "SIDEWAYS":
                         why.append("Waiting: trend direction")
-                    elif not (trend_strength == "STRONG"):
+                    elif trend_strength != "STRONG":
                         why.append("Waiting: strong trend")
                     elif not touched_ema20:
-                        why.append("Waiting: pullback to EMA20")
+                        why.append("Waiting: pullback candle touch EMA20")
                     else:
-                        why.append("Waiting: confirmation / RSI")
+                        why.append("Waiting: confirm candle color/RSI")
 
                 self.market_debug[symbol] = {
                     "time": time.time(),
@@ -418,14 +436,12 @@ class DerivSniperBot:
                     "last_closed": confirm_t0,
                     "signal": signal,
 
-                    # ✅ SIMPLE STATUS
                     "trend_label": trend_label,
                     "ema_label": ema_label,
                     "trend_strength": trend_strength,
                     "pullback_label": pullback_label,
                     "block_label": block_label,
 
-                    # Raw values (optional)
                     "ema20": ema20,
                     "ema50": ema50,
                     "ema_diff": ema_diff,
@@ -442,16 +458,21 @@ class DerivSniperBot:
                     await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
 
-                # One trade per closed candle per symbol
+                # One trade per closed CONFIRM candle per symbol
                 if self.last_processed_closed_t0[symbol] == confirm_t0:
                     await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
                 self.last_processed_closed_t0[symbol] = confirm_t0
 
+                # ✅ Enter on NEXT candle open (sync)
+                if call_ready or put_ready:
+                    await self._sync_to_next_candle_open(confirm_t0)
+
                 if call_ready:
-                    await self.execute_trade("CALL", symbol, reason="EMA20/EMA50 trend + EMA20 pullback + RSI filter", source="AUTO")
+                    await self.execute_trade("CALL", symbol, reason="Trend + PullbackTouch(Prev) + ConfirmGreen + RSI + Filters", source="AUTO")
                 elif put_ready:
-                    await self.execute_trade("PUT", symbol, reason="EMA20/EMA50 trend + EMA20 pullback + RSI filter", source="AUTO")
+                    await self.execute_trade("PUT", symbol, reason="Trend + PullbackTouch(Prev) + ConfirmRed + RSI + Filters", source="AUTO")
+                # ========================= END STRATEGY =========================
 
             except asyncio.CancelledError:
                 break
@@ -552,7 +573,6 @@ def main_keyboard():
          InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
     ])
 
-# ✅ UPDATED: simpler status display
 def format_market_detail(sym: str, d: dict) -> str:
     if not d:
         return f"📍 {sym.replace('_',' ')}\n⏳ No scan data yet"
@@ -602,7 +622,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
         await q.edit_message_text(
             f"🔍 SCANNER ACTIVE\n"
-            f"📌 Strategy: EMA20/EMA50 trend + pullback touch EMA20 + RSI zones + spike/flat filters\n"
+            f"📌 Strategy: Trend (EMA20/EMA50) + Pullback touch EMA20 (prev candle) + Confirm candle green/red + RSI (M1)\n"
             f"🕯 Timeframe: M1\n"
             f"⏱ Expiry: {DURATION_MIN}m",
             reply_markup=main_keyboard()
@@ -635,7 +655,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"📌 Strategy: EMA20/EMA50 trend + EMA20 pullback + RSI zones + spike/flat filters (M1)\n"
+            f"📌 Strategy: Trend + Pullback(Prev) + ConfirmColor + RSI (M1)\n"
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
@@ -655,7 +675,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         "💎 Deriv Bot\n"
-        "📌 Strategy: EMA20/EMA50 trend + pullback touch EMA20 + RSI zones + spike/flat filters\n"
+        "📌 Strategy: Trend + Pullback(Prev) + ConfirmColor + RSI (M1)\n"
         "🕯 Timeframe: M1\n"
         f"⏱ Expiry: {DURATION_MIN}m\n",
         reply_markup=main_keyboard()
