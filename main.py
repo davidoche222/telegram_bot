@@ -29,10 +29,8 @@ logger = logging.getLogger(__name__)
 
 # ========================= STRATEGY SETTINGS =========================
 TF_SEC = 60                # M1 candles (REAL candles from Deriv)
-
-# ✅ Stability change: reduce API pressure
-CANDLES_COUNT = 200        # was 300 (still enough for EMA50 + RSI)
-SCAN_SLEEP_SEC = 5         # was 2 (reduces throttling / disconnects)
+CANDLES_COUNT = 300        # enough for EMA50 + RSI + PSAR
+SCAN_SLEEP_SEC = 2
 
 EMA_PERIOD = 50
 
@@ -192,11 +190,7 @@ class DerivSniperBot:
         self.total_profit_today = 0.0
         self.balance = "0.00"
         self.current_stake = BASE_STAKE
-
         self.trade_lock = asyncio.Lock()
-
-        # ✅ Stability: prevent concurrent Deriv websocket calls
-        self.api_call_lock = asyncio.Lock()
 
         self.market_debug = {m: {} for m in MARKETS}
         self.last_processed_closed_t0 = {m: 0 for m in MARKETS}
@@ -211,65 +205,18 @@ class DerivSniperBot:
             if not self.active_token:
                 return False
             self.api = DerivAPI(app_id=APP_ID)
-            async with self.api_call_lock:
-                await self.api.authorize(self.active_token)
+            await self.api.authorize(self.active_token)
             await self.fetch_balance()
             return True
         except Exception as e:
             logger.error(f"Connect error: {e}")
             return False
 
-    # ========================= SELF-HEALING (ADDED) =========================
-    async def safe_reconnect(self) -> bool:
-        """Reconnect Deriv API safely after disconnect/throttle/auth issues."""
-        try:
-            if self.api:
-                try:
-                    async with self.api_call_lock:
-                        await self.api.disconnect()
-                except:
-                    pass
-        except:
-            pass
-        self.api = None
-        return await self.connect()
-
-    async def safe_ticks_history(self, payload: dict, retries: int = 5):
-        """
-        Retry wrapper for ticks_history to handle throttling / temporary disconnects.
-        Strategy logic unchanged, only stability.
-        """
-        last_err = None
-        for attempt in range(1, retries + 1):
-            try:
-                if not self.api:
-                    ok = await self.safe_reconnect()
-                    if not ok:
-                        raise RuntimeError("Reconnect failed")
-
-                async with self.api_call_lock:
-                    return await self.api.ticks_history(payload)
-
-            except Exception as e:
-                last_err = e
-                msg = str(e).lower()
-
-                # reconnect on common connection/auth failures
-                if any(k in msg for k in ["disconnect", "connection", "websocket", "not connected", "authorize", "auth"]):
-                    await self.safe_reconnect()
-
-                # backoff for rate limiting / server hiccups
-                await asyncio.sleep(min(8.0, 1.5 * attempt))
-
-        raise last_err
-    # ========================= END SELF-HEALING =========================
-
     async def fetch_balance(self):
         if not self.api:
             return
         try:
-            async with self.api_call_lock:
-                bal = await self.api.balance({"balance": 1})
+            bal = await self.api.balance({"balance": 1})
             self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
         except:
             pass
@@ -302,14 +249,13 @@ class DerivSniperBot:
             self.market_tasks.clear()
 
     async def fetch_real_m1_candles(self, symbol: str):
-        payload = {
+        data = await self.api.ticks_history({
             "ticks_history": symbol,
             "end": "latest",
             "count": CANDLES_COUNT,
             "style": "candles",
             "granularity": TF_SEC
-        }
-        data = await self.safe_ticks_history(payload, retries=5)
+        })
         return build_candles_from_deriv(data.get("candles", []))
 
     async def _sync_to_next_candle_open(self, last_closed_t0: int):
@@ -353,6 +299,7 @@ class DerivSniperBot:
                 pullback = candles[-3]
                 confirm = candles[-2]
 
+                pullback_t0 = int(pullback["t0"])
                 confirm_t0 = int(confirm["t0"])
 
                 closes = [x["c"] for x in candles]
@@ -531,7 +478,7 @@ class DerivSniperBot:
                 break
             except Exception as e:
                 logger.error(f"Scanner Error ({symbol}): {e}")
-                self.market_debug[symbol] = {"time": time.time(), "gate": "Error", "why": [str(e)[:240]]}
+                self.market_debug[symbol] = {"time": time.time(), "gate": "Error", "why": [str(e)[:140]]}
 
             await asyncio.sleep(SCAN_SLEEP_SEC)
 
@@ -547,18 +494,17 @@ class DerivSniperBot:
             try:
                 stake = float(self.current_stake if source == "AUTO" else BASE_STAKE)
 
-                async with self.api_call_lock:
-                    prop = await self.api.proposal({
-                        "proposal": 1,
-                        "amount": stake,
-                        "basis": "stake",
-                        "contract_type": side,
-                        "currency": "USD",
-                        "duration": int(DURATION_MIN),
-                        "duration_unit": "m",
-                        "symbol": symbol
-                    })
-                    buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])})
+                prop = await self.api.proposal({
+                    "proposal": 1,
+                    "amount": stake,
+                    "basis": "stake",
+                    "contract_type": side,
+                    "currency": "USD",
+                    "duration": int(DURATION_MIN),
+                    "duration_unit": "m",
+                    "symbol": symbol
+                })
+                buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])})
 
                 self.active_trade_info = int(buy["buy"]["contract_id"])
                 self.active_market = symbol
@@ -584,8 +530,7 @@ class DerivSniperBot:
     async def check_result(self, cid: int, source: str):
         await asyncio.sleep(int(DURATION_MIN) * 60 + 5)
         try:
-            async with self.api_call_lock:
-                res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
+            res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
             profit = float(res["proposal_open_contract"].get("profit", 0))
 
             if source == "AUTO":
@@ -643,9 +588,6 @@ def format_market_detail(sym: str, d: dict) -> str:
     pullback_label = d.get("pullback_label", "—")
     block_label = d.get("block_label", "—")
 
-    why_lines = d.get("why", [])[:3]
-    why_txt = ("\n".join([f"• {x}" for x in why_lines])) if why_lines else "• —"
-
     return (
         f"📍 {sym.replace('_',' ')} ({age}s)\n"
         f"Gate: {gate}\n"
@@ -656,7 +598,6 @@ def format_market_detail(sym: str, d: dict) -> str:
         f"{pullback_label}\n"
         f"Filters: {block_label}\n"
         f"Signal: {signal}\n"
-        f"Why:\n{why_txt}\n"
     )
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -702,8 +643,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         trade_status = "No Active Trade"
         if bot_logic.active_trade_info and bot_logic.api:
             try:
-                async with bot_logic.api_call_lock:
-                    res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
+                res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
                 pnl = float(res["proposal_open_contract"].get("profit", 0))
                 rem = max(0, int(DURATION_MIN * 60) - int(time.time() - bot_logic.trade_start_time))
                 icon = "✅ PROFIT" if pnl > 0 else "❌ LOSS" if pnl < 0 else "➖ FLAT"
