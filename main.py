@@ -19,7 +19,6 @@ MARKETS = ["R_10", "R_25", "R_50"]
 COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 60
 MAX_CONSEC_LOSSES = 10
-BASE_STAKE = 1.00
 
 TELEGRAM_TOKEN = "8253450930:AAHUhPk9TML-8kZlA9UaHZZvTUGdurN9MVY"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -44,11 +43,14 @@ EMA_SLOPE_MIN = 0.0              # 0.0 means must be rising/falling
 
 # Martingale 2x (AUTO only) - ⚠️ risky, safety-capped
 MARTINGALE_MULT = 2.0
-MARTINGALE_MAX_STEPS = 4         # max doubles (BASE * 2^4 = 16x)
+MARTINGALE_MAX_STEPS = 4         # max doubles
 MARTINGALE_MAX_STAKE = 16.0      # extra absolute cap
 
 # Daily profit target: stop trading after +$5 until 12:00am WAT
 DAILY_PROFIT_TARGET = 5.0
+
+# ========================= NEW: ASK DERIV FOR MIN STAKE =========================
+MIN_STAKE_CACHE_TTL = 300  # seconds
 
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period: int):
@@ -134,9 +136,13 @@ class DerivSniperBot:
         self.total_profit_today = 0.0
         self.balance = "0.00"
 
-        # ✅ Martingale state
-        self.current_stake = BASE_STAKE
+        # ✅ Martingale state (AUTO only)
+        # current_stake is the NEXT stake to use when martingale_step > 0
+        self.current_stake = None
         self.martingale_step = 0
+
+        # ✅ Cache: (symbol, side) -> (min_stake, timestamp)
+        self.min_stake_cache = {}
 
         self.trade_lock = asyncio.Lock()
 
@@ -204,6 +210,45 @@ class DerivSniperBot:
         except:
             pass
 
+    # ========================= ASK DERIV FOR MINIMUM STAKE =========================
+    async def get_min_stake(self, symbol: str, side: str) -> float:
+        """
+        Ask Deriv for the true minimum stake for this symbol/contract type.
+        Cached to reduce API calls.
+        """
+        key = (symbol, side)
+        now = time.time()
+
+        if key in self.min_stake_cache:
+            stake, ts = self.min_stake_cache[key]
+            if (now - ts) < MIN_STAKE_CACHE_TTL:
+                return float(stake)
+
+        # Try a tiny amount; if Deriv rejects, increase a bit.
+        test_amounts = [0.01, 0.05, 0.10, 0.20, 0.50, 1.00]
+        last_err = None
+
+        for amt in test_amounts:
+            try:
+                prop = await self.api.proposal({
+                    "proposal": 1,
+                    "amount": float(amt),
+                    "basis": "stake",
+                    "contract_type": side,
+                    "currency": "USD",
+                    "duration": int(DURATION_MIN),
+                    "duration_unit": "m",
+                    "symbol": symbol
+                })
+                min_stake = float(prop["proposal"]["ask_price"])
+                self.min_stake_cache[key] = (min_stake, now)
+                return min_stake
+            except Exception as e:
+                last_err = e
+
+        raise last_err
+    # ========================= END MINIMUM STAKE =========================
+
     # ========================= DAILY RESET / PAUSE =========================
     def _next_midnight_epoch(self) -> float:
         now = datetime.now(self.tz)
@@ -221,7 +266,7 @@ class DerivSniperBot:
             self.cooldown_until = 0.0
             self.pause_until = 0.0
             self.martingale_step = 0
-            self.current_stake = BASE_STAKE
+            self.current_stake = None
     # ========================= END DAILY RESET / PAUSE =========================
 
     def can_auto_trade(self) -> tuple[bool, str]:
@@ -231,7 +276,6 @@ class DerivSniperBot:
             left = int(self.pause_until - time.time())
             return False, f"Paused until 12:00am WAT ({left}s)"
 
-        # pause for day if profit target reached
         if self.total_profit_today >= DAILY_PROFIT_TARGET:
             self.pause_until = self._next_midnight_epoch()
             return False, f"Daily target reached (+${self.total_profit_today:.2f})"
@@ -321,13 +365,11 @@ class DerivSniperBot:
                     await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
 
-                # ✅ aligned EMA values
                 ema20_pullback = float(ema20_arr[-3])
                 ema20_confirm = float(ema20_arr[-2])
                 ema50_confirm = float(ema50_arr[-2])
 
                 # ✅ EMA50 slope filter
-                # (uses closed candles only; ensure index exists)
                 slope_ok = False
                 ema50_slope = 0.0
                 ema50_rising = False
@@ -357,7 +399,7 @@ class DerivSniperBot:
                 bull_confirm = c_close > c_open
                 bear_confirm = c_close < c_open
 
-                # ✅ Confirm candle must close above/below EMA20_confirm
+                # Confirm candle must close above/below EMA20_confirm
                 close_above_ema20 = c_close > ema20_confirm
                 close_below_ema20 = c_close < ema20_confirm
 
@@ -388,9 +430,6 @@ class DerivSniperBot:
                 call_rsi_ok = (rsi_call_min <= rsi_now <= rsi_call_max)
                 put_rsi_ok = (rsi_put_min <= rsi_now <= rsi_put_max)
 
-                # ✅ UPDATED entry rules + EMA50 slope:
-                # CALL needs EMA50 rising
-                # PUT needs EMA50 falling
                 call_ready = (
                     uptrend
                     and slope_ok and ema50_rising
@@ -560,7 +599,22 @@ class DerivSniperBot:
                 return
 
             try:
-                stake = float(self.current_stake if source == "AUTO" else BASE_STAKE)
+                # ✅ Always use Deriv minimum stake as the BASE.
+                min_stake = await self.get_min_stake(symbol, side)
+
+                if source == "AUTO":
+                    if self.martingale_step <= 0 or self.current_stake is None:
+                        stake = float(min_stake)
+                    else:
+                        stake = float(self.current_stake)
+                        if stake < min_stake:
+                            stake = float(min_stake)
+                else:
+                    # Manual trades also use true minimum stake
+                    stake = float(min_stake)
+
+                # Round for cleaner display / amounts
+                stake = round(stake, 2)
 
                 prop = await self.api.proposal({
                     "proposal": 1,
@@ -589,16 +643,17 @@ class DerivSniperBot:
                     f"⏱ Expiry: {DURATION_MIN}m\n"
                     f"🧠 Reason: {reason}\n"
                     f"🤖 Source: {source}\n"
+                    f"✅ Base Stake: Deriv MIN (${min_stake:.2f})\n"
                     f"🎯 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
                     f"🧪 Martingale: step {self.martingale_step}/{MARTINGALE_MAX_STEPS}"
                 )
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
-                asyncio.create_task(self.check_result(self.active_trade_info, source))
+                asyncio.create_task(self.check_result(self.active_trade_info, source, stake_used=stake))
 
             except Exception as e:
                 logger.error(f"Trade error: {e}")
 
-    async def check_result(self, cid: int, source: str):
+    async def check_result(self, cid: int, source: str, stake_used: float):
         await asyncio.sleep(int(DURATION_MIN) * 60 + 5)
         try:
             res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
@@ -611,16 +666,15 @@ class DerivSniperBot:
                     self.consecutive_losses += 1
                     self.total_losses_today += 1
 
-                    # ✅ Martingale 2x with safety caps
+                    # ✅ Martingale 2x based on what we ACTUALLY used
                     self.martingale_step = min(self.martingale_step + 1, MARTINGALE_MAX_STEPS)
-                    next_stake = BASE_STAKE * (MARTINGALE_MULT ** self.martingale_step)
+                    next_stake = float(stake_used) * float(MARTINGALE_MULT)
                     self.current_stake = min(next_stake, MARTINGALE_MAX_STAKE)
                 else:
                     self.consecutive_losses = 0
                     self.martingale_step = 0
-                    self.current_stake = BASE_STAKE
+                    self.current_stake = None  # next trade goes back to Deriv MIN
 
-                # ✅ Pause if daily target hit
                 if self.total_profit_today >= DAILY_PROFIT_TARGET:
                     self.pause_until = self._next_midnight_epoch()
 
@@ -630,13 +684,15 @@ class DerivSniperBot:
             if time.time() < self.pause_until:
                 pause_note = f"\n⏸ Paused until 12:00am WAT"
 
+            next_stake_label = "Deriv MIN" if (self.martingale_step == 0 or self.current_stake is None) else f"${self.current_stake:.2f}"
+
             await self.app.bot.send_message(
                 TELEGRAM_CHAT_ID,
                 (
                     f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n"
                     f"📊 Today: {self.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {self.total_losses_today} | Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
                     f"💵 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
-                    f"🧪 Next Stake: ${self.current_stake:.2f} (step {self.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
+                    f"🧪 Next Stake: {next_stake_label} (step {self.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
                     f"💰 Balance: {self.balance}"
                     f"{pause_note}"
                 )
@@ -716,6 +772,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"📌 Strategy: Trend(EMA20/EMA50) + EMA50 Slope + Pullback touch EMA20 + Confirm color + Close vs EMA20 + RSI (M1)\n"
             f"🕯 Timeframe: M1\n"
             f"⏱ Expiry: {DURATION_MIN}m\n"
+            f"💵 Stake: Deriv MIN (auto)\n"
             f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n"
             f"🧪 Martingale: {MARTINGALE_MULT}x (max steps {MARTINGALE_MAX_STEPS}, max stake ${MARTINGALE_MAX_STAKE:.2f})",
             reply_markup=main_keyboard()
@@ -749,10 +806,13 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if time.time() < bot_logic.pause_until:
             pause_line = f"⏸ Paused until 12:00am WAT\n"
 
+        next_stake_label = "Deriv MIN" if (bot_logic.martingale_step == 0 or bot_logic.current_stake is None) else f"${bot_logic.current_stake:.2f}"
+
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
             f"{pause_line}"
+            f"💵 Stake: Deriv MIN (auto)\n"
             f"📌 Strategy: Trend + EMA50Slope + Pullback + ConfirmColor + CloseVsEMA20 + RSI (M1)\n"
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
             f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
@@ -760,7 +820,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
             f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
             f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
-            f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | 🧪 Next Stake: ${bot_logic.current_stake:.2f} (step {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
+            f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | 🧪 Next Stake: {next_stake_label} (step {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
             f"🚦 Gate: {gate}\n"
             f"💰 Balance: {bot_logic.balance}\n"
         )
@@ -777,6 +837,7 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "📌 Strategy: Trend + EMA50Slope + Pullback + ConfirmColor + CloseVsEMA20 + RSI (M1)\n"
         "🕯 Timeframe: M1\n"
         f"⏱ Expiry: {DURATION_MIN}m\n"
+        f"💵 Stake: Deriv MIN (auto)\n"
         f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n"
         f"🧪 Martingale: {MARTINGALE_MULT}x (max steps {MARTINGALE_MAX_STEPS}, max stake ${MARTINGALE_MAX_STAKE:.2f})\n",
         reply_markup=main_keyboard()
