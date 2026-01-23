@@ -19,7 +19,7 @@ MARKETS = ["R_10", "R_25", "R_50"]
 COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 60
 MAX_CONSEC_LOSSES = 5  # ✅ CHANGED from 10 to 5
-BASE_STAKE = 0.52
+BASE_STAKE = 1.00
 
 TELEGRAM_TOKEN = "8253450930:AAHUhPk9TML-8kZlA9UaHZZvTUGdurN9MVY"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -560,7 +560,11 @@ class DerivSniperBot:
                 return
 
             try:
-                stake = float(self.current_stake if source == "AUTO" else BASE_STAKE)
+                # ✅ ADDED: enforce Deriv minimum + safe rounding
+                stake = round(max(
+                    (self.current_stake if source == "AUTO" else BASE_STAKE),
+                    0.35
+                ), 2)
 
                 prop = await self.api.proposal({
                     "proposal": 1,
