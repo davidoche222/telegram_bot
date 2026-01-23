@@ -45,14 +45,15 @@ DAILY_PROFIT_TARGET = 5.0
 
 # ========================= PAYOUT MODE =========================
 USE_PAYOUT_MODE = True
-PAYOUT_TARGET = 0.74          # ✅ payout = $0.74 (base payout)
+PAYOUT_TARGET = 0.74          # ✅ payout = $0.74
 MAX_STAKE_ALLOWED = 5.00      # safety cap: if Deriv needs > this stake, skip trade
-BUY_PRICE_BUFFER = 0.02       # kept (not used in the fixed max cap flow, but left as-is)
+BUY_PRICE_BUFFER = 0.02       # kept
 
-# ========================= MARTINGALE SETTINGS (NOW ACTIVE IN PAYOUT MODE) =========================
+# ========================= MARTINGALE SETTINGS (ACTIVE IN PAYOUT MODE) =========================
 MARTINGALE_MULT = 2.0
 MARTINGALE_MAX_STEPS = 4
-MARTINGALE_MAX_STAKE = 16.0   # kept (not used directly; stake is controlled by Deriv in payout mode)
+MARTINGALE_MAX_STAKE = 16.0
+
 
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period: int):
@@ -121,15 +122,17 @@ def money2(x: float) -> float:
     return math.ceil(float(x) * 100.0) / 100.0
 
 
-# ✅ NEW: Deriv can be picky; always send payout as a safe string >= 0.01
-def payout_str(x) -> str:
+# ✅ NEW: Deriv min payout guard, return FLOAT (NOT STRING)
+def payout_float(x) -> float:
     try:
         v = float(x)
     except Exception:
         v = 0.0
-    if not np.isfinite(v) or v < 0.01:
-        v = 0.01
-    return f"{v:.2f}"
+    if not np.isfinite(v) or v < 0.001:
+        v = 0.001
+    # keep 3dp safety for Deriv min rules, but fine for normal values like 0.74
+    v = float(f"{v:.3f}")
+    return v
 
 
 # ========================= BOT CORE =========================
@@ -168,10 +171,11 @@ class DerivSniperBot:
         self.current_day = datetime.now(self.tz).date()
         self.pause_until = 0.0
 
-    # ✅ NEW: Martingale in payout-mode = increase PAYOUT after losses
+    # ✅ Martingale in payout-mode = increase PAYOUT after losses
     def get_martingale_payout(self) -> float:
         step = min(self.martingale_step, MARTINGALE_MAX_STEPS)
-        return float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** step)
+        base = payout_float(PAYOUT_TARGET)
+        return payout_float(base * (float(MARTINGALE_MULT) ** step))
 
     async def connect(self) -> bool:
         try:
@@ -517,15 +521,14 @@ class DerivSniperBot:
                 return
 
             try:
-                # ✅ payout mode + martingale payout
-                raw_payout = self.get_martingale_payout()
-                payout = payout_str(raw_payout)  # ✅ send as STRING, always >= 0.01
-                payout_f = float(payout)
+                payout_amt = float(self.get_martingale_payout())  # ✅ FLOAT
+                if payout_amt < 0.001:
+                    payout_amt = 0.001
 
                 proposal_req = {
                     "proposal": 1,
-                    "amount": payout,          # ✅ payout STRING
-                    "basis": "payout",         # ✅ payout mode (NOT stake)
+                    "amount": payout_amt,     # ✅ FLOAT (this fixes your min payout error)
+                    "basis": "payout",        # ✅ STILL PAYOUT MODE (NOT stake)
                     "contract_type": side,
                     "currency": "USD",
                     "duration": int(DURATION_MIN),
@@ -533,7 +536,6 @@ class DerivSniperBot:
                     "symbol": symbol
                 }
 
-                # ---- Attempt 1 ----
                 prop = await self.api.proposal(proposal_req)
                 if "error" in prop:
                     err = prop["error"].get("message", "Proposal error")
@@ -550,17 +552,14 @@ class DerivSniperBot:
                 if ask_price > float(MAX_STAKE_ALLOWED):
                     await self.app.bot.send_message(
                         TELEGRAM_CHAT_ID,
-                        f"⛔️ Skipped trade: payout=${payout_f:.2f} needs stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
+                        f"⛔️ Skipped trade: payout=${payout_amt:.2f} needs stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
                     )
                     self.cooldown_until = time.time() + COOLDOWN_SEC
                     return
 
-                # ✅ fixed max cap to prevent 0.00 -> x.xx mismatch
                 buy_price_cap = float(MAX_STAKE_ALLOWED)
-
                 buy = await self.api.buy({"buy": proposal_id, "price": buy_price_cap})
 
-                # one retry if market moved too much
                 if "error" in buy:
                     err_msg = str(buy["error"].get("message", "Buy error"))
                     low = err_msg.lower()
@@ -585,7 +584,7 @@ class DerivSniperBot:
                         if ask_price2 > float(MAX_STAKE_ALLOWED):
                             await self.app.bot.send_message(
                                 TELEGRAM_CHAT_ID,
-                                f"⛔️ Skipped (retry): payout=${payout_f:.2f} needs stake=${ask_price2:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
+                                f"⛔️ Skipped (retry): payout=${payout_amt:.2f} needs stake=${ask_price2:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
                             )
                             self.cooldown_until = time.time() + COOLDOWN_SEC
                             return
@@ -618,7 +617,7 @@ class DerivSniperBot:
                     f"🚀 {side} TRADE OPENED\n"
                     f"🛒 Market: {safe_symbol}\n"
                     f"⏱ Expiry: {DURATION_MIN}m\n"
-                    f"🎁 Payout: ${payout_f:.2f}\n"
+                    f"🎁 Payout: ${payout_amt:.2f}\n"
                     f"🎲 MG Step: {self.martingale_step}/{MARTINGALE_MAX_STEPS} (x{MARTINGALE_MULT})\n"
                     f"💵 Stake (Deriv): ${ask_price:.2f}\n"
                     f"🧾 Buy cap used: ${buy_price_cap:.2f}\n"
