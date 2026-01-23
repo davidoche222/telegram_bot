@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -36,6 +36,19 @@ SCAN_SLEEP_SEC = 2  # used only as a small idle; main wait is candle-sync
 
 RSI_PERIOD = 14
 DURATION_MIN = 1  # ✅ 1-minute expiry
+
+# ========================= NEW: EMA50 SLOPE + MARTINGALE + DAILY TARGET =========================
+# EMA50 slope filter (trend quality)
+EMA_SLOPE_LOOKBACK = 10          # compare EMA50 now vs 10 candles back
+EMA_SLOPE_MIN = 0.0              # 0.0 means must be rising/falling
+
+# Martingale 2x (AUTO only) - ⚠️ risky, safety-capped
+MARTINGALE_MULT = 2.0
+MARTINGALE_MAX_STEPS = 4         # max doubles (BASE * 2^4 = 16x)
+MARTINGALE_MAX_STAKE = 16.0      # extra absolute cap
+
+# Daily profit target: stop trading after +$5 until 12:00am WAT
+DAILY_PROFIT_TARGET = 5.0
 
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period: int):
@@ -120,11 +133,20 @@ class DerivSniperBot:
         self.consecutive_losses = 0
         self.total_profit_today = 0.0
         self.balance = "0.00"
+
+        # ✅ Martingale state
         self.current_stake = BASE_STAKE
+        self.martingale_step = 0
+
         self.trade_lock = asyncio.Lock()
 
         self.market_debug = {m: {} for m in MARKETS}
         self.last_processed_closed_t0 = {m: 0 for m in MARKETS}
+
+        # ✅ Daily controls
+        self.tz = ZoneInfo("Africa/Lagos")
+        self.current_day = datetime.now(self.tz).date()
+        self.pause_until = 0.0  # epoch, 0 means not paused
 
     async def connect(self) -> bool:
         try:
@@ -182,7 +204,38 @@ class DerivSniperBot:
         except:
             pass
 
+    # ========================= DAILY RESET / PAUSE =========================
+    def _next_midnight_epoch(self) -> float:
+        now = datetime.now(self.tz)
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return next_midnight.timestamp()
+
+    def _daily_reset_if_needed(self):
+        today = datetime.now(self.tz).date()
+        if today != self.current_day:
+            self.current_day = today
+            self.trades_today = 0
+            self.total_losses_today = 0
+            self.consecutive_losses = 0
+            self.total_profit_today = 0.0
+            self.cooldown_until = 0.0
+            self.pause_until = 0.0
+            self.martingale_step = 0
+            self.current_stake = BASE_STAKE
+    # ========================= END DAILY RESET / PAUSE =========================
+
     def can_auto_trade(self) -> tuple[bool, str]:
+        self._daily_reset_if_needed()
+
+        if time.time() < self.pause_until:
+            left = int(self.pause_until - time.time())
+            return False, f"Paused until 12:00am WAT ({left}s)"
+
+        # pause for day if profit target reached
+        if self.total_profit_today >= DAILY_PROFIT_TARGET:
+            self.pause_until = self._next_midnight_epoch()
+            return False, f"Daily target reached (+${self.total_profit_today:.2f})"
+
         if self.consecutive_losses >= MAX_CONSEC_LOSSES:
             return False, "Stopped: max loss streak reached"
         if self.trades_today >= MAX_TRADES_PER_DAY:
@@ -273,6 +326,19 @@ class DerivSniperBot:
                 ema20_confirm = float(ema20_arr[-2])
                 ema50_confirm = float(ema50_arr[-2])
 
+                # ✅ EMA50 slope filter
+                # (uses closed candles only; ensure index exists)
+                slope_ok = False
+                ema50_slope = 0.0
+                ema50_rising = False
+                ema50_falling = False
+                if len(ema50_arr) >= (EMA_SLOPE_LOOKBACK + 3):
+                    ema50_prev = float(ema50_arr[-(EMA_SLOPE_LOOKBACK + 2)])
+                    ema50_slope = ema50_confirm - ema50_prev
+                    ema50_rising = ema50_slope > EMA_SLOPE_MIN
+                    ema50_falling = ema50_slope < -EMA_SLOPE_MIN
+                    slope_ok = True
+
                 rsi_arr = calculate_rsi(closes, RSI_PERIOD)
                 if len(rsi_arr) < 60 or np.isnan(rsi_arr[-2]):
                     self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["RSI not ready yet."]}
@@ -291,7 +357,7 @@ class DerivSniperBot:
                 bull_confirm = c_close > c_open
                 bear_confirm = c_close < c_open
 
-                # ✅ NEW: confirm candle must close above/below EMA20
+                # ✅ Confirm candle must close above/below EMA20_confirm
                 close_above_ema20 = c_close > ema20_confirm
                 close_below_ema20 = c_close < ema20_confirm
 
@@ -322,11 +388,12 @@ class DerivSniperBot:
                 call_rsi_ok = (rsi_call_min <= rsi_now <= rsi_call_max)
                 put_rsi_ok = (rsi_put_min <= rsi_now <= rsi_put_max)
 
-                # ✅ UPDATED entry rules:
-                # CALL: confirm candle green AND close above EMA20_confirm
-                # PUT : confirm candle red   AND close below EMA20_confirm
+                # ✅ UPDATED entry rules + EMA50 slope:
+                # CALL needs EMA50 rising
+                # PUT needs EMA50 falling
                 call_ready = (
                     uptrend
+                    and slope_ok and ema50_rising
                     and touched_ema20
                     and bull_confirm
                     and close_above_ema20
@@ -337,6 +404,7 @@ class DerivSniperBot:
 
                 put_ready = (
                     downtrend
+                    and slope_ok and ema50_falling
                     and touched_ema20
                     and bear_confirm
                     and close_below_ema20
@@ -352,13 +420,21 @@ class DerivSniperBot:
                 trend_strength = "STRONG" if not flat_block else "WEAK"
                 pullback_label = "PULLBACK TOUCHED ✅" if touched_ema20 else "WAITING PULLBACK…"
 
-                confirm_close_label = "CONFIRM CLOSE > EMA20 ✅" if close_above_ema20 else "CONFIRM CLOSE < EMA20 ✅" if close_below_ema20 else "CONFIRM CLOSE ON EMA20"
+                confirm_close_label = (
+                    "CONFIRM CLOSE > EMA20 ✅" if close_above_ema20 else
+                    "CONFIRM CLOSE < EMA20 ✅" if close_below_ema20 else
+                    "CONFIRM CLOSE ON EMA20"
+                )
+
+                slope_label = "EMA50 SLOPE ↑" if ema50_rising else "EMA50 SLOPE ↓" if ema50_falling else "EMA50 SLOPE FLAT"
 
                 block_label = []
                 if spike_block:
                     block_label.append("SPIKE BLOCK")
                 if flat_block:
                     block_label.append("WEAK/FLAT TREND")
+                if not slope_ok:
+                    block_label.append("SLOPE N/A")
                 block_label = " | ".join(block_label) if block_label else "OK"
 
                 why = []
@@ -371,10 +447,15 @@ class DerivSniperBot:
                         why.append("Waiting: trend direction")
                     elif trend_strength != "STRONG":
                         why.append("Waiting: strong trend")
+                    elif not slope_ok:
+                        why.append("Waiting: EMA50 slope data")
+                    elif uptrend and not ema50_rising:
+                        why.append("Waiting: EMA50 slope rising")
+                    elif downtrend and not ema50_falling:
+                        why.append("Waiting: EMA50 slope falling")
                     elif not touched_ema20:
                         why.append("Waiting: pullback touch EMA20")
                     else:
-                        # show what confirmation is missing
                         if uptrend:
                             if not bull_confirm:
                                 why.append("Waiting: confirm candle GREEN")
@@ -408,6 +489,8 @@ class DerivSniperBot:
                     "pullback_label": pullback_label,
                     "block_label": block_label,
                     "confirm_close_label": confirm_close_label,
+                    "slope_label": slope_label,
+                    "ema50_slope": ema50_slope,
 
                     "ema20_pullback": ema20_pullback,
                     "ema20": ema20_confirm,
@@ -433,9 +516,19 @@ class DerivSniperBot:
                     await self._sync_to_next_candle_open(confirm_t0)
 
                 if call_ready:
-                    await self.execute_trade("CALL", symbol, reason="Trend + PullbackTouch + ConfirmGreen + Close>EMA20 + RSI + Filters", source="AUTO")
+                    await self.execute_trade(
+                        "CALL",
+                        symbol,
+                        reason="Trend + EMA50SlopeUp + PullbackTouch + ConfirmGreen + Close>EMA20 + RSI + Filters",
+                        source="AUTO"
+                    )
                 elif put_ready:
-                    await self.execute_trade("PUT", symbol, reason="Trend + PullbackTouch + ConfirmRed + Close<EMA20 + RSI + Filters", source="AUTO")
+                    await self.execute_trade(
+                        "PUT",
+                        symbol,
+                        reason="Trend + EMA50SlopeDown + PullbackTouch + ConfirmRed + Close<EMA20 + RSI + Filters",
+                        source="AUTO"
+                    )
 
                 await asyncio.sleep(0.25)
 
@@ -495,7 +588,9 @@ class DerivSniperBot:
                     f"🛒 Market: {safe_symbol}\n"
                     f"⏱ Expiry: {DURATION_MIN}m\n"
                     f"🧠 Reason: {reason}\n"
-                    f"🤖 Source: {source}"
+                    f"🤖 Source: {source}\n"
+                    f"🎯 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
+                    f"🧪 Martingale: step {self.martingale_step}/{MARTINGALE_MAX_STEPS}"
                 )
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
                 asyncio.create_task(self.check_result(self.active_trade_info, source))
@@ -511,22 +606,39 @@ class DerivSniperBot:
 
             if source == "AUTO":
                 self.total_profit_today += profit
+
                 if profit <= 0:
                     self.consecutive_losses += 1
                     self.total_losses_today += 1
+
+                    # ✅ Martingale 2x with safety caps
+                    self.martingale_step = min(self.martingale_step + 1, MARTINGALE_MAX_STEPS)
+                    next_stake = BASE_STAKE * (MARTINGALE_MULT ** self.martingale_step)
+                    self.current_stake = min(next_stake, MARTINGALE_MAX_STAKE)
                 else:
                     self.consecutive_losses = 0
+                    self.martingale_step = 0
+                    self.current_stake = BASE_STAKE
 
-                self.current_stake = BASE_STAKE
+                # ✅ Pause if daily target hit
+                if self.total_profit_today >= DAILY_PROFIT_TARGET:
+                    self.pause_until = self._next_midnight_epoch()
 
             await self.fetch_balance()
+
+            pause_note = ""
+            if time.time() < self.pause_until:
+                pause_note = f"\n⏸ Paused until 12:00am WAT"
+
             await self.app.bot.send_message(
                 TELEGRAM_CHAT_ID,
                 (
                     f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n"
                     f"📊 Today: {self.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {self.total_losses_today} | Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
-                    f"🧪 Next Stake: ${self.current_stake:.2f}\n"
+                    f"💵 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
+                    f"🧪 Next Stake: ${self.current_stake:.2f} (step {self.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
                     f"💰 Balance: {self.balance}"
+                    f"{pause_note}"
                 )
             )
         finally:
@@ -563,6 +675,7 @@ def format_market_detail(sym: str, d: dict) -> str:
     pullback_label = d.get("pullback_label", "—")
     block_label = d.get("block_label", "—")
     confirm_close_label = d.get("confirm_close_label", "—")
+    slope_label = d.get("slope_label", "—")
 
     return (
         f"📍 {sym.replace('_',' ')} ({age}s)\n"
@@ -571,6 +684,7 @@ def format_market_detail(sym: str, d: dict) -> str:
         f"────────────────\n"
         f"Trend: {trend_label} ({trend_strength})\n"
         f"{ema_label}\n"
+        f"{slope_label}\n"
         f"{pullback_label}\n"
         f"{confirm_close_label}\n"
         f"Filters: {block_label}\n"
@@ -599,9 +713,11 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
         await q.edit_message_text(
             f"🔍 SCANNER ACTIVE\n"
-            f"📌 Strategy: Trend (EMA20/EMA50) + Pullback touch EMA20 + Confirm color + Confirm close vs EMA20 + RSI (M1)\n"
+            f"📌 Strategy: Trend(EMA20/EMA50) + EMA50 Slope + Pullback touch EMA20 + Confirm color + Close vs EMA20 + RSI (M1)\n"
             f"🕯 Timeframe: M1\n"
-            f"⏱ Expiry: {DURATION_MIN}m",
+            f"⏱ Expiry: {DURATION_MIN}m\n"
+            f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n"
+            f"🧪 Martingale: {MARTINGALE_MULT}x (max steps {MARTINGALE_MAX_STEPS}, max stake ${MARTINGALE_MAX_STAKE:.2f})",
             reply_markup=main_keyboard()
         )
 
@@ -629,16 +745,22 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except:
                 trade_status = "🚀 Active Trade: Syncing..."
 
+        pause_line = ""
+        if time.time() < bot_logic.pause_until:
+            pause_line = f"⏸ Paused until 12:00am WAT\n"
+
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"📌 Strategy: Trend + Pullback + ConfirmColor + CloseVsEMA20 + RSI (M1)\n"
+            f"{pause_line}"
+            f"📌 Strategy: Trend + EMA50Slope + Pullback + ConfirmColor + CloseVsEMA20 + RSI (M1)\n"
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
+            f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
             f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
             f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
-            f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | 🧪 Next Stake: ${bot_logic.current_stake:.2f}\n"
+            f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | 🧪 Next Stake: ${bot_logic.current_stake:.2f} (step {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
             f"🚦 Gate: {gate}\n"
             f"💰 Balance: {bot_logic.balance}\n"
         )
@@ -652,9 +774,11 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         "💎 Deriv Bot\n"
-        "📌 Strategy: Trend + Pullback + ConfirmColor + CloseVsEMA20 + RSI (M1)\n"
+        "📌 Strategy: Trend + EMA50Slope + Pullback + ConfirmColor + CloseVsEMA20 + RSI (M1)\n"
         "🕯 Timeframe: M1\n"
-        f"⏱ Expiry: {DURATION_MIN}m\n",
+        f"⏱ Expiry: {DURATION_MIN}m\n"
+        f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n"
+        f"🧪 Martingale: {MARTINGALE_MULT}x (max steps {MARTINGALE_MAX_STEPS}, max stake ${MARTINGALE_MAX_STAKE:.2f})\n",
         reply_markup=main_keyboard()
     )
 
