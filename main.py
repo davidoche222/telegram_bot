@@ -36,12 +36,12 @@ CANDLES_COUNT = 150
 SCAN_SLEEP_SEC = 2
 
 RSI_PERIOD = 14
-DURATION_MIN = 1  # 1-minute expiry
+DURATION_MIN = 1 # 1-minute expiry
 
 # ========================= EMA50 SLOPE + DAILY TARGET =========================
 EMA_SLOPE_LOOKBACK = 10
 EMA_SLOPE_MIN = 0.0
-DAILY_PROFIT_TARGET = 1
+DAILY_PROFIT_TARGET = 0.96
 
 # ========================= PAYOUT MODE =========================
 USE_PAYOUT_MODE = True
