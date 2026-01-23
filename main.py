@@ -18,7 +18,7 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "2hsJzopRHG5w"  # replace with your full real token
 APP_ID = 1089
 
-MARKETS = ["R_10", "R_25", "R_50"]
+MARKETS = ["R_10"]
 
 COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 60
