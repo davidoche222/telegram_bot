@@ -1,3 +1,7 @@
+# ⚠️ SECURITY NOTE:
+# You posted your Deriv + Telegram tokens publicly in this chat.
+# Regenerate/revoke them in Deriv and BotFather, then replace below.
+
 import asyncio
 import logging
 import time
@@ -11,15 +15,14 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 # ========================= CONFIG =========================
 DEMO_TOKEN = "tIrfitLjqeBxCOM"
-REAL_TOKEN = "2hsJzopRHG5w"
+REAL_TOKEN = "2hsJzopRHG5w"  # (looks short/incomplete) replace with your full real token
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50"]
 
 COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 60
-MAX_CONSEC_LOSSES = 5  # ✅ CHANGED from 10 to 5
-BASE_STAKE = 0.52      # ✅ CHANGED from 1.00 to 0.52
+MAX_CONSEC_LOSSES = 10
 
 TELEGRAM_TOKEN = "8253450930:AAHUhPk9TML-8kZlA9UaHZZvTUGdurN9MVY"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -29,26 +32,33 @@ logger = logging.getLogger(__name__)
 
 # ========================= STRATEGY SETTINGS =========================
 TF_SEC = 60  # M1 candles
-
-# ✅ Reduce API pressure (still enough for EMA50 + RSI)
 CANDLES_COUNT = 150
-SCAN_SLEEP_SEC = 2  # used only as a small idle; main wait is candle-sync
+SCAN_SLEEP_SEC = 2
 
 RSI_PERIOD = 14
-DURATION_MIN = 1  # ✅ 1-minute expiry
+DURATION_MIN = 1  # 1-minute expiry
 
-# ========================= NEW: EMA50 SLOPE + MARTINGALE + DAILY TARGET =========================
-# EMA50 slope filter (trend quality)
-EMA_SLOPE_LOOKBACK = 10          # compare EMA50 now vs 10 candles back
-EMA_SLOPE_MIN = 0.0              # 0.0 means must be rising/falling
+# ========================= EMA50 SLOPE + DAILY TARGET =========================
+EMA_SLOPE_LOOKBACK = 10
+EMA_SLOPE_MIN = 0.0
 
-# Martingale 2x (AUTO only) - ⚠️ risky, safety-capped
-MARTINGALE_MULT = 2.0
-MARTINGALE_MAX_STEPS = 4         # max doubles (BASE * 2^4 = 16x)
-MARTINGALE_MAX_STAKE = 16.0      # extra absolute cap
-
-# Daily profit target: stop trading after +$5 until 12:00am WAT
 DAILY_PROFIT_TARGET = 5.0
+
+# ========================= PAYOUT MODE (✅ FIXED PAYOUT = $1) =========================
+USE_PAYOUT_MODE = True
+PAYOUT_TARGET = 1.00          # ✅ YOU WANTED PAYOUT = $1
+MAX_STAKE_ALLOWED = 5.00      # safety cap: if Deriv needs > this stake for $1 payout, we skip trade
+BUY_PRICE_BUFFER = 0.02       # buffer above ask_price to avoid rounding/refusal
+
+# NOTE:
+# When you use payout mode, Deriv chooses the stake required to achieve payout=$1.
+# Because payout is fixed, Martingale-by-stake does NOT apply cleanly here.
+# So we keep your martingale variables for display only (no stake-multiplying).
+
+# ========================= MARTINGALE SETTINGS (kept for display only) =========================
+MARTINGALE_MULT = 2.0
+MARTINGALE_MAX_STEPS = 4
+MARTINGALE_MAX_STAKE = 16.0
 
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period: int):
@@ -111,6 +121,11 @@ def fmt_time_hhmmss(epoch):
         return "—"
 
 
+def money2(x: float) -> float:
+    # stable 2dp rounding for prices
+    return float(f"{x:.2f}")
+
+
 # ========================= BOT CORE =========================
 class DerivSniperBot:
     def __init__(self):
@@ -134,8 +149,8 @@ class DerivSniperBot:
         self.total_profit_today = 0.0
         self.balance = "0.00"
 
-        # ✅ Martingale state
-        self.current_stake = BASE_STAKE
+        # kept for UI display
+        self.current_stake = 0.0
         self.martingale_step = 0
 
         self.trade_lock = asyncio.Lock()
@@ -143,10 +158,9 @@ class DerivSniperBot:
         self.market_debug = {m: {} for m in MARKETS}
         self.last_processed_closed_t0 = {m: 0 for m in MARKETS}
 
-        # ✅ Daily controls
         self.tz = ZoneInfo("Africa/Lagos")
         self.current_day = datetime.now(self.tz).date()
-        self.pause_until = 0.0  # epoch, 0 means not paused
+        self.pause_until = 0.0
 
     async def connect(self) -> bool:
         try:
@@ -221,8 +235,7 @@ class DerivSniperBot:
             self.cooldown_until = 0.0
             self.pause_until = 0.0
             self.martingale_step = 0
-            self.current_stake = BASE_STAKE
-    # ========================= END DAILY RESET / PAUSE =========================
+            self.current_stake = 0.0
 
     def can_auto_trade(self) -> tuple[bool, str]:
         self._daily_reset_if_needed()
@@ -231,7 +244,6 @@ class DerivSniperBot:
             left = int(self.pause_until - time.time())
             return False, f"Paused until 12:00am WAT ({left}s)"
 
-        # pause for day if profit target reached
         if self.total_profit_today >= DAILY_PROFIT_TARGET:
             self.pause_until = self._next_midnight_epoch()
             return False, f"Daily target reached (+${self.total_profit_today:.2f})"
@@ -307,7 +319,6 @@ class DerivSniperBot:
                 confirm = candles[-2]
                 confirm_t0 = int(confirm["t0"])
 
-                # ✅ Rate-limit fix: if no new candle, wait instead of spamming API
                 if self.last_processed_closed_t0[symbol] == confirm_t0:
                     await self._sync_to_next_candle_open(confirm_t0)
                     continue
@@ -321,13 +332,10 @@ class DerivSniperBot:
                     await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
 
-                # ✅ aligned EMA values
                 ema20_pullback = float(ema20_arr[-3])
                 ema20_confirm = float(ema20_arr[-2])
                 ema50_confirm = float(ema50_arr[-2])
 
-                # ✅ EMA50 slope filter
-                # (uses closed candles only; ensure index exists)
                 slope_ok = False
                 ema50_slope = 0.0
                 ema50_rising = False
@@ -346,22 +354,18 @@ class DerivSniperBot:
                     continue
                 rsi_now = float(rsi_arr[-2])
 
-                # Pullback touch EMA20 (aligned to pullback candle)
                 pb_high = float(pullback["h"])
                 pb_low = float(pullback["l"])
                 touched_ema20 = (pb_low <= ema20_pullback <= pb_high)
 
-                # Confirm candle color
                 c_open = float(confirm["o"])
                 c_close = float(confirm["c"])
                 bull_confirm = c_close > c_open
                 bear_confirm = c_close < c_open
 
-                # ✅ Confirm candle must close above/below EMA20_confirm
                 close_above_ema20 = c_close > ema20_confirm
                 close_below_ema20 = c_close < ema20_confirm
 
-                # Spike filter
                 bodies = [abs(float(candles[i]["c"]) - float(candles[i]["o"])) for i in range(-22, -2)]
                 avg_body = float(np.mean(bodies)) if len(bodies) >= 10 else float(np.mean([abs(float(c["c"]) - float(c["o"])) for c in candles[-60:-2]]))
                 last_body = abs(c_close - c_open)
@@ -439,8 +443,6 @@ class DerivSniperBot:
                     why.append(f"Gate blocked: {gate}")
                 if signal:
                     why.append(f"READY: {signal} (enter next candle)")
-                else:
-                    why.append("Waiting: setup")
 
                 self.market_debug[symbol] = {
                     "time": time.time(),
@@ -455,6 +457,11 @@ class DerivSniperBot:
                     "confirm_close_label": confirm_close_label,
                     "slope_label": slope_label,
                     "ema50_slope": ema50_slope,
+                    "rsi_now": rsi_now,
+                    "avg_body": avg_body,
+                    "last_body": last_body,
+                    "spike_block": spike_block,
+                    "flat_block": flat_block,
                     "why": why[:10],
                 }
 
@@ -502,6 +509,7 @@ class DerivSniperBot:
 
             await asyncio.sleep(SCAN_SLEEP_SEC)
 
+    # ========================= ✅ UPDATED TRADE EXECUTION (PAYOUT=$1) =========================
     async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL"):
         if not self.api or self.active_trade_info:
             return
@@ -512,48 +520,80 @@ class DerivSniperBot:
                 return
 
             try:
-                # enforce Deriv minimum + safe rounding
-                stake = round(max(
-                    (self.current_stake if source == "AUTO" else BASE_STAKE),
-                    0.35
-                ), 2)
+                payout = float(PAYOUT_TARGET)  # ✅ always $1 payout
 
-                prop = await self.api.proposal({
+                proposal_req = {
                     "proposal": 1,
-                    "amount": stake,
-                    "basis": "stake",
+                    "amount": payout,
+                    "basis": "payout",          # ✅ payout mode
                     "contract_type": side,
                     "currency": "USD",
                     "duration": int(DURATION_MIN),
                     "duration_unit": "m",
                     "symbol": symbol
-                })
+                }
 
-                # ✅ CHANGED: use stake as the buy price in stake-mode
-                buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": stake})
+                prop = await self.api.proposal(proposal_req)
+                if "error" in prop:
+                    err = prop["error"].get("message", "Proposal error")
+                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Proposal Error:\n{err}")
+                    return
+
+                p = prop["proposal"]
+                proposal_id = p["id"]
+                ask_price = float(p.get("ask_price", 0.0))
+                if ask_price <= 0:
+                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, "❌ Proposal returned invalid ask_price.")
+                    return
+
+                # ✅ safety cap: if stake required for payout=$1 is too high, skip trade
+                if ask_price > float(MAX_STAKE_ALLOWED):
+                    await self.app.bot.send_message(
+                        TELEGRAM_CHAT_ID,
+                        f"⛔️ Skipped trade: payout=${payout:.2f} needs stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
+                    )
+                    self.cooldown_until = time.time() + COOLDOWN_SEC
+                    return
+
+                buy_price_cap = money2(ask_price + BUY_PRICE_BUFFER)
+
+                buy = await self.api.buy({"buy": proposal_id, "price": buy_price_cap})
+                if "error" in buy:
+                    err = buy["error"].get("message", "Buy error")
+                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Trade Refused:\n{err}")
+                    return
 
                 self.active_trade_info = int(buy["buy"]["contract_id"])
                 self.active_market = symbol
                 self.trade_start_time = time.time()
+
+                # for UI display
+                self.current_stake = ask_price
 
                 if source == "AUTO":
                     self.trades_today += 1
 
                 safe_symbol = str(symbol).replace("_", " ")
                 msg = (
-                    f"🚀 {side} TRADE OPENED (${stake:.2f})\n"
+                    f"🚀 {side} TRADE OPENED\n"
                     f"🛒 Market: {safe_symbol}\n"
                     f"⏱ Expiry: {DURATION_MIN}m\n"
+                    f"🎁 Payout: ${payout:.2f}\n"
+                    f"💵 Stake (Deriv): ${ask_price:.2f}\n"
+                    f"🧾 Buy cap used: ${buy_price_cap:.2f}\n"
                     f"🧠 Reason: {reason}\n"
                     f"🤖 Source: {source}\n"
-                    f"🎯 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
-                    f"🧪 Martingale: step {self.martingale_step}/{MARTINGALE_MAX_STEPS}"
+                    f"🎯 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}"
                 )
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
                 asyncio.create_task(self.check_result(self.active_trade_info, source))
 
             except Exception as e:
                 logger.error(f"Trade error: {e}")
+                try:
+                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"⚠️ Trade error:\n{e}")
+                except:
+                    pass
 
     async def check_result(self, cid: int, source: str):
         await asyncio.sleep(int(DURATION_MIN) * 60 + 5)
@@ -567,14 +607,11 @@ class DerivSniperBot:
                 if profit <= 0:
                     self.consecutive_losses += 1
                     self.total_losses_today += 1
-
+                    # payout is fixed at $1, so we don't martingale the payout/stake here
                     self.martingale_step = min(self.martingale_step + 1, MARTINGALE_MAX_STEPS)
-                    next_stake = BASE_STAKE * (MARTINGALE_MULT ** self.martingale_step)
-                    self.current_stake = min(next_stake, MARTINGALE_MAX_STAKE)
                 else:
                     self.consecutive_losses = 0
                     self.martingale_step = 0
-                    self.current_stake = BASE_STAKE
 
                 if self.total_profit_today >= DAILY_PROFIT_TARGET:
                     self.pause_until = self._next_midnight_epoch()
@@ -591,7 +628,7 @@ class DerivSniperBot:
                     f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n"
                     f"📊 Today: {self.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {self.total_losses_today} | Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
                     f"💵 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
-                    f"🧪 Next Stake: ${self.current_stake:.2f} (step {self.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
+                    f"🎁 Next payout remains: ${PAYOUT_TARGET:.2f}\n"
                     f"💰 Balance: {self.balance}"
                     f"{pause_note}"
                 )
@@ -671,8 +708,9 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"📌 Strategy: Trend(EMA20/EMA50) + EMA50 Slope + Pullback touch EMA20 + Confirm color + Close vs EMA20 + RSI (M1)\n"
             f"🕯 Timeframe: M1\n"
             f"⏱ Expiry: {DURATION_MIN}m\n"
-            f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n"
-            f"🧪 Martingale: {MARTINGALE_MULT}x (max steps {MARTINGALE_MAX_STEPS}, max stake ${MARTINGALE_MAX_STAKE:.2f})",
+            f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} payout per trade\n"
+            f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f} (skips if higher)\n"
+            f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)",
             reply_markup=main_keyboard()
         )
 
@@ -708,14 +746,14 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
             f"{pause_line}"
-            f"📌 Strategy: Trend + EMA50Slope + Pullback + ConfirmColor + CloseVsEMA20 + RSI (M1)\n"
+            f"🎁 Payout mode: ${PAYOUT_TARGET:.2f} | Max stake: ${MAX_STAKE_ALLOWED:.2f}\n"
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
             f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
             f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
             f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
-            f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | 🧪 Next Stake: ${bot_logic.current_stake:.2f} (step {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
+            f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
             f"🚦 Gate: {gate}\n"
             f"💰 Balance: {bot_logic.balance}\n"
         )
@@ -732,8 +770,9 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "📌 Strategy: Trend + EMA50Slope + Pullback + ConfirmColor + CloseVsEMA20 + RSI (M1)\n"
         "🕯 Timeframe: M1\n"
         f"⏱ Expiry: {DURATION_MIN}m\n"
-        f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n"
-        f"🧪 Martingale: {MARTINGALE_MULT}x (max steps {MARTINGALE_MAX_STEPS}, max stake ${MARTINGALE_MAX_STAKE:.2f})\n",
+        f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} payout per trade\n"
+        f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
+        f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n",
         reply_markup=main_keyboard()
     )
 
