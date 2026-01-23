@@ -19,7 +19,7 @@ MARKETS = ["R_10", "R_25", "R_50"]
 COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 60
 MAX_CONSEC_LOSSES = 5  # ✅ CHANGED from 10 to 5
-BASE_STAKE = 1.00
+BASE_STAKE = 0.52      # ✅ CHANGED from 1.00 to 0.52
 
 TELEGRAM_TOKEN = "8253450930:AAHUhPk9TML-8kZlA9UaHZZvTUGdurN9MVY"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -388,9 +388,6 @@ class DerivSniperBot:
                 call_rsi_ok = (rsi_call_min <= rsi_now <= rsi_call_max)
                 put_rsi_ok = (rsi_put_min <= rsi_now <= rsi_put_max)
 
-                # ✅ UPDATED entry rules + EMA50 slope:
-                # CALL needs EMA50 rising
-                # PUT needs EMA50 falling
                 call_ready = (
                     uptrend
                     and slope_ok and ema50_rising
@@ -443,46 +440,13 @@ class DerivSniperBot:
                 if signal:
                     why.append(f"READY: {signal} (enter next candle)")
                 else:
-                    if trend_label == "SIDEWAYS":
-                        why.append("Waiting: trend direction")
-                    elif trend_strength != "STRONG":
-                        why.append("Waiting: strong trend")
-                    elif not slope_ok:
-                        why.append("Waiting: EMA50 slope data")
-                    elif uptrend and not ema50_rising:
-                        why.append("Waiting: EMA50 slope rising")
-                    elif downtrend and not ema50_falling:
-                        why.append("Waiting: EMA50 slope falling")
-                    elif not touched_ema20:
-                        why.append("Waiting: pullback touch EMA20")
-                    else:
-                        if uptrend:
-                            if not bull_confirm:
-                                why.append("Waiting: confirm candle GREEN")
-                            elif not close_above_ema20:
-                                why.append("Waiting: confirm close ABOVE EMA20")
-                            elif not call_rsi_ok:
-                                why.append("Waiting: RSI (CALL zone)")
-                            else:
-                                why.append("Waiting: filters")
-                        elif downtrend:
-                            if not bear_confirm:
-                                why.append("Waiting: confirm candle RED")
-                            elif not close_below_ema20:
-                                why.append("Waiting: confirm close BELOW EMA20")
-                            elif not put_rsi_ok:
-                                why.append("Waiting: RSI (PUT zone)")
-                            else:
-                                why.append("Waiting: filters")
-                        else:
-                            why.append("Waiting: confirmations")
+                    why.append("Waiting: setup")
 
                 self.market_debug[symbol] = {
                     "time": time.time(),
                     "gate": gate,
                     "last_closed": confirm_t0,
                     "signal": signal,
-
                     "trend_label": trend_label,
                     "ema_label": ema_label,
                     "trend_strength": trend_strength,
@@ -491,21 +455,9 @@ class DerivSniperBot:
                     "confirm_close_label": confirm_close_label,
                     "slope_label": slope_label,
                     "ema50_slope": ema50_slope,
-
-                    "ema20_pullback": ema20_pullback,
-                    "ema20": ema20_confirm,
-                    "ema50": ema50_confirm,
-                    "ema_diff": ema_diff,
-                    "rsi_now": rsi_now,
-                    "avg_body": avg_body,
-                    "last_body": last_body,
-                    "spike_block": spike_block,
-                    "flat_block": flat_block,
-
                     "why": why[:10],
                 }
 
-                # mark processed candle
                 self.last_processed_closed_t0[symbol] = confirm_t0
 
                 if not ok_gate:
@@ -560,7 +512,7 @@ class DerivSniperBot:
                 return
 
             try:
-                # ✅ ADDED: enforce Deriv minimum + safe rounding
+                # enforce Deriv minimum + safe rounding
                 stake = round(max(
                     (self.current_stake if source == "AUTO" else BASE_STAKE),
                     0.35
@@ -577,7 +529,8 @@ class DerivSniperBot:
                     "symbol": symbol
                 })
 
-                buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])})
+                # ✅ CHANGED: use stake as the buy price in stake-mode
+                buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": stake})
 
                 self.active_trade_info = int(buy["buy"]["contract_id"])
                 self.active_market = symbol
@@ -615,7 +568,6 @@ class DerivSniperBot:
                     self.consecutive_losses += 1
                     self.total_losses_today += 1
 
-                    # ✅ Martingale 2x with safety caps
                     self.martingale_step = min(self.martingale_step + 1, MARTINGALE_MAX_STEPS)
                     next_stake = BASE_STAKE * (MARTINGALE_MULT ** self.martingale_step)
                     self.current_stake = min(next_stake, MARTINGALE_MAX_STAKE)
@@ -624,7 +576,6 @@ class DerivSniperBot:
                     self.martingale_step = 0
                     self.current_stake = BASE_STAKE
 
-                # ✅ Pause if daily target hit
                 if self.total_profit_today >= DAILY_PROFIT_TARGET:
                     self.pause_until = self._next_midnight_epoch()
 
