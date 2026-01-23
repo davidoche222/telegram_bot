@@ -18,7 +18,7 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "2hsJzopRHG5w"  # replace with your full real token
 APP_ID = 1089
 
-MARKETS = ["R_10"]
+MARKETS = ["R_10", "R_25", "R_50"]
 
 COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 60
@@ -540,18 +540,17 @@ class DerivSniperBot:
                     self.cooldown_until = time.time() + COOLDOWN_SEC
                     return
 
-                # ✅ CHANGED: bigger cap of (ask+buffer) OR (ask*1.10), then round UP
-                buy_price_cap = money2(max(ask_price + BUY_PRICE_BUFFER, ask_price * 1.10))
+                # ✅ CHANGED (ONLY): use a fixed max price cap (prevents 0.00 -> x.xx mismatch)
+                buy_price_cap = float(MAX_STAKE_ALLOWED)
 
                 buy = await self.api.buy({"buy": proposal_id, "price": buy_price_cap})
 
-                # ✅ CHANGED: one retry if market moved too much
+                # ✅ CHANGED: one retry if market moved too much (retry also uses fixed max price cap)
                 if "error" in buy:
                     err_msg = str(buy["error"].get("message", "Buy error"))
                     low = err_msg.lower()
 
                     if ("moved too much" in low) or ("price has changed" in low):
-                        # short wait then retry with a fresh proposal + bigger cap
                         await asyncio.sleep(0.25)
 
                         prop2 = await self.api.proposal(proposal_req)
@@ -576,7 +575,7 @@ class DerivSniperBot:
                             self.cooldown_until = time.time() + COOLDOWN_SEC
                             return
 
-                        buy_price_cap2 = money2(max(ask_price2 + BUY_PRICE_BUFFER, ask_price2 * 1.15))  # a bit more on retry
+                        buy_price_cap2 = float(MAX_STAKE_ALLOWED)
                         buy = await self.api.buy({"buy": proposal_id2, "price": buy_price_cap2})
 
                         if "error" in buy:
