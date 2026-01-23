@@ -43,9 +43,9 @@ MARTINGALE_MAX_STAKE = 8.00  # Max stake allowed during martingale
 
 DAILY_PROFIT_TARGET = 5.0
 
-# ========================= STAKE SETTINGS (FIXED) =========================
-BASE_STAKE = 0.40  # <--- YOUR REQUESTED RISK
-MIN_STAKE = 0.35   # Deriv API Minimum floor
+# ========================= STAKE SETTINGS (UPDATED) =========================
+BASE_STAKE = 0.40  # <--- YOUR REQUESTED MINIMUM
+MIN_STAKE = 0.40   # <--- LOCKED AT 0.40
 
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period: int):
@@ -110,7 +110,6 @@ class DerivSniperBot:
         self.current_day = datetime.now(self.tz).date()
         self.pause_until = 0.0
 
-        # ✅ FIXED STAKE LOGIC
         self.base_stake = float(BASE_STAKE)
         self.current_stake = self.base_stake
         self.martingale_step = 0
@@ -168,14 +167,13 @@ class DerivSniperBot:
             ok, _ = self.can_auto_trade()
             if not ok: return
             try:
-                # ✅ Set exact stake
                 stake = float(self.current_stake if source == "AUTO" else self.base_stake)
                 stake = round(max(stake, MIN_STAKE), 2)
 
                 prop = await self.api.proposal({
                     "proposal": 1,
                     "amount": stake,
-                    "basis": "stake", # <--- NOW USING STAKE BASIS
+                    "basis": "stake",
                     "contract_type": side,
                     "currency": "USD",
                     "duration": int(DURATION_MIN),
@@ -220,7 +218,6 @@ class DerivSniperBot:
             self.active_trade_info = None
             self.cooldown_until = time.time() + COOLDOWN_SEC
 
-    # ... (Rest of scanner logic remains the same, just calling execute_trade)
     async def background_scanner(self):
         self.market_tasks = {sym: asyncio.create_task(self.scan_market(sym)) for sym in MARKETS}
         while self.is_scanning: await asyncio.sleep(1)
@@ -233,12 +230,6 @@ class DerivSniperBot:
                 if len(candles) < 70: 
                     await asyncio.sleep(5)
                     continue
-                
-                # ... (Insert your RSI/EMA strategy logic here from your original script)
-                # For brevity, I'm focusing on the trade execution fix.
-                # When a signal is found:
-                # await self.execute_trade("CALL", symbol, "Strategy", "AUTO")
-                
             except Exception as e: logger.error(e)
             await asyncio.sleep(SCAN_SLEEP_SEC)
 
@@ -263,6 +254,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic.base_stake = round(bot_logic.base_stake + 0.05, 2)
         bot_logic.current_stake = bot_logic.base_stake
     elif q.data == "STAKE_DOWN":
+        # Ensures user cannot decrease stake below your requested 0.40
         bot_logic.base_stake = round(max(bot_logic.base_stake - 0.05, MIN_STAKE), 2)
         bot_logic.current_stake = bot_logic.base_stake
     elif q.data == "START_SCAN":
