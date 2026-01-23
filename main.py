@@ -43,20 +43,16 @@ EMA_SLOPE_LOOKBACK = 10
 EMA_SLOPE_MIN = 0.0
 DAILY_PROFIT_TARGET = 5.0
 
-# ========================= PAYOUT MODE (✅ FIXED PAYOUT) =========================
+# ========================= PAYOUT MODE =========================
 USE_PAYOUT_MODE = True
-
-# ✅ CHANGE #1: payout now 0.74
-PAYOUT_TARGET = 0.74          # ✅ payout = $0.74
-
+PAYOUT_TARGET = 0.74          # ✅ payout = $0.74 (base payout)
 MAX_STAKE_ALLOWED = 5.00      # safety cap: if Deriv needs > this stake, skip trade
-BUY_PRICE_BUFFER = 0.02       # (kept, not used now because buy cap is fixed)
+BUY_PRICE_BUFFER = 0.02       # kept (not used in the fixed max cap flow, but left as-is)
 
-# ========================= MARTINGALE SETTINGS =========================
+# ========================= MARTINGALE SETTINGS (NOW ACTIVE IN PAYOUT MODE) =========================
 MARTINGALE_MULT = 2.0
 MARTINGALE_MAX_STEPS = 4
-MARTINGALE_MAX_STAKE = 16.0   # (kept, we still enforce MAX_STAKE_ALLOWED as the hard cap)
-
+MARTINGALE_MAX_STAKE = 16.0   # kept (not used directly; stake is controlled by Deriv in payout mode)
 
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period: int):
@@ -125,6 +121,17 @@ def money2(x: float) -> float:
     return math.ceil(float(x) * 100.0) / 100.0
 
 
+# ✅ NEW: Deriv can be picky; always send payout as a safe string >= 0.01
+def payout_str(x) -> str:
+    try:
+        v = float(x)
+    except Exception:
+        v = 0.0
+    if not np.isfinite(v) or v < 0.01:
+        v = 0.01
+    return f"{v:.2f}"
+
+
 # ========================= BOT CORE =========================
 class DerivSniperBot:
     def __init__(self):
@@ -160,6 +167,11 @@ class DerivSniperBot:
         self.tz = ZoneInfo("Africa/Lagos")
         self.current_day = datetime.now(self.tz).date()
         self.pause_until = 0.0
+
+    # ✅ NEW: Martingale in payout-mode = increase PAYOUT after losses
+    def get_martingale_payout(self) -> float:
+        step = min(self.martingale_step, MARTINGALE_MAX_STEPS)
+        return float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** step)
 
     async def connect(self) -> bool:
         try:
@@ -318,7 +330,6 @@ class DerivSniperBot:
                 confirm = candles[-2]
                 confirm_t0 = int(confirm["t0"])
 
-                # ✅ Rate-limit fix: don't reprocess same closed candle
                 if self.last_processed_closed_t0[symbol] == confirm_t0:
                     await self._sync_to_next_candle_open(confirm_t0)
                     continue
@@ -336,7 +347,6 @@ class DerivSniperBot:
                 ema20_confirm = float(ema20_arr[-2])
                 ema50_confirm = float(ema50_arr[-2])
 
-                # EMA50 slope filter
                 slope_ok = False
                 ema50_slope = 0.0
                 ema50_rising = False
@@ -460,7 +470,6 @@ class DerivSniperBot:
                     await self._sync_to_next_candle_open(confirm_t0)
                     continue
 
-                # wait for next candle open then place trade
                 if call_ready or put_ready:
                     await self._sync_to_next_candle_open(confirm_t0)
 
@@ -497,7 +506,7 @@ class DerivSniperBot:
 
             await asyncio.sleep(SCAN_SLEEP_SEC)
 
-    # ========================= ✅ UPDATED TRADE EXECUTION (PAYOUT + MARTINGALE) =========================
+    # ========================= TRADE EXECUTION (PAYOUT MODE + MARTINGALE) =========================
     async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL"):
         if not self.api or self.active_trade_info:
             return
@@ -508,16 +517,15 @@ class DerivSniperBot:
                 return
 
             try:
-                # ✅ CHANGE #2: Martingale in payout-mode by increasing PAYOUT after losses
-                # payout_step = base_payout * (mult ^ step), capped to max steps
-                step_used = min(self.martingale_step, MARTINGALE_MAX_STEPS) if source == "AUTO" else 0
-                payout = float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(step_used))
-                payout = max(0.01, money2(payout))  # keep >= 0.01 and 2dp
+                # ✅ payout mode + martingale payout
+                raw_payout = self.get_martingale_payout()
+                payout = payout_str(raw_payout)  # ✅ send as STRING, always >= 0.01
+                payout_f = float(payout)
 
                 proposal_req = {
                     "proposal": 1,
-                    "amount": payout,
-                    "basis": "payout",          # ✅ payout mode
+                    "amount": payout,          # ✅ payout STRING
+                    "basis": "payout",         # ✅ payout mode (NOT stake)
                     "contract_type": side,
                     "currency": "USD",
                     "duration": int(DURATION_MIN),
@@ -542,17 +550,17 @@ class DerivSniperBot:
                 if ask_price > float(MAX_STAKE_ALLOWED):
                     await self.app.bot.send_message(
                         TELEGRAM_CHAT_ID,
-                        f"⛔️ Skipped trade: payout=${payout:.2f} needs stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
+                        f"⛔️ Skipped trade: payout=${payout_f:.2f} needs stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
                     )
                     self.cooldown_until = time.time() + COOLDOWN_SEC
                     return
 
-                # ✅ fixed max buy cap (works around fast price changes)
+                # ✅ fixed max cap to prevent 0.00 -> x.xx mismatch
                 buy_price_cap = float(MAX_STAKE_ALLOWED)
 
                 buy = await self.api.buy({"buy": proposal_id, "price": buy_price_cap})
 
-                # one retry if market moved too much (retry also uses fixed max price cap)
+                # one retry if market moved too much
                 if "error" in buy:
                     err_msg = str(buy["error"].get("message", "Buy error"))
                     low = err_msg.lower()
@@ -577,7 +585,7 @@ class DerivSniperBot:
                         if ask_price2 > float(MAX_STAKE_ALLOWED):
                             await self.app.bot.send_message(
                                 TELEGRAM_CHAT_ID,
-                                f"⛔️ Skipped (retry): payout=${payout:.2f} needs stake=${ask_price2:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
+                                f"⛔️ Skipped (retry): payout=${payout_f:.2f} needs stake=${ask_price2:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
                             )
                             self.cooldown_until = time.time() + COOLDOWN_SEC
                             return
@@ -590,7 +598,7 @@ class DerivSniperBot:
                             await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Trade Refused (retry):\n{err3}")
                             return
 
-                        # use retry prices for display
+                        proposal_id = proposal_id2
                         ask_price = ask_price2
                         buy_price_cap = buy_price_cap2
                     else:
@@ -610,7 +618,8 @@ class DerivSniperBot:
                     f"🚀 {side} TRADE OPENED\n"
                     f"🛒 Market: {safe_symbol}\n"
                     f"⏱ Expiry: {DURATION_MIN}m\n"
-                    f"🎁 Payout: ${payout:.2f} (step {step_used}/{MARTINGALE_MAX_STEPS})\n"
+                    f"🎁 Payout: ${payout_f:.2f}\n"
+                    f"🎲 MG Step: {self.martingale_step}/{MARTINGALE_MAX_STEPS} (x{MARTINGALE_MULT})\n"
                     f"💵 Stake (Deriv): ${ask_price:.2f}\n"
                     f"🧾 Buy cap used: ${buy_price_cap:.2f}\n"
                     f"🧠 Reason: {reason}\n"
@@ -639,11 +648,9 @@ class DerivSniperBot:
                 if profit <= 0:
                     self.consecutive_losses += 1
                     self.total_losses_today += 1
-                    # ✅ Martingale step increases on loss (affects next payout)
                     self.martingale_step = min(self.martingale_step + 1, MARTINGALE_MAX_STEPS)
                 else:
                     self.consecutive_losses = 0
-                    # ✅ Reset on win
                     self.martingale_step = 0
 
                 if self.total_profit_today >= DAILY_PROFIT_TARGET:
@@ -661,7 +668,7 @@ class DerivSniperBot:
                     f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n"
                     f"📊 Today: {self.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {self.total_losses_today} | Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
                     f"💵 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
-                    f"🎁 Base payout: ${PAYOUT_TARGET:.2f} | Next step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
+                    f"🎁 Next base payout: ${float(PAYOUT_TARGET):.2f} | Next MG step: {self.martingale_step}\n"
                     f"💰 Balance: {self.balance}"
                     f"{pause_note}"
                 )
@@ -763,9 +770,8 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 "📌 Strategy: Trend(EMA20/EMA50) + EMA50 Slope + Pullback touch EMA20 + Confirm color + Close vs EMA20 + RSI (M1)\n"
                 "🕯 Timeframe: M1\n"
                 f"⏱ Expiry: {DURATION_MIN}m\n"
-                f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} base payout per trade\n"
-                f"🎲 Martingale: x{MARTINGALE_MULT} up to {MARTINGALE_MAX_STEPS} steps (payout-based)\n"
-                f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f} (skips if higher)\n"
+                f"🎁 PAYOUT MODE: ${float(PAYOUT_TARGET):.2f} base payout (Martingale increases payout)\n"
+                f"🧯 Max stake allowed: ${float(MAX_STAKE_ALLOWED):.2f} (skips if higher)\n"
                 f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)"
             ),
             reply_markup=main_keyboard()
@@ -802,12 +808,14 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if time.time() < bot_logic.pause_until:
             pause_line = "⏸ Paused until 12:00am WAT\n"
 
+        next_payout = bot_logic.get_martingale_payout()
+
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
             f"{pause_line}"
-            f"🎁 Base payout: ${PAYOUT_TARGET:.2f} | Next step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
-            f"🧯 Max stake: ${MAX_STAKE_ALLOWED:.2f}\n"
+            f"🎁 Payout base: ${float(PAYOUT_TARGET):.2f} | Next payout: ${next_payout:.2f} | MG step: {bot_logic.martingale_step}\n"
+            f"🧯 Max stake: ${float(MAX_STAKE_ALLOWED):.2f}\n"
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
             f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
@@ -832,9 +840,8 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "📌 Strategy: Trend + EMA50Slope + Pullback + ConfirmColor + CloseVsEMA20 + RSI (M1)\n"
         "🕯 Timeframe: M1\n"
         f"⏱ Expiry: {DURATION_MIN}m\n"
-        f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} base payout per trade\n"
-        f"🎲 Martingale: x{MARTINGALE_MULT} up to {MARTINGALE_MAX_STEPS} steps (payout-based)\n"
-        f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
+        f"🎁 PAYOUT MODE: ${float(PAYOUT_TARGET):.2f} base payout (Martingale increases payout)\n"
+        f"🧯 Max stake allowed: ${float(MAX_STAKE_ALLOWED):.2f}\n"
         f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n",
         reply_markup=main_keyboard()
     )
