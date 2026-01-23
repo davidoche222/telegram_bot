@@ -17,7 +17,7 @@ APP_ID = 1089
 MARKETS = ["R_10", "R_25", "R_50"]
 
 COOLDOWN_SEC = 120
-MAX_TRADES_PER_DAY = 60          # ✅ requested: 60 trades/day
+MAX_TRADES_PER_DAY = 60
 MAX_CONSEC_LOSSES = 10
 BASE_STAKE = 1.00
 
@@ -28,27 +28,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ========================= STRATEGY SETTINGS =========================
-TF_SEC = 60                # M1 candles (REAL candles from Deriv)
-CANDLES_COUNT = 300        # enough for EMA50 + RSI + PSAR
-SCAN_SLEEP_SEC = 2
+TF_SEC = 60  # M1 candles
 
-EMA_PERIOD = 50
+# ✅ Reduce API pressure (still enough for EMA50 + RSI)
+CANDLES_COUNT = 150
+SCAN_SLEEP_SEC = 2  # used only as a small idle; main wait is candle-sync
 
-# Parabolic SAR defaults (kept as-is; strategy no longer uses it)
-PSAR_AF_STEP = 0.02
-PSAR_AF_MAX = 0.2
-
-# RSI
 RSI_PERIOD = 14
-
-# ✅ UPDATED (your new idea needs 1-minute expiry)
-DURATION_MIN = 1
-
-# ===== CROSS STRATEGY SETTINGS (kept as-is; strategy no longer uses it) =====
-PSAR_MIN_DIST_MULT = 0.50
+DURATION_MIN = 1  # ✅ 1-minute expiry
 
 # ========================= INDICATOR MATH =========================
-def calculate_ema(values, period):
+def calculate_ema(values, period: int):
     values = np.array(values, dtype=float)
     if len(values) < period:
         return np.array([])
@@ -61,10 +51,6 @@ def calculate_ema(values, period):
 
 
 def calculate_rsi(values, period=14):
-    """
-    Wilder's RSI. Returns array same length as values.
-    First (period) values will be np.nan.
-    """
     values = np.array(values, dtype=float)
     n = len(values)
     if n < period + 2:
@@ -90,61 +76,6 @@ def calculate_rsi(values, period=14):
         rsi[i] = 100.0 - (100.0 / (1.0 + rs))
 
     return rsi
-
-
-def calculate_psar(candles, af_step=0.02, af_max=0.2):
-    """
-    Standard Parabolic SAR implementation.
-    Returns PSAR list (len == len(candles)).
-    """
-    n = len(candles)
-    if n < 3:
-        return []
-
-    highs = [c["h"] for c in candles]
-    lows = [c["l"] for c in candles]
-
-    psar = [0.0] * n
-
-    uptrend = highs[1] > highs[0]
-    ep = highs[1] if uptrend else lows[1]
-    af = af_step
-    psar[1] = lows[0] if uptrend else highs[0]
-
-    for i in range(2, n):
-        prev_psar = psar[i - 1]
-        psar_i = prev_psar + af * (ep - prev_psar)
-
-        if uptrend:
-            psar_i = min(psar_i, lows[i - 1], lows[i - 2])
-        else:
-            psar_i = max(psar_i, highs[i - 1], highs[i - 2])
-
-        if uptrend:
-            if lows[i] < psar_i:
-                uptrend = False
-                psar_i = ep
-                ep = lows[i]
-                af = af_step
-            else:
-                if highs[i] > ep:
-                    ep = highs[i]
-                    af = min(af + af_step, af_max)
-        else:
-            if highs[i] > psar_i:
-                uptrend = True
-                psar_i = ep
-                ep = highs[i]
-                af = af_step
-            else:
-                if lows[i] < ep:
-                    ep = lows[i]
-                    af = min(af + af_step, af_max)
-
-        psar[i] = psar_i
-
-    psar[0] = psar[1]
-    return psar
 
 
 def build_candles_from_deriv(candles_raw):
@@ -195,11 +126,6 @@ class DerivSniperBot:
         self.market_debug = {m: {} for m in MARKETS}
         self.last_processed_closed_t0 = {m: 0 for m in MARKETS}
 
-        # Cross-state per symbol (kept as-is; strategy no longer uses it)
-        self.last_cross_dir = {m: None for m in MARKETS}
-        self.last_cross_t0 = {m: 0 for m in MARKETS}
-        self.cross_traded = {m: False for m in MARKETS}
-
     async def connect(self) -> bool:
         try:
             if not self.active_token:
@@ -211,6 +137,41 @@ class DerivSniperBot:
         except Exception as e:
             logger.error(f"Connect error: {e}")
             return False
+
+    async def safe_reconnect(self) -> bool:
+        try:
+            if self.api:
+                try:
+                    await self.api.disconnect()
+                except:
+                    pass
+        except:
+            pass
+        self.api = None
+        return await self.connect()
+
+    async def safe_ticks_history(self, payload: dict, retries: int = 4):
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                if not self.api:
+                    ok = await self.safe_reconnect()
+                    if not ok:
+                        raise RuntimeError("Reconnect failed")
+                return await self.api.ticks_history(payload)
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+
+                if "rate limit" in msg or "too many" in msg or "throttle" in msg:
+                    await asyncio.sleep(2.5 * attempt)
+                else:
+                    await asyncio.sleep(1.0 * attempt)
+
+                if any(k in msg for k in ["disconnect", "connection", "websocket", "not connected", "authorize", "auth"]):
+                    await self.safe_reconnect()
+
+        raise last_err
 
     async def fetch_balance(self):
         if not self.api:
@@ -249,28 +210,26 @@ class DerivSniperBot:
             self.market_tasks.clear()
 
     async def fetch_real_m1_candles(self, symbol: str):
-        data = await self.api.ticks_history({
+        payload = {
             "ticks_history": symbol,
             "end": "latest",
             "count": CANDLES_COUNT,
             "style": "candles",
             "granularity": TF_SEC
-        })
+        }
+        data = await self.safe_ticks_history(payload, retries=4)
         return build_candles_from_deriv(data.get("candles", []))
 
-    async def _sync_to_next_candle_open(self, last_closed_t0: int):
-        """
-        last_closed_t0 is the OPEN time of the last closed candle.
-        Next candle open = last_closed_t0 + TF_SEC.
-        We sleep a tiny bit so we enter near the new candle open.
-        """
-        next_open = int(last_closed_t0) + int(TF_SEC)
-        now = time.time()
-        wait = (next_open - now) + 0.15  # small buffer
+    async def _sleep_until(self, epoch_ts: float, buffer_s: float = 0.15):
+        wait = (epoch_ts - time.time()) + buffer_s
         if wait > 0:
-            await asyncio.sleep(min(wait, 2.0))  # never sleep too long
+            await asyncio.sleep(wait)
         else:
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.10)
+
+    async def _sync_to_next_candle_open(self, last_closed_t0: int):
+        next_open = int(last_closed_t0) + int(TF_SEC)
+        await self._sleep_until(next_open, buffer_s=0.20)
 
     async def scan_market(self, symbol: str):
         while self.is_scanning:
@@ -279,70 +238,68 @@ class DerivSniperBot:
                     self.is_scanning = False
                     break
 
+                ok_gate, gate = self.can_auto_trade()
+
                 candles = await self.fetch_real_m1_candles(symbol)
-                need = max(60, RSI_PERIOD + 10, 60)  # enough for EMA50 & RSI
-                if len(candles) < need:
+                if len(candles) < 70:
                     self.market_debug[symbol] = {
                         "time": time.time(),
                         "gate": "Waiting for more candles",
-                        "why": [f"Not enough candle history yet (need {need}, have {len(candles)})."],
+                        "why": [f"Not enough candle history yet (need ~70, have {len(candles)})."],
                     }
                     await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
 
-                ok_gate, gate = self.can_auto_trade()
-
-                # ========================= STRATEGY (YOUR NEW IDEA) =========================
-                # We use TWO closed candles:
-                # - pullback_candle = candles[-3] (must touch EMA20)
-                # - confirm_candle  = candles[-2] (must close green/red)
                 pullback = candles[-3]
                 confirm = candles[-2]
-
-                pullback_t0 = int(pullback["t0"])
                 confirm_t0 = int(confirm["t0"])
+
+                # ✅ Rate-limit fix: if no new candle, wait instead of spamming API
+                if self.last_processed_closed_t0[symbol] == confirm_t0:
+                    await self._sync_to_next_candle_open(confirm_t0)
+                    continue
 
                 closes = [x["c"] for x in candles]
 
-                # EMA20 + EMA50
                 ema20_arr = calculate_ema(closes, 20)
                 ema50_arr = calculate_ema(closes, 50)
-                if len(ema20_arr) < 10 or len(ema50_arr) < 10:
+                if len(ema20_arr) < 60 or len(ema50_arr) < 60:
                     self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["EMA20/EMA50 not ready yet."]}
                     await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
 
-                ema20 = float(ema20_arr[-2])  # EMA at confirm candle close
-                ema50 = float(ema50_arr[-2])
+                # ✅ aligned EMA values
+                ema20_pullback = float(ema20_arr[-3])
+                ema20_confirm = float(ema20_arr[-2])
+                ema50_confirm = float(ema50_arr[-2])
 
-                # RSI14 on confirm candle close
                 rsi_arr = calculate_rsi(closes, RSI_PERIOD)
-                if len(rsi_arr) < 10 or np.isnan(rsi_arr[-2]):
+                if len(rsi_arr) < 60 or np.isnan(rsi_arr[-2]):
                     self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["RSI not ready yet."]}
                     await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
                 rsi_now = float(rsi_arr[-2])
 
-                # ---- Pullback candle touches EMA20 ----
+                # Pullback touch EMA20 (aligned to pullback candle)
                 pb_high = float(pullback["h"])
                 pb_low = float(pullback["l"])
-                touched_ema20 = (pb_low <= ema20 <= pb_high)
+                touched_ema20 = (pb_low <= ema20_pullback <= pb_high)
 
-                # ---- Confirmation candle color (forms green/red then we enter next candle) ----
+                # Confirm candle color
                 c_open = float(confirm["o"])
                 c_close = float(confirm["c"])
                 bull_confirm = c_close > c_open
                 bear_confirm = c_close < c_open
 
-                # Spike filter on CONFIRM candle body
+                # ✅ NEW: confirm candle must close above/below EMA20
+                close_above_ema20 = c_close > ema20_confirm
+                close_below_ema20 = c_close < ema20_confirm
+
+                # Spike filter
                 bodies = [abs(float(candles[i]["c"]) - float(candles[i]["o"])) for i in range(-22, -2)]
-                if len(bodies) >= 10:
-                    avg_body = float(np.mean(bodies))
-                else:
-                    avg_body = float(np.mean([abs(float(c["c"]) - float(c["o"])) for c in candles[-60:-2]]))
+                avg_body = float(np.mean(bodies)) if len(bodies) >= 10 else float(np.mean([abs(float(c["c"]) - float(c["o"])) for c in candles[-60:-2]]))
                 last_body = abs(c_close - c_open)
 
-                # Per-market tuning (R_50 stricter)
                 if symbol == "R_50":
                     spike_mult = 1.2
                     rsi_call_min, rsi_call_max = 53.0, 62.0
@@ -356,24 +313,23 @@ class DerivSniperBot:
 
                 spike_block = (avg_body > 0 and last_body > spike_mult * avg_body)
 
-                # Trend strength (separation)
-                ema_diff = abs(ema20 - ema50)
+                ema_diff = abs(ema20_confirm - ema50_confirm)
                 flat_block = ema_diff < ema_diff_min
 
-                # Trend direction
-                uptrend = ema20 > ema50
-                downtrend = ema20 < ema50
+                uptrend = ema20_confirm > ema50_confirm
+                downtrend = ema20_confirm < ema50_confirm
 
-                # RSI zones
                 call_rsi_ok = (rsi_call_min <= rsi_now <= rsi_call_max)
                 put_rsi_ok = (rsi_put_min <= rsi_now <= rsi_put_max)
 
-                # ✅ Entry is based on:
-                # Trend + pullback touches EMA20 (previous candle) + confirm candle color + RSI + filters
+                # ✅ UPDATED entry rules:
+                # CALL: confirm candle green AND close above EMA20_confirm
+                # PUT : confirm candle red   AND close below EMA20_confirm
                 call_ready = (
                     uptrend
                     and touched_ema20
                     and bull_confirm
+                    and close_above_ema20
                     and call_rsi_ok
                     and not spike_block
                     and not flat_block
@@ -383,6 +339,7 @@ class DerivSniperBot:
                     downtrend
                     and touched_ema20
                     and bear_confirm
+                    and close_below_ema20
                     and put_rsi_ok
                     and not spike_block
                     and not flat_block
@@ -390,23 +347,12 @@ class DerivSniperBot:
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
 
-                # ---------------- SIMPLE STATUS LABELS ----------------
-                if uptrend:
-                    trend_label = "UPTREND"
-                elif downtrend:
-                    trend_label = "DOWNTREND"
-                else:
-                    trend_label = "SIDEWAYS"
-
-                if ema20 > ema50:
-                    ema_label = "EMA20 ABOVE EMA50"
-                elif ema20 < ema50:
-                    ema_label = "EMA20 BELOW EMA50"
-                else:
-                    ema_label = "EMA20 = EMA50"
-
+                trend_label = "UPTREND" if uptrend else "DOWNTREND" if downtrend else "SIDEWAYS"
+                ema_label = "EMA20 ABOVE EMA50" if uptrend else "EMA20 BELOW EMA50" if downtrend else "EMA20 = EMA50"
                 trend_strength = "STRONG" if not flat_block else "WEAK"
                 pullback_label = "PULLBACK TOUCHED ✅" if touched_ema20 else "WAITING PULLBACK…"
+
+                confirm_close_label = "CONFIRM CLOSE > EMA20 ✅" if close_above_ema20 else "CONFIRM CLOSE < EMA20 ✅" if close_below_ema20 else "CONFIRM CLOSE ON EMA20"
 
                 block_label = []
                 if spike_block:
@@ -426,9 +372,29 @@ class DerivSniperBot:
                     elif trend_strength != "STRONG":
                         why.append("Waiting: strong trend")
                     elif not touched_ema20:
-                        why.append("Waiting: pullback candle touch EMA20")
+                        why.append("Waiting: pullback touch EMA20")
                     else:
-                        why.append("Waiting: confirm candle color/RSI")
+                        # show what confirmation is missing
+                        if uptrend:
+                            if not bull_confirm:
+                                why.append("Waiting: confirm candle GREEN")
+                            elif not close_above_ema20:
+                                why.append("Waiting: confirm close ABOVE EMA20")
+                            elif not call_rsi_ok:
+                                why.append("Waiting: RSI (CALL zone)")
+                            else:
+                                why.append("Waiting: filters")
+                        elif downtrend:
+                            if not bear_confirm:
+                                why.append("Waiting: confirm candle RED")
+                            elif not close_below_ema20:
+                                why.append("Waiting: confirm close BELOW EMA20")
+                            elif not put_rsi_ok:
+                                why.append("Waiting: RSI (PUT zone)")
+                            else:
+                                why.append("Waiting: filters")
+                        else:
+                            why.append("Waiting: confirmations")
 
                 self.market_debug[symbol] = {
                     "time": time.time(),
@@ -441,9 +407,11 @@ class DerivSniperBot:
                     "trend_strength": trend_strength,
                     "pullback_label": pullback_label,
                     "block_label": block_label,
+                    "confirm_close_label": confirm_close_label,
 
-                    "ema20": ema20,
-                    "ema50": ema50,
+                    "ema20_pullback": ema20_pullback,
+                    "ema20": ema20_confirm,
+                    "ema50": ema50_confirm,
                     "ema_diff": ema_diff,
                     "rsi_now": rsi_now,
                     "avg_body": avg_body,
@@ -454,31 +422,38 @@ class DerivSniperBot:
                     "why": why[:10],
                 }
 
-                if not ok_gate:
-                    await asyncio.sleep(SCAN_SLEEP_SEC)
-                    continue
-
-                # One trade per closed CONFIRM candle per symbol
-                if self.last_processed_closed_t0[symbol] == confirm_t0:
-                    await asyncio.sleep(SCAN_SLEEP_SEC)
-                    continue
+                # mark processed candle
                 self.last_processed_closed_t0[symbol] = confirm_t0
 
-                # ✅ Enter on NEXT candle open (sync)
+                if not ok_gate:
+                    await self._sync_to_next_candle_open(confirm_t0)
+                    continue
+
                 if call_ready or put_ready:
                     await self._sync_to_next_candle_open(confirm_t0)
 
                 if call_ready:
-                    await self.execute_trade("CALL", symbol, reason="Trend + PullbackTouch(Prev) + ConfirmGreen + RSI + Filters", source="AUTO")
+                    await self.execute_trade("CALL", symbol, reason="Trend + PullbackTouch + ConfirmGreen + Close>EMA20 + RSI + Filters", source="AUTO")
                 elif put_ready:
-                    await self.execute_trade("PUT", symbol, reason="Trend + PullbackTouch(Prev) + ConfirmRed + RSI + Filters", source="AUTO")
-                # ========================= END STRATEGY =========================
+                    await self.execute_trade("PUT", symbol, reason="Trend + PullbackTouch + ConfirmRed + Close<EMA20 + RSI + Filters", source="AUTO")
+
+                await asyncio.sleep(0.25)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Scanner Error ({symbol}): {e}")
-                self.market_debug[symbol] = {"time": time.time(), "gate": "Error", "why": [str(e)[:140]]}
+                msg = str(e)
+                logger.error(f"Scanner Error ({symbol}): {msg}")
+                self.market_debug[symbol] = {"time": time.time(), "gate": "Error", "why": [msg[:160]]}
+
+                low = msg.lower()
+                if "rate limit" in low or "too many" in low or "throttle" in low:
+                    await asyncio.sleep(6)
+                elif any(k in low for k in ["disconnect", "connection", "websocket", "not connected"]):
+                    await self.safe_reconnect()
+                    await asyncio.sleep(2)
+                else:
+                    await asyncio.sleep(2)
 
             await asyncio.sleep(SCAN_SLEEP_SEC)
 
@@ -504,6 +479,7 @@ class DerivSniperBot:
                     "duration_unit": "m",
                     "symbol": symbol
                 })
+
                 buy = await self.api.buy({"buy": prop["proposal"]["id"], "price": float(prop["proposal"]["ask_price"])})
 
                 self.active_trade_info = int(buy["buy"]["contract_id"])
@@ -541,7 +517,6 @@ class DerivSniperBot:
                 else:
                     self.consecutive_losses = 0
 
-                # ✅ remove martingale (always fixed stake)
                 self.current_stake = BASE_STAKE
 
             await self.fetch_balance()
@@ -587,6 +562,7 @@ def format_market_detail(sym: str, d: dict) -> str:
     trend_strength = d.get("trend_strength", "—")
     pullback_label = d.get("pullback_label", "—")
     block_label = d.get("block_label", "—")
+    confirm_close_label = d.get("confirm_close_label", "—")
 
     return (
         f"📍 {sym.replace('_',' ')} ({age}s)\n"
@@ -596,6 +572,7 @@ def format_market_detail(sym: str, d: dict) -> str:
         f"Trend: {trend_label} ({trend_strength})\n"
         f"{ema_label}\n"
         f"{pullback_label}\n"
+        f"{confirm_close_label}\n"
         f"Filters: {block_label}\n"
         f"Signal: {signal}\n"
     )
@@ -622,7 +599,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
         await q.edit_message_text(
             f"🔍 SCANNER ACTIVE\n"
-            f"📌 Strategy: Trend (EMA20/EMA50) + Pullback touch EMA20 (prev candle) + Confirm candle green/red + RSI (M1)\n"
+            f"📌 Strategy: Trend (EMA20/EMA50) + Pullback touch EMA20 + Confirm color + Confirm close vs EMA20 + RSI (M1)\n"
             f"🕯 Timeframe: M1\n"
             f"⏱ Expiry: {DURATION_MIN}m",
             reply_markup=main_keyboard()
@@ -655,7 +632,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"📌 Strategy: Trend + Pullback(Prev) + ConfirmColor + RSI (M1)\n"
+            f"📌 Strategy: Trend + Pullback + ConfirmColor + CloseVsEMA20 + RSI (M1)\n"
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
@@ -675,7 +652,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         "💎 Deriv Bot\n"
-        "📌 Strategy: Trend + Pullback(Prev) + ConfirmColor + RSI (M1)\n"
+        "📌 Strategy: Trend + Pullback + ConfirmColor + CloseVsEMA20 + RSI (M1)\n"
         "🕯 Timeframe: M1\n"
         f"⏱ Expiry: {DURATION_MIN}m\n",
         reply_markup=main_keyboard()
