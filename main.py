@@ -15,7 +15,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 # ========================= CONFIG =========================
 DEMO_TOKEN = "tIrfitLjqeBxCOM"
-REAL_TOKEN = "2hsJzopRHG5w"  # (looks short/incomplete) replace with your full real token
+REAL_TOKEN = "2hsJzopRHG5w"  # replace with your full real token
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50"]
@@ -41,24 +41,19 @@ DURATION_MIN = 1  # 1-minute expiry
 # ========================= EMA50 SLOPE + DAILY TARGET =========================
 EMA_SLOPE_LOOKBACK = 10
 EMA_SLOPE_MIN = 0.0
-
 DAILY_PROFIT_TARGET = 5.0
 
 # ========================= PAYOUT MODE (✅ FIXED PAYOUT = $1) =========================
 USE_PAYOUT_MODE = True
-PAYOUT_TARGET = 1.00          # ✅ YOU WANTED PAYOUT = $1
-MAX_STAKE_ALLOWED = 5.00      # safety cap: if Deriv needs > this stake for $1 payout, we skip trade
+PAYOUT_TARGET = 1.00          # ✅ payout = $1
+MAX_STAKE_ALLOWED = 5.00      # safety cap: if Deriv needs > this stake for $1 payout, skip trade
 BUY_PRICE_BUFFER = 0.02       # buffer above ask_price to avoid rounding/refusal
-
-# NOTE:
-# When you use payout mode, Deriv chooses the stake required to achieve payout=$1.
-# Because payout is fixed, Martingale-by-stake does NOT apply cleanly here.
-# So we keep your martingale variables for display only (no stake-multiplying).
 
 # ========================= MARTINGALE SETTINGS (kept for display only) =========================
 MARTINGALE_MULT = 2.0
 MARTINGALE_MAX_STEPS = 4
 MARTINGALE_MAX_STAKE = 16.0
+
 
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period: int):
@@ -117,12 +112,11 @@ def build_candles_from_deriv(candles_raw):
 def fmt_time_hhmmss(epoch):
     try:
         return datetime.fromtimestamp(epoch, ZoneInfo("Africa/Lagos")).strftime("%H:%M:%S")
-    except:
+    except Exception:
         return "—"
 
 
 def money2(x: float) -> float:
-    # stable 2dp rounding for prices
     return float(f"{x:.2f}")
 
 
@@ -149,7 +143,7 @@ class DerivSniperBot:
         self.total_profit_today = 0.0
         self.balance = "0.00"
 
-        # kept for UI display
+        # for UI display
         self.current_stake = 0.0
         self.martingale_step = 0
 
@@ -179,9 +173,9 @@ class DerivSniperBot:
             if self.api:
                 try:
                     await self.api.disconnect()
-                except:
+                except Exception:
                     pass
-        except:
+        except Exception:
             pass
         self.api = None
         return await self.connect()
@@ -215,7 +209,7 @@ class DerivSniperBot:
         try:
             bal = await self.api.balance({"balance": 1})
             self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
-        except:
+        except Exception:
             pass
 
     # ========================= DAILY RESET / PAUSE =========================
@@ -319,6 +313,7 @@ class DerivSniperBot:
                 confirm = candles[-2]
                 confirm_t0 = int(confirm["t0"])
 
+                # ✅ Rate-limit fix: don't reprocess same closed candle
                 if self.last_processed_closed_t0[symbol] == confirm_t0:
                     await self._sync_to_next_candle_open(confirm_t0)
                     continue
@@ -336,6 +331,7 @@ class DerivSniperBot:
                 ema20_confirm = float(ema20_arr[-2])
                 ema50_confirm = float(ema50_arr[-2])
 
+                # EMA50 slope filter
                 slope_ok = False
                 ema50_slope = 0.0
                 ema50_rising = False
@@ -367,7 +363,9 @@ class DerivSniperBot:
                 close_below_ema20 = c_close < ema20_confirm
 
                 bodies = [abs(float(candles[i]["c"]) - float(candles[i]["o"])) for i in range(-22, -2)]
-                avg_body = float(np.mean(bodies)) if len(bodies) >= 10 else float(np.mean([abs(float(c["c"]) - float(c["o"])) for c in candles[-60:-2]]))
+                avg_body = float(np.mean(bodies)) if len(bodies) >= 10 else float(
+                    np.mean([abs(float(c["c"]) - float(c["o"])) for c in candles[-60:-2]])
+                )
                 last_body = abs(c_close - c_open)
 
                 if symbol == "R_50":
@@ -393,25 +391,13 @@ class DerivSniperBot:
                 put_rsi_ok = (rsi_put_min <= rsi_now <= rsi_put_max)
 
                 call_ready = (
-                    uptrend
-                    and slope_ok and ema50_rising
-                    and touched_ema20
-                    and bull_confirm
-                    and close_above_ema20
-                    and call_rsi_ok
-                    and not spike_block
-                    and not flat_block
+                    uptrend and slope_ok and ema50_rising and touched_ema20 and bull_confirm
+                    and close_above_ema20 and call_rsi_ok and not spike_block and not flat_block
                 )
 
                 put_ready = (
-                    downtrend
-                    and slope_ok and ema50_falling
-                    and touched_ema20
-                    and bear_confirm
-                    and close_below_ema20
-                    and put_rsi_ok
-                    and not spike_block
-                    and not flat_block
+                    downtrend and slope_ok and ema50_falling and touched_ema20 and bear_confirm
+                    and close_below_ema20 and put_rsi_ok and not spike_block and not flat_block
                 )
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
@@ -420,13 +406,11 @@ class DerivSniperBot:
                 ema_label = "EMA20 ABOVE EMA50" if uptrend else "EMA20 BELOW EMA50" if downtrend else "EMA20 = EMA50"
                 trend_strength = "STRONG" if not flat_block else "WEAK"
                 pullback_label = "PULLBACK TOUCHED ✅" if touched_ema20 else "WAITING PULLBACK…"
-
                 confirm_close_label = (
                     "CONFIRM CLOSE > EMA20 ✅" if close_above_ema20 else
                     "CONFIRM CLOSE < EMA20 ✅" if close_below_ema20 else
                     "CONFIRM CLOSE ON EMA20"
                 )
-
                 slope_label = "EMA50 SLOPE ↑" if ema50_rising else "EMA50 SLOPE ↓" if ema50_falling else "EMA50 SLOPE FLAT"
 
                 block_label = []
@@ -471,22 +455,21 @@ class DerivSniperBot:
                     await self._sync_to_next_candle_open(confirm_t0)
                     continue
 
+                # wait for next candle open then place trade
                 if call_ready or put_ready:
                     await self._sync_to_next_candle_open(confirm_t0)
 
                 if call_ready:
                     await self.execute_trade(
-                        "CALL",
-                        symbol,
+                        "CALL", symbol,
                         reason="Trend + EMA50SlopeUp + PullbackTouch + ConfirmGreen + Close>EMA20 + RSI + Filters",
-                        source="AUTO"
+                        source="AUTO",
                     )
                 elif put_ready:
                     await self.execute_trade(
-                        "PUT",
-                        symbol,
+                        "PUT", symbol,
                         reason="Trend + EMA50SlopeDown + PullbackTouch + ConfirmRed + Close<EMA20 + RSI + Filters",
-                        source="AUTO"
+                        source="AUTO",
                     )
 
                 await asyncio.sleep(0.25)
@@ -520,7 +503,7 @@ class DerivSniperBot:
                 return
 
             try:
-                payout = float(PAYOUT_TARGET)  # ✅ always $1 payout
+                payout = float(PAYOUT_TARGET)
 
                 proposal_req = {
                     "proposal": 1,
@@ -546,7 +529,6 @@ class DerivSniperBot:
                     await self.app.bot.send_message(TELEGRAM_CHAT_ID, "❌ Proposal returned invalid ask_price.")
                     return
 
-                # ✅ safety cap: if stake required for payout=$1 is too high, skip trade
                 if ask_price > float(MAX_STAKE_ALLOWED):
                     await self.app.bot.send_message(
                         TELEGRAM_CHAT_ID,
@@ -566,8 +548,6 @@ class DerivSniperBot:
                 self.active_trade_info = int(buy["buy"]["contract_id"])
                 self.active_market = symbol
                 self.trade_start_time = time.time()
-
-                # for UI display
                 self.current_stake = ask_price
 
                 if source == "AUTO":
@@ -592,7 +572,7 @@ class DerivSniperBot:
                 logger.error(f"Trade error: {e}")
                 try:
                     await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"⚠️ Trade error:\n{e}")
-                except:
+                except Exception:
                     pass
 
     async def check_result(self, cid: int, source: str):
@@ -607,7 +587,6 @@ class DerivSniperBot:
                 if profit <= 0:
                     self.consecutive_losses += 1
                     self.total_losses_today += 1
-                    # payout is fixed at $1, so we don't martingale the payout/stake here
                     self.martingale_step = min(self.martingale_step + 1, MARTINGALE_MAX_STEPS)
                 else:
                     self.consecutive_losses = 0
@@ -641,6 +620,7 @@ class DerivSniperBot:
 # ========================= UI =========================
 bot_logic = DerivSniperBot()
 
+
 def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("▶️ START", callback_data="START_SCAN"),
@@ -651,6 +631,7 @@ def main_keyboard():
         [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"),
          InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
     ])
+
 
 def format_market_detail(sym: str, d: dict) -> str:
     if not d:
@@ -683,43 +664,77 @@ def format_market_detail(sym: str, d: dict) -> str:
         f"Signal: {signal}\n"
     )
 
+
+# ========================= ✅ FIX: CALLBACK "query too old" =========================
+# Telegram requires you answer callback queries fast (<~10s).
+# Some branches do network calls (Deriv) before edit_message_text, so we:
+# 1) answer immediately with q.answer()
+# 2) show a quick "Working..." placeholder
+# 3) do work, then edit again with final text
+# Also: if Telegram still says "query too old", we swallow it.
+
+async def _safe_answer(q, text: str | None = None, show_alert: bool = False):
+    try:
+        await q.answer(text=text, show_alert=show_alert)
+    except Exception as e:
+        # ignore: "Query is too old and response timeout expired" etc
+        logger.warning(f"Callback answer ignored: {e}")
+
+async def _safe_edit(q, text: str, reply_markup=None):
+    try:
+        await q.edit_message_text(text, reply_markup=reply_markup)
+    except Exception as e:
+        # If message already edited / too old / not modified etc
+        logger.warning(f"Edit failed: {e}")
+
+
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
-    await q.answer()
+
+    # ✅ immediately answer to prevent "query too old"
+    await _safe_answer(q)
+
+    # ✅ quick immediate feedback to user
+    await _safe_edit(q, "⏳ Working...", reply_markup=main_keyboard())
 
     if q.data == "SET_DEMO":
         bot_logic.active_token, bot_logic.account_type = DEMO_TOKEN, "DEMO"
         ok = await bot_logic.connect()
-        await q.edit_message_text("✅ Connected to DEMO" if ok else "❌ DEMO Failed", reply_markup=main_keyboard())
+        await _safe_edit(q, "✅ Connected to DEMO" if ok else "❌ DEMO Failed", reply_markup=main_keyboard())
 
     elif q.data == "SET_REAL":
         bot_logic.active_token, bot_logic.account_type = REAL_TOKEN, "LIVE"
         ok = await bot_logic.connect()
-        await q.edit_message_text("⚠️ LIVE CONNECTED" if ok else "❌ LIVE Failed", reply_markup=main_keyboard())
+        await _safe_edit(q, "⚠️ LIVE CONNECTED" if ok else "❌ LIVE Failed", reply_markup=main_keyboard())
 
     elif q.data == "START_SCAN":
         if not bot_logic.api:
-            await q.edit_message_text("❌ Connect first.", reply_markup=main_keyboard())
+            await _safe_edit(q, "❌ Connect first.", reply_markup=main_keyboard())
             return
         bot_logic.is_scanning = True
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
-        await q.edit_message_text(
-            f"🔍 SCANNER ACTIVE\n"
-            f"📌 Strategy: Trend(EMA20/EMA50) + EMA50 Slope + Pullback touch EMA20 + Confirm color + Close vs EMA20 + RSI (M1)\n"
-            f"🕯 Timeframe: M1\n"
-            f"⏱ Expiry: {DURATION_MIN}m\n"
-            f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} payout per trade\n"
-            f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f} (skips if higher)\n"
-            f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)",
+        await _safe_edit(
+            q,
+            (
+                "🔍 SCANNER ACTIVE\n"
+                "📌 Strategy: Trend(EMA20/EMA50) + EMA50 Slope + Pullback touch EMA20 + Confirm color + Close vs EMA20 + RSI (M1)\n"
+                "🕯 Timeframe: M1\n"
+                f"⏱ Expiry: {DURATION_MIN}m\n"
+                f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} payout per trade\n"
+                f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f} (skips if higher)\n"
+                f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)"
+            ),
             reply_markup=main_keyboard()
         )
 
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
-        await q.edit_message_text("⏹️ Scanner stopped.", reply_markup=main_keyboard())
+        await _safe_edit(q, "⏹️ Scanner stopped.", reply_markup=main_keyboard())
 
     elif q.data == "TEST_BUY":
-        await bot_logic.execute_trade("CALL", "R_10", "Manual Test", source="MANUAL")
+        # don't block UI—run in background
+        asyncio.create_task(bot_logic.execute_trade("CALL", "R_10", "Manual Test", source="MANUAL"))
+        await _safe_edit(q, "🧪 Test trade triggered (CALL R 10).", reply_markup=main_keyboard())
 
     elif q.data == "STATUS":
         await bot_logic.fetch_balance()
@@ -729,18 +744,20 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         trade_status = "No Active Trade"
         if bot_logic.active_trade_info and bot_logic.api:
             try:
-                res = await bot_logic.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info})
+                res = await bot_logic.api.proposal_open_contract(
+                    {"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info}
+                )
                 pnl = float(res["proposal_open_contract"].get("profit", 0))
                 rem = max(0, int(DURATION_MIN * 60) - int(time.time() - bot_logic.trade_start_time))
                 icon = "✅ PROFIT" if pnl > 0 else "❌ LOSS" if pnl < 0 else "➖ FLAT"
                 mkt_clean = str(bot_logic.active_market).replace("_", " ")
                 trade_status = f"🚀 Active Trade ({mkt_clean})\n📈 PnL: {icon} ({pnl:+.2f})\n⏳ Left: {rem}s"
-            except:
+            except Exception:
                 trade_status = "🚀 Active Trade: Syncing..."
 
         pause_line = ""
         if time.time() < bot_logic.pause_until:
-            pause_line = f"⏸ Paused until 12:00am WAT\n"
+            pause_line = "⏸ Paused until 12:00am WAT\n"
 
         header = (
             f"🕒 Time (WAT): {now_time}\n"
@@ -762,7 +779,8 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             [format_market_detail(sym, bot_logic.market_debug.get(sym, {})) for sym in MARKETS]
         )
 
-        await q.edit_message_text(header + details, reply_markup=main_keyboard())
+        await _safe_edit(q, header + details, reply_markup=main_keyboard())
+
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
@@ -775,6 +793,7 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n",
         reply_markup=main_keyboard()
     )
+
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
