@@ -41,7 +41,7 @@ DURATION_MIN = 1  # 1-minute expiry
 # ========================= EMA50 SLOPE + DAILY TARGET =========================
 EMA_SLOPE_LOOKBACK = 10
 EMA_SLOPE_MIN = 0.0
-DAILY_PROFIT_TARGET = 5.0
+DAILY_PROFIT_TARGET = 1.40
 
 # ========================= PAYOUT MODE =========================
 USE_PAYOUT_MODE = True
