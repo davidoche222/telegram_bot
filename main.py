@@ -116,8 +116,10 @@ def fmt_time_hhmmss(epoch):
         return "—"
 
 
+# ✅ CHANGED: round UP to 2dp (prevents buy cap rounding down)
 def money2(x: float) -> float:
-    return float(f"{x:.2f}")
+    import math
+    return math.ceil(float(x) * 100.0) / 100.0
 
 
 # ========================= BOT CORE =========================
@@ -516,6 +518,7 @@ class DerivSniperBot:
                     "symbol": symbol
                 }
 
+                # ---- Attempt 1 ----
                 prop = await self.api.proposal(proposal_req)
                 if "error" in prop:
                     err = prop["error"].get("message", "Proposal error")
@@ -537,13 +540,57 @@ class DerivSniperBot:
                     self.cooldown_until = time.time() + COOLDOWN_SEC
                     return
 
-                buy_price_cap = money2(ask_price + BUY_PRICE_BUFFER)
+                # ✅ CHANGED: bigger cap of (ask+buffer) OR (ask*1.10), then round UP
+                buy_price_cap = money2(max(ask_price + BUY_PRICE_BUFFER, ask_price * 1.10))
 
                 buy = await self.api.buy({"buy": proposal_id, "price": buy_price_cap})
+
+                # ✅ CHANGED: one retry if market moved too much
                 if "error" in buy:
-                    err = buy["error"].get("message", "Buy error")
-                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Trade Refused:\n{err}")
-                    return
+                    err_msg = str(buy["error"].get("message", "Buy error"))
+                    low = err_msg.lower()
+
+                    if ("moved too much" in low) or ("price has changed" in low):
+                        # short wait then retry with a fresh proposal + bigger cap
+                        await asyncio.sleep(0.25)
+
+                        prop2 = await self.api.proposal(proposal_req)
+                        if "error" in prop2:
+                            err2 = prop2["error"].get("message", "Proposal error")
+                            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Proposal Error (retry):\n{err2}")
+                            return
+
+                        p2 = prop2["proposal"]
+                        proposal_id2 = p2["id"]
+                        ask_price2 = float(p2.get("ask_price", 0.0))
+
+                        if ask_price2 <= 0:
+                            await self.app.bot.send_message(TELEGRAM_CHAT_ID, "❌ Proposal retry returned invalid ask_price.")
+                            return
+
+                        if ask_price2 > float(MAX_STAKE_ALLOWED):
+                            await self.app.bot.send_message(
+                                TELEGRAM_CHAT_ID,
+                                f"⛔️ Skipped (retry): payout=${payout:.2f} needs stake=${ask_price2:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
+                            )
+                            self.cooldown_until = time.time() + COOLDOWN_SEC
+                            return
+
+                        buy_price_cap2 = money2(max(ask_price2 + BUY_PRICE_BUFFER, ask_price2 * 1.15))  # a bit more on retry
+                        buy = await self.api.buy({"buy": proposal_id2, "price": buy_price_cap2})
+
+                        if "error" in buy:
+                            err3 = buy["error"].get("message", "Buy error")
+                            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Trade Refused (retry):\n{err3}")
+                            return
+
+                        # use retry prices for display
+                        proposal_id = proposal_id2
+                        ask_price = ask_price2
+                        buy_price_cap = buy_price_cap2
+                    else:
+                        await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Trade Refused:\n{err_msg}")
+                        return
 
                 self.active_trade_info = int(buy["buy"]["contract_id"])
                 self.active_market = symbol
@@ -666,35 +713,23 @@ def format_market_detail(sym: str, d: dict) -> str:
 
 
 # ========================= ✅ FIX: CALLBACK "query too old" =========================
-# Telegram requires you answer callback queries fast (<~10s).
-# Some branches do network calls (Deriv) before edit_message_text, so we:
-# 1) answer immediately with q.answer()
-# 2) show a quick "Working..." placeholder
-# 3) do work, then edit again with final text
-# Also: if Telegram still says "query too old", we swallow it.
-
 async def _safe_answer(q, text: str | None = None, show_alert: bool = False):
     try:
         await q.answer(text=text, show_alert=show_alert)
     except Exception as e:
-        # ignore: "Query is too old and response timeout expired" etc
         logger.warning(f"Callback answer ignored: {e}")
 
 async def _safe_edit(q, text: str, reply_markup=None):
     try:
         await q.edit_message_text(text, reply_markup=reply_markup)
     except Exception as e:
-        # If message already edited / too old / not modified etc
         logger.warning(f"Edit failed: {e}")
 
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
 
-    # ✅ immediately answer to prevent "query too old"
     await _safe_answer(q)
-
-    # ✅ quick immediate feedback to user
     await _safe_edit(q, "⏳ Working...", reply_markup=main_keyboard())
 
     if q.data == "SET_DEMO":
@@ -732,7 +767,6 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await _safe_edit(q, "⏹️ Scanner stopped.", reply_markup=main_keyboard())
 
     elif q.data == "TEST_BUY":
-        # don't block UI—run in background
         asyncio.create_task(bot_logic.execute_trade("CALL", "R_10", "Manual Test", source="MANUAL"))
         await _safe_edit(q, "🧪 Test trade triggered (CALL R 10).", reply_markup=main_keyboard())
 
