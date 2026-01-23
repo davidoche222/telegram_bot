@@ -45,7 +45,7 @@ DAILY_PROFIT_TARGET = 5.0
 
 # ========================= PAYOUT MODE (✅ FIXED PAYOUT = $1) =========================
 USE_PAYOUT_MODE = True
-PAYOUT_TARGET = 1.00          # ✅ payout = $1
+PAYOUT_TARGET = 0.74        # ✅ payout = $1
 MAX_STAKE_ALLOWED = 5.00      # safety cap: if Deriv needs > this stake for $1 payout, skip trade
 BUY_PRICE_BUFFER = 0.02       # buffer above ask_price to avoid rounding/refusal
 
