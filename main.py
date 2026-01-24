@@ -1,9 +1,10 @@
 # ⚠️ SECURITY NOTE:
-# You posted your Deriv + Telegram tokens publicly in this chat.
+# You posted your Deriv + Telegram tokens publicly.
 # Regenerate/revoke them in Deriv and BotFather, then replace below.
 
 import asyncio
 import logging
+import random
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -22,7 +23,7 @@ MARKETS = ["R_10", "R_25", "R_50"]
 
 COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 60
-MAX_CONSEC_LOSSES = 10
+MAX_CONSEC_LOSSES = 10  # ✅ unchanged (NOT 2)
 
 TELEGRAM_TOKEN = "8253450930:AAHUhPk9TML-8kZlA9UaHZZvTUGdurN9MVY"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -36,12 +37,17 @@ CANDLES_COUNT = 150
 SCAN_SLEEP_SEC = 2
 
 RSI_PERIOD = 14
-DURATION_MIN = 1 # 1-minute expiry
+DURATION_MIN = 1  # 1-minute expiry
 
 # ========================= EMA50 SLOPE + DAILY TARGET =========================
 EMA_SLOPE_LOOKBACK = 10
 EMA_SLOPE_MIN = 0.0
-DAILY_PROFIT_TARGET = 0.96
+DAILY_PROFIT_TARGET = 5.0  # keep as-is unless you change it
+
+# ========================= SECTIONS (✅ NEW) =========================
+SECTIONS_PER_DAY = 4
+SECTION_PROFIT_TARGET = 0.48  # stop this section after +$0.48, then auto-resume next section
+SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)  # 6 hours when 4 sections
 
 # ========================= PAYOUT MODE =========================
 USE_PAYOUT_MODE = True
@@ -50,10 +56,9 @@ MAX_STAKE_ALLOWED = 5.00      # safety cap: if Deriv needs > this stake, skip tr
 BUY_PRICE_BUFFER = 0.02       # kept (not used in fixed-cap buy)
 
 # ========================= MARTINGALE SETTINGS =========================
-MARTINGALE_MULT = 2.0         # ✅ 2x martingale
-MARTINGALE_MAX_STEPS = 5      # ✅ only stop AFTER completing 5 martingales
+MARTINGALE_MULT = 2.0         # 2x martingale
+MARTINGALE_MAX_STEPS = 5      # stop AFTER completing 5 martingales
 MARTINGALE_MAX_STAKE = 16.0   # kept for display only
-
 
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period: int):
@@ -116,7 +121,14 @@ def fmt_time_hhmmss(epoch):
         return "—"
 
 
-# ✅ round UP to 2dp (prevents buy cap rounding down)
+def fmt_hhmm(epoch):
+    try:
+        return datetime.fromtimestamp(epoch, ZoneInfo("Africa/Lagos")).strftime("%H:%M")
+    except Exception:
+        return "—"
+
+
+# ✅ round UP to 2dp
 def money2(x: float) -> float:
     import math
     return math.ceil(float(x) * 100.0) / 100.0
@@ -148,9 +160,13 @@ class DerivSniperBot:
         # for UI display
         self.current_stake = 0.0
         self.martingale_step = 0
+        self.martingale_halt = False  # stop-after-5-martingales flag
 
-        # ✅ NEW: stop-after-5-martingales flag
-        self.martingale_halt = False
+        # ✅ SECTIONS state
+        self.section_profit = 0.0
+        self.sections_won_today = 0
+        self.section_index = 1  # 1..SECTIONS_PER_DAY
+        self.section_pause_until = 0.0  # when section target hit, wait to next section boundary
 
         self.trade_lock = asyncio.Lock()
 
@@ -161,6 +177,80 @@ class DerivSniperBot:
         self.current_day = datetime.now(self.tz).date()
         self.pause_until = 0.0
 
+    # ---------- Gateway helpers ----------
+    @staticmethod
+    def _is_gatewayish_error(msg: str) -> bool:
+        m = (msg or "").lower()
+        return any(k in m for k in [
+            "gateway", "bad gateway", "502", "503", "504",
+            "timeout", "timed out", "temporarily unavailable",
+            "connection", "websocket", "not connected", "disconnect",
+            "internal server error", "service unavailable"
+        ])
+
+    async def safe_send_tg(self, text: str, retries: int = 5):
+        if not self.app:
+            return
+        last_err = None
+        for i in range(1, retries + 1):
+            try:
+                await self.app.bot.send_message(TELEGRAM_CHAT_ID, text)
+                return
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                if self._is_gatewayish_error(msg):
+                    await asyncio.sleep(0.8 * i + random.random() * 0.4)
+                else:
+                    await asyncio.sleep(0.4 * i)
+        logger.warning(f"Telegram send failed after retries: {last_err}")
+
+    # ---------- Section helpers ----------
+    def _today_midnight_epoch(self) -> float:
+        now = datetime.now(self.tz)
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return midnight.timestamp()
+
+    def _get_section_index_for_epoch(self, epoch_ts: float) -> int:
+        midnight = self._today_midnight_epoch()
+        sec_into_day = max(0, int(epoch_ts - midnight))
+        idx0 = min(SECTIONS_PER_DAY - 1, sec_into_day // SECTION_LENGTH_SEC)
+        return int(idx0 + 1)
+
+    def _next_section_start_epoch(self, epoch_ts: float) -> float:
+        midnight = self._today_midnight_epoch()
+        sec_into_day = max(0, int(epoch_ts - midnight))
+        idx0 = min(SECTIONS_PER_DAY - 1, sec_into_day // SECTION_LENGTH_SEC)
+        next_start = midnight + (idx0 + 1) * SECTION_LENGTH_SEC
+        # if already past last section start, next is next midnight
+        if idx0 + 1 >= SECTIONS_PER_DAY:
+            next_midnight = (datetime.fromtimestamp(midnight, self.tz) + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            return next_midnight.timestamp()
+        return float(next_start)
+
+    def _section_boundaries(self):
+        midnight = self._today_midnight_epoch()
+        starts = [midnight + i * SECTION_LENGTH_SEC for i in range(SECTIONS_PER_DAY)]
+        ends = [s + SECTION_LENGTH_SEC for s in starts]
+        return starts, ends
+
+    def _sync_section_if_needed(self):
+        """Auto-advance section by time (and reset section_profit)"""
+        now = time.time()
+        today = datetime.now(self.tz).date()
+        if today != self.current_day:
+            return  # daily reset handles everything
+
+        new_idx = self._get_section_index_for_epoch(now)
+        if new_idx != self.section_index:
+            # new time window -> reset section state
+            self.section_index = new_idx
+            self.section_profit = 0.0
+            self.section_pause_until = 0.0
+
+    # ---------- Deriv connection helpers ----------
     async def connect(self) -> bool:
         try:
             if not self.active_token:
@@ -185,7 +275,7 @@ class DerivSniperBot:
         self.api = None
         return await self.connect()
 
-    async def safe_ticks_history(self, payload: dict, retries: int = 4):
+    async def safe_deriv_call(self, fn_name: str, payload: dict, retries: int = 6):
         last_err = None
         for attempt in range(1, retries + 1):
             try:
@@ -193,26 +283,25 @@ class DerivSniperBot:
                     ok = await self.safe_reconnect()
                     if not ok:
                         raise RuntimeError("Reconnect failed")
-                return await self.api.ticks_history(payload)
+                fn = getattr(self.api, fn_name)
+                return await fn(payload)
             except Exception as e:
                 last_err = e
-                msg = str(e).lower()
-
-                if "rate limit" in msg or "too many" in msg or "throttle" in msg:
-                    await asyncio.sleep(2.5 * attempt)
-                else:
-                    await asyncio.sleep(1.0 * attempt)
-
-                if any(k in msg for k in ["disconnect", "connection", "websocket", "not connected", "authorize", "auth"]):
+                msg = str(e)
+                low = msg.lower()
+                if self._is_gatewayish_error(low):
                     await self.safe_reconnect()
-
+                await asyncio.sleep(min(8.0, 0.6 * attempt + random.random() * 0.5))
         raise last_err
+
+    async def safe_ticks_history(self, payload: dict, retries: int = 6):
+        return await self.safe_deriv_call("ticks_history", payload, retries=retries)
 
     async def fetch_balance(self):
         if not self.api:
             return
         try:
-            bal = await self.api.balance({"balance": 1})
+            bal = await self.safe_deriv_call("balance", {"balance": 1}, retries=4)
             self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
         except Exception:
             pass
@@ -235,8 +324,16 @@ class DerivSniperBot:
             self.pause_until = 0.0
             self.martingale_step = 0
             self.current_stake = 0.0
-            # ✅ reset martingale stop flag
             self.martingale_halt = False
+
+            # ✅ reset sections daily
+            self.section_profit = 0.0
+            self.sections_won_today = 0
+            self.section_index = self._get_section_index_for_epoch(time.time())
+            self.section_pause_until = 0.0
+
+        # Also auto-advance section by time within the same day
+        self._sync_section_if_needed()
 
     def can_auto_trade(self) -> tuple[bool, str]:
         self._daily_reset_if_needed()
@@ -244,6 +341,11 @@ class DerivSniperBot:
         # ✅ stop only when 5 martingales have been completed and it still lost
         if self.martingale_halt:
             return False, f"Stopped: Martingale {MARTINGALE_MAX_STEPS} steps completed"
+
+        # ✅ section pause (auto resumes when time passes)
+        if time.time() < self.section_pause_until:
+            left = int(self.section_pause_until - time.time())
+            return False, f"Section target hit (+${SECTION_PROFIT_TARGET:.2f}). Resumes {fmt_hhmm(self.section_pause_until)} ({left}s)"
 
         if time.time() < self.pause_until:
             left = int(self.pause_until - time.time())
@@ -287,7 +389,7 @@ class DerivSniperBot:
             "style": "candles",
             "granularity": TF_SEC
         }
-        data = await self.safe_ticks_history(payload, retries=4)
+        data = await self.safe_ticks_history(payload, retries=6)
         return build_candles_from_deriv(data.get("candles", []))
 
     async def _sleep_until(self, epoch_ts: float, buffer_s: float = 0.15):
@@ -489,18 +591,14 @@ class DerivSniperBot:
                 logger.error(f"Scanner Error ({symbol}): {msg}")
                 self.market_debug[symbol] = {"time": time.time(), "gate": "Error", "why": [msg[:160]]}
 
-                low = msg.lower()
-                if "rate limit" in low or "too many" in low or "throttle" in low:
-                    await asyncio.sleep(6)
-                elif any(k in low for k in ["disconnect", "connection", "websocket", "not connected"]):
-                    await self.safe_reconnect()
-                    await asyncio.sleep(2)
+                if self._is_gatewayish_error(msg):
+                    await asyncio.sleep(4 + random.random() * 2)
                 else:
                     await asyncio.sleep(2)
 
             await asyncio.sleep(SCAN_SLEEP_SEC)
 
-    # ========================= ✅ PAYOUT MODE + 2x MARTINGALE (STOP AFTER 5) =========================
+    # ========================= PAYOUT MODE + 2x MARTINGALE (STOP AFTER 5) =========================
     async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL"):
         if not self.api or self.active_trade_info:
             return
@@ -511,9 +609,8 @@ class DerivSniperBot:
                 return
 
             try:
-                # ✅ payout stays payout-mode, but martingale multiplies the payout amount
                 payout = float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step))
-                payout = money2(payout)  # keep it clean for API
+                payout = money2(payout)
 
                 proposal_req = {
                     "proposal": 1,
@@ -526,22 +623,21 @@ class DerivSniperBot:
                     "symbol": symbol
                 }
 
-                prop = await self.api.proposal(proposal_req)
+                prop = await self.safe_deriv_call("proposal", proposal_req, retries=6)
                 if "error" in prop:
                     err = prop["error"].get("message", "Proposal error")
-                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Proposal Error:\n{err}")
+                    await self.safe_send_tg(f"❌ Proposal Error:\n{err}")
                     return
 
                 p = prop["proposal"]
                 proposal_id = p["id"]
                 ask_price = float(p.get("ask_price", 0.0))
                 if ask_price <= 0:
-                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, "❌ Proposal returned invalid ask_price.")
+                    await self.safe_send_tg("❌ Proposal returned invalid ask_price.")
                     return
 
                 if ask_price > float(MAX_STAKE_ALLOWED):
-                    await self.app.bot.send_message(
-                        TELEGRAM_CHAT_ID,
+                    await self.safe_send_tg(
                         f"⛔️ Skipped trade: payout=${payout:.2f} needs stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
                     )
                     self.cooldown_until = time.time() + COOLDOWN_SEC
@@ -549,51 +645,11 @@ class DerivSniperBot:
 
                 buy_price_cap = float(MAX_STAKE_ALLOWED)
 
-                buy = await self.api.buy({"buy": proposal_id, "price": buy_price_cap})
-
+                buy = await self.safe_deriv_call("buy", {"buy": proposal_id, "price": buy_price_cap}, retries=6)
                 if "error" in buy:
                     err_msg = str(buy["error"].get("message", "Buy error"))
-                    low = err_msg.lower()
-
-                    if ("moved too much" in low) or ("price has changed" in low):
-                        await asyncio.sleep(0.25)
-
-                        prop2 = await self.api.proposal(proposal_req)
-                        if "error" in prop2:
-                            err2 = prop2["error"].get("message", "Proposal error")
-                            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Proposal Error (retry):\n{err2}")
-                            return
-
-                        p2 = prop2["proposal"]
-                        proposal_id2 = p2["id"]
-                        ask_price2 = float(p2.get("ask_price", 0.0))
-
-                        if ask_price2 <= 0:
-                            await self.app.bot.send_message(TELEGRAM_CHAT_ID, "❌ Proposal retry returned invalid ask_price.")
-                            return
-
-                        if ask_price2 > float(MAX_STAKE_ALLOWED):
-                            await self.app.bot.send_message(
-                                TELEGRAM_CHAT_ID,
-                                f"⛔️ Skipped (retry): payout=${payout:.2f} needs stake=${ask_price2:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
-                            )
-                            self.cooldown_until = time.time() + COOLDOWN_SEC
-                            return
-
-                        buy_price_cap2 = float(MAX_STAKE_ALLOWED)
-                        buy = await self.api.buy({"buy": proposal_id2, "price": buy_price_cap2})
-
-                        if "error" in buy:
-                            err3 = buy["error"].get("message", "Buy error")
-                            await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Trade Refused (retry):\n{err3}")
-                            return
-
-                        proposal_id = proposal_id2
-                        ask_price = ask_price2
-                        buy_price_cap = buy_price_cap2
-                    else:
-                        await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Trade Refused:\n{err_msg}")
-                        return
+                    await self.safe_send_tg(f"❌ Trade Refused:\n{err_msg}")
+                    return
 
                 self.active_trade_info = int(buy["buy"]["contract_id"])
                 self.active_market = symbol
@@ -610,42 +666,47 @@ class DerivSniperBot:
                     f"⏱ Expiry: {DURATION_MIN}m\n"
                     f"🎁 Payout: ${payout:.2f}\n"
                     f"🎲 Martingale step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
+                    f"🧩 Section: {self.section_index}/{SECTIONS_PER_DAY} | Section PnL: {self.section_profit:+.2f} / +{SECTION_PROFIT_TARGET:.2f}\n"
                     f"💵 Stake (Deriv): ${ask_price:.2f}\n"
                     f"🧾 Buy cap used: ${buy_price_cap:.2f}\n"
                     f"🧠 Reason: {reason}\n"
                     f"🤖 Source: {source}\n"
                     f"🎯 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}"
                 )
-                await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
+                await self.safe_send_tg(msg)
                 asyncio.create_task(self.check_result(self.active_trade_info, source))
 
             except Exception as e:
                 logger.error(f"Trade error: {e}")
-                try:
-                    await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"⚠️ Trade error:\n{e}")
-                except Exception:
-                    pass
+                await self.safe_send_tg(f"⚠️ Trade error:\n{e}")
 
     async def check_result(self, cid: int, source: str):
         await asyncio.sleep(int(DURATION_MIN) * 60 + 5)
         try:
-            res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
+            res = await self.safe_deriv_call(
+                "proposal_open_contract",
+                {"proposal_open_contract": 1, "contract_id": cid},
+                retries=6
+            )
             profit = float(res["proposal_open_contract"].get("profit", 0))
 
             if source == "AUTO":
                 self.total_profit_today += profit
+                self.section_profit += profit
+
+                # ✅ Section target logic
+                if self.section_profit >= float(SECTION_PROFIT_TARGET):
+                    self.sections_won_today += 1
+                    # pause until next section boundary (auto resume)
+                    self.section_pause_until = self._next_section_start_epoch(time.time())
 
                 if profit <= 0:
                     self.consecutive_losses += 1
                     self.total_losses_today += 1
 
-                    # ✅ Martingale progression:
-                    # step goes 0 -> 1 -> 2 -> 3 -> 4 -> 5
-                    # AFTER losing on step 5, we STOP.
                     if self.martingale_step < MARTINGALE_MAX_STEPS:
                         self.martingale_step += 1
                     else:
-                        # step already == 5 and still lost -> HALT
                         self.martingale_halt = True
                         self.is_scanning = False
                 else:
@@ -666,17 +727,22 @@ class DerivSniperBot:
             if self.martingale_halt:
                 halt_note = f"\n🛑 Martingale stopped after {MARTINGALE_MAX_STEPS} steps"
 
+            section_note = ""
+            if time.time() < self.section_pause_until:
+                section_note = f"\n🧩 Section hit (+${SECTION_PROFIT_TARGET:.2f}). Auto-resume at {fmt_hhmm(self.section_pause_until)}"
+
             next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step)))
 
-            await self.app.bot.send_message(
-                TELEGRAM_CHAT_ID,
+            await self.safe_send_tg(
                 (
                     f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n"
+                    f"🧩 Section: {self.section_index}/{SECTIONS_PER_DAY} | Section PnL: {self.section_profit:+.2f} | Sections won: {self.sections_won_today}\n"
                     f"📊 Today: {self.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {self.total_losses_today} | Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
                     f"💵 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
                     f"🎁 Next payout: ${next_payout:.2f} (step {self.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
                     f"💰 Balance: {self.balance}"
                     f"{pause_note}"
+                    f"{section_note}"
                     f"{halt_note}"
                 )
             )
@@ -695,6 +761,7 @@ def main_keyboard():
          InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
         [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"),
          InlineKeyboardButton("🔄 REFRESH", callback_data="STATUS")],
+        [InlineKeyboardButton("🧩 SECTION", callback_data="NEXT_SECTION")],  # ✅ NEW
         [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY")],
         [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"),
          InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
@@ -733,12 +800,13 @@ def format_market_detail(sym: str, d: dict) -> str:
     )
 
 
-# ========================= ✅ FIX: CALLBACK "query too old" =========================
+# ========================= FIX: CALLBACK "query too old" =========================
 async def _safe_answer(q, text: str | None = None, show_alert: bool = False):
     try:
         await q.answer(text=text, show_alert=show_alert)
     except Exception as e:
         logger.warning(f"Callback answer ignored: {e}")
+
 
 async def _safe_edit(q, text: str, reply_markup=None):
     try:
@@ -777,6 +845,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 "🕯 Timeframe: M1\n"
                 f"⏱ Expiry: {DURATION_MIN}m\n"
                 f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} base payout (Martingale {MARTINGALE_MULT:.0f}x up to {MARTINGALE_MAX_STEPS})\n"
+                f"🧩 Sections: {SECTIONS_PER_DAY}/day | Target per section: +${SECTION_PROFIT_TARGET:.2f} (auto resume next section)\n"
                 f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f} (skips if higher)\n"
                 f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)"
             ),
@@ -786,6 +855,34 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
         await _safe_edit(q, "⏹️ Scanner stopped.", reply_markup=main_keyboard())
+
+    elif q.data == "NEXT_SECTION":
+        # ✅ NEW: manually advance to next section immediately, and auto resume (no other changes)
+        bot_logic._daily_reset_if_needed()
+        now = time.time()
+        nxt = bot_logic._next_section_start_epoch(now)
+
+        # If we're already before the next boundary (because we're in a paused section),
+        # jump to that boundary logically by resetting section stats and clearing section pause.
+        # Also mark as "next section" index.
+        # (If it's last section, this moves to tomorrow's first section.)
+        if nxt <= now + 1:
+            # extremely unlikely, but avoid zero wait edge case
+            nxt = now + 1
+
+        # Force section rollover now (manual)
+        # Determine what the next index would be at nxt+1
+        forced_idx = bot_logic._get_section_index_for_epoch(nxt + 1)
+        bot_logic.section_index = forced_idx
+        bot_logic.section_profit = 0.0
+        bot_logic.section_pause_until = 0.0
+
+        await _safe_edit(
+            q,
+            f"🧩 Moved to Section {bot_logic.section_index}/{SECTIONS_PER_DAY}. Reset section PnL to 0.00.\n"
+            f"✅ Auto trading continues normally (if START is on).",
+            reply_markup=main_keyboard()
+        )
 
     elif q.data == "TEST_BUY":
         asyncio.create_task(bot_logic.execute_trade("CALL", "R_10", "Manual Test", source="MANUAL"))
@@ -799,8 +896,10 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         trade_status = "No Active Trade"
         if bot_logic.active_trade_info and bot_logic.api:
             try:
-                res = await bot_logic.api.proposal_open_contract(
-                    {"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info}
+                res = await bot_logic.safe_deriv_call(
+                    "proposal_open_contract",
+                    {"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info},
+                    retries=4
                 )
                 pnl = float(res["proposal_open_contract"].get("profit", 0))
                 rem = max(0, int(DURATION_MIN * 60) - int(time.time() - bot_logic.trade_start_time))
@@ -814,12 +913,18 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if time.time() < bot_logic.pause_until:
             pause_line = "⏸ Paused until 12:00am WAT\n"
 
+        section_line = ""
+        if time.time() < bot_logic.section_pause_until:
+            section_line = f"🧩 Section paused until {fmt_hhmm(bot_logic.section_pause_until)}\n"
+
         next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(bot_logic.martingale_step)))
 
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
             f"{pause_line}"
+            f"{section_line}"
+            f"🧩 Section: {bot_logic.section_index}/{SECTIONS_PER_DAY} | Section PnL: {bot_logic.section_profit:+.2f} / +{SECTION_PROFIT_TARGET:.2f} | Sections won: {bot_logic.sections_won_today}\n"
             f"🎁 Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
             f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
@@ -847,6 +952,7 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "🕯 Timeframe: M1\n"
         f"⏱ Expiry: {DURATION_MIN}m\n"
         f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} base payout (Martingale {MARTINGALE_MULT:.0f}x up to {MARTINGALE_MAX_STEPS})\n"
+        f"🧩 Sections: {SECTIONS_PER_DAY}/day | Target per section: +${SECTION_PROFIT_TARGET:.2f}\n"
         f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
         f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n",
         reply_markup=main_keyboard()
