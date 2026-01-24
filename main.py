@@ -60,6 +60,17 @@ MARTINGALE_MULT = 2.0         # 2x martingale
 MARTINGALE_MAX_STEPS = 5      # stop AFTER completing 5 martingales
 MARTINGALE_MAX_STAKE = 16.0   # kept for display only
 
+# ========================= ✅ HIGHER TIMEFRAME BIAS (ADDED) =========================
+# This is ONLY a filter (does not change your UI/flow):
+# - For CALL on M1: HTF must be BULL (HTF EMA20 > EMA50)
+# - For PUT on M1:  HTF must be BEAR (HTF EMA20 < EMA50)
+USE_HTF_BIAS = True
+HTF_SEC = 300                 # M5 candles
+HTF_CANDLES_COUNT = 140        # enough for EMA50 stability
+HTF_EMA_FAST = 20
+HTF_EMA_SLOW = 50
+HTF_REFRESH_SEC = 20           # cache refresh to reduce API calls
+
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period: int):
     values = np.array(values, dtype=float)
@@ -176,6 +187,9 @@ class DerivSniperBot:
         self.tz = ZoneInfo("Africa/Lagos")
         self.current_day = datetime.now(self.tz).date()
         self.pause_until = 0.0
+
+        # ✅ HTF cache (ADDED)
+        self.htf_cache = {m: {"ts": 0.0, "bias": "N/A"} for m in MARKETS}
 
     # ---------- Gateway helpers ----------
     @staticmethod
@@ -306,6 +320,47 @@ class DerivSniperBot:
         except Exception:
             pass
 
+    # ========================= ✅ HTF BIAS (ADDED) =========================
+    async def _get_htf_bias(self, symbol: str) -> str:
+        """
+        Returns: "BULL", "BEAR", or "N/A"
+        Cache is used to avoid hammering the API.
+        """
+        if not USE_HTF_BIAS:
+            return "N/A"
+
+        now = time.time()
+        cached = self.htf_cache.get(symbol, {"ts": 0.0, "bias": "N/A"})
+        if (now - float(cached.get("ts", 0.0))) < float(HTF_REFRESH_SEC) and cached.get("bias") != "N/A":
+            return str(cached.get("bias", "N/A"))
+
+        payload = {
+            "ticks_history": symbol,
+            "end": "latest",
+            "count": int(HTF_CANDLES_COUNT),
+            "style": "candles",
+            "granularity": int(HTF_SEC),
+        }
+        data = await self.safe_ticks_history(payload, retries=6)
+        candles = build_candles_from_deriv(data.get("candles", []))
+        if len(candles) < (HTF_EMA_SLOW + 5):
+            self.htf_cache[symbol] = {"ts": now, "bias": "N/A"}
+            return "N/A"
+
+        closes = [x["c"] for x in candles]
+        ema_fast_arr = calculate_ema(closes, int(HTF_EMA_FAST))
+        ema_slow_arr = calculate_ema(closes, int(HTF_EMA_SLOW))
+        if len(ema_fast_arr) == 0 or len(ema_slow_arr) == 0:
+            self.htf_cache[symbol] = {"ts": now, "bias": "N/A"}
+            return "N/A"
+
+        ema_fast = float(ema_fast_arr[-2])  # last closed HTF candle
+        ema_slow = float(ema_slow_arr[-2])
+
+        bias = "BULL" if ema_fast > ema_slow else "BEAR" if ema_fast < ema_slow else "N/A"
+        self.htf_cache[symbol] = {"ts": now, "bias": bias}
+        return bias
+
     # ========================= DAILY RESET / PAUSE =========================
     def _next_midnight_epoch(self) -> float:
         now = datetime.now(self.tz)
@@ -331,6 +386,9 @@ class DerivSniperBot:
             self.sections_won_today = 0
             self.section_index = self._get_section_index_for_epoch(time.time())
             self.section_pause_until = 0.0
+
+            # ✅ reset HTF cache daily (ADDED)
+            self.htf_cache = {m: {"ts": 0.0, "bias": "N/A"} for m in MARKETS}
 
         # Also auto-advance section by time within the same day
         self._sync_section_if_needed()
@@ -510,6 +568,14 @@ class DerivSniperBot:
                     downtrend and slope_ok and ema50_falling and touched_ema20 and bear_confirm
                     and close_below_ema20 and put_rsi_ok and not spike_block and not flat_block
                 )
+
+                # ✅ APPLY HTF BIAS FILTER (ADDED) — no UI changes
+                if USE_HTF_BIAS:
+                    htf_bias = await self._get_htf_bias(symbol)
+                    if call_ready and htf_bias != "BULL":
+                        call_ready = False
+                    if put_ready and htf_bias != "BEAR":
+                        put_ready = False
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
 
@@ -862,16 +928,9 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         now = time.time()
         nxt = bot_logic._next_section_start_epoch(now)
 
-        # If we're already before the next boundary (because we're in a paused section),
-        # jump to that boundary logically by resetting section stats and clearing section pause.
-        # Also mark as "next section" index.
-        # (If it's last section, this moves to tomorrow's first section.)
         if nxt <= now + 1:
-            # extremely unlikely, but avoid zero wait edge case
             nxt = now + 1
 
-        # Force section rollover now (manual)
-        # Determine what the next index would be at nxt+1
         forced_idx = bot_logic._get_section_index_for_epoch(nxt + 1)
         bot_logic.section_index = forced_idx
         bot_logic.section_profit = 0.0
