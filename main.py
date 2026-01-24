@@ -33,8 +33,8 @@ logger = logging.getLogger(__name__)
 
 # ========================= STRATEGY SETTINGS =========================
 TF_SEC = 60  # M1 candles
-CANDLES_COUNT = 150
-SCAN_SLEEP_SEC = 2
+CANDLES_COUNT = 120
+SCAN_SLEEP_SEC = 5
 
 RSI_PERIOD = 14
 DURATION_MIN = 1  # 1-minute expiry
