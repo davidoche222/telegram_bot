@@ -19,7 +19,7 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "ZkOFWOlPtwnjqTS"  # replace with your full real token
 APP_ID = 1089
 
-MARKETS = ["R_10", "R_25"]
+MARKETS = ["R_10", "R_25", "R_50"]
 
 COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 60
@@ -37,28 +37,28 @@ CANDLES_COUNT = 120
 SCAN_SLEEP_SEC = 5
 
 RSI_PERIOD = 14
-DURATION_MIN = 1  # 1-minute expiry
+DURATION_MIN = 2  # 1-minute expiry
 
 # ========================= EMA50 SLOPE + DAILY TARGET =========================
 EMA_SLOPE_LOOKBACK = 10
-EMA_SLOPE_MIN = 0.0
-DAILY_PROFIT_TARGET = 5.0  # keep as-is unless you change it
+EMA_SLOPE_MIN = 0.2
+DAILY_PROFIT_TARGET = 2.0  # keep as-is unless you change it
 
 # ========================= SECTIONS (UPDATED) =========================
 SECTIONS_PER_DAY = 4
-SECTION_PROFIT_TARGET = 0.15  # ✅ UPDATED: profit target per section
+SECTION_PROFIT_TARGET = 0.05  # ✅ UPDATED: profit target per section
 SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)  # 6 hours when 4 sections
 
 # ========================= PAYOUT MODE =========================
 USE_PAYOUT_MODE = True
 PAYOUT_TARGET = 1          # base payout (martingale will multiply this)
 MIN_PAYOUT = 0.35             # never request payout below this
-MAX_STAKE_ALLOWED = 5.00      # safety cap: if Deriv needs > this stake, skip trade
+MAX_STAKE_ALLOWED = 10.00      # safety cap: if Deriv needs > this stake, skip trade
 BUY_PRICE_BUFFER = 0.02       # kept (not used in fixed-cap buy)
 
 # ========================= MARTINGALE SETTINGS (UPDATED) =========================
-MARTINGALE_MULT = 1.8         # ✅ UPDATED: 1.8x martingale
-MARTINGALE_MAX_STEPS = 5      # stop AFTER completing 5 martingales
+MARTINGALE_MULT = 1.5         # ✅ UPDATED: 1.8x martingale
+MARTINGALE_MAX_STEPS = 3      # stop AFTER completing 5 martingales
 MARTINGALE_MAX_STAKE = 16.0   # kept for display only
 
 # ========================= INDICATOR MATH =========================
@@ -177,6 +177,8 @@ class DerivSniperBot:
         self.tz = ZoneInfo("Africa/Lagos")
         self.current_day = datetime.now(self.tz).date()
         self.pause_until = 0.0
+
+        self.trade_log = []  # starts a list to log trades
 
     # ---------- Gateway helpers ----------
     @staticmethod
@@ -344,6 +346,10 @@ class DerivSniperBot:
             self.pause_until = self._next_midnight_epoch()
             return False, f"Daily target reached (+${self.total_profit_today:.2f})"
 
+        if self.total_profit_today <= -2.0:
+            self.pause_until = self._next_midnight_epoch()
+            return False, "Stopped: Daily loss limit (-$2.00) reached"
+
         if self.consecutive_losses >= MAX_CONSEC_LOSSES:
             return False, "Stopped: max loss streak reached"
         if self.trades_today >= MAX_TRADES_PER_DAY:
@@ -472,12 +478,12 @@ class DerivSniperBot:
                     spike_mult = 1.2
                     rsi_call_min, rsi_call_max = 53.0, 62.0
                     rsi_put_min, rsi_put_max = 38.0, 47.0
-                    ema_diff_min = 0.30
+                    ema_diff_min = 0.40
                 else:
                     spike_mult = 1.5
-                    rsi_call_min, rsi_call_max = 52.0, 60.0
-                    rsi_put_min, rsi_put_max = 40.0, 48.0
-                    ema_diff_min = 0.20
+                    rsi_call_min, rsi_call_max = 45.0, 65.0
+                    rsi_put_min, rsi_put_max = 35.0, 55.0
+                    ema_diff_min = 0.40
 
                 spike_block = (avg_body > 0 and last_body > spike_mult * avg_body)
 
@@ -490,14 +496,35 @@ class DerivSniperBot:
                 call_rsi_ok = (rsi_call_min <= rsi_now <= rsi_call_max)
                 put_rsi_ok = (rsi_put_min <= rsi_now <= rsi_put_max)
 
+                breakout_call = c_close > pb_high
+                breakout_put = c_close < pb_low
+
+                def calculate_adx(highs, lows, closes, period=14):
+                    highs = np.array(highs)
+                    lows = np.array(lows)
+                    closes = np.array(closes)
+                    up = np.diff(highs)
+                    down = -np.diff(lows)
+                    up[up < 0] = 0
+                    down[down < 0] = 0
+                    tr = np.maximum(np.maximum(np.diff(highs), -np.diff(lows)), np.abs(np.diff(closes)))
+                    atr = np.convolve(tr, np.ones(period)/period, mode='valid')
+                    up_di = 100 * np.convolve(up, np.ones(period)/period, mode='valid') / atr
+                    down_di = 100 * np.convolve(down, np.ones(period)/period, mode='valid') / atr
+                    dx = 100 * np.abs(up_di - down_di) / (up_di + down_di)
+                    adx = np.convolve(dx, np.ones(period)/period, mode='valid')
+                    return adx[-1] if len(adx) > 0 else 0.0
+
+                adx_now = calculate_adx([x["h"] for x in candles[-60:]], [x["l"] for x in candles[-60:]], closes[-60:])
+
                 call_ready = (
                     uptrend and slope_ok and ema50_rising and touched_ema20 and bull_confirm
-                    and close_above_ema20 and call_rsi_ok and not spike_block and not flat_block
+                    and close_above_ema20 and call_rsi_ok and not spike_block and not flat_block and adx_now > 25 and breakout_call
                 )
 
                 put_ready = (
                     downtrend and slope_ok and ema50_falling and touched_ema20 and bear_confirm
-                    and close_below_ema20 and put_rsi_ok and not spike_block and not flat_block
+                    and close_below_ema20 and put_rsi_ok and not spike_block and not flat_block and adx_now > 25 and breakout_put
                 )
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
@@ -608,6 +635,11 @@ class DerivSniperBot:
                 payout = max(float(MIN_PAYOUT), float(payout))
                 payout = money2(payout)
 
+                bal_response = await self.safe_deriv_call("balance", {"balance": 1})
+                bal = float(bal_response['balance']['balance'])
+                max_stake = bal * 0.01
+                payout = min(payout, max_stake * 0.8)
+
                 proposal_req = {
                     "proposal": 1,
                     "amount": payout,
@@ -634,7 +666,7 @@ class DerivSniperBot:
 
                 if ask_price > float(MAX_STAKE_ALLOWED):
                     await self.safe_send_tg(
-                        f"⛔️ Skipped trade: payout=${payout:.2f} needs stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
+                        f"⛔️ Skipped trade: payout=\( {payout:.2f} needs stake= \){ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
                     )
                     self.cooldown_until = time.time() + COOLDOWN_SEC
                     return
@@ -670,13 +702,13 @@ class DerivSniperBot:
                     f"🎯 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}"
                 )
                 await self.safe_send_tg(msg)
-                asyncio.create_task(self.check_result(self.active_trade_info, source))
+                asyncio.create_task(self.check_result(self.active_trade_info, source, side, rsi_now, ema50_slope))
 
             except Exception as e:
                 logger.error(f"Trade error: {e}")
                 await self.safe_send_tg(f"⚠️ Trade error:\n{e}")
 
-    async def check_result(self, cid: int, source: str):
+    async def check_result(self, cid: int, source: str, side: str, rsi_now: float, ema50_slope: float):
         await asyncio.sleep(int(DURATION_MIN) * 60 + 5)
         try:
             res = await self.safe_deriv_call(
@@ -728,6 +760,9 @@ class DerivSniperBot:
 
             next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step)))
 
+            log_entry = f"Time: {datetime.now(self.tz).strftime('%Y-%m-%d %H:%M:%S')}, Side: {side}, Profit: {profit}, Stake: {self.current_stake}, RSI: {rsi_now}, Slope: {ema50_slope}"
+            self.trade_log.append(log_entry)
+
             await self.safe_send_tg(
                 (
                     f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n"
@@ -741,6 +776,11 @@ class DerivSniperBot:
                     f"{halt_note}"
                 )
             )
+            if profit <= 0:
+                if self.consecutive_losses >= 3:
+                    self.cooldown_until = time.time() + 900
+                elif self.consecutive_losses >= 2:
+                    self.cooldown_until = time.time() + 300
         finally:
             self.active_trade_info = None
             self.cooldown_until = time.time() + COOLDOWN_SEC
@@ -841,7 +881,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 f"⏱ Expiry: {DURATION_MIN}m\n"
                 f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} base payout (Martingale {MARTINGALE_MULT:.2f}x up to {MARTINGALE_MAX_STEPS})\n"
                 f"🧩 Sections: {SECTIONS_PER_DAY}/day | Target per section: +${SECTION_PROFIT_TARGET:.2f} (auto resume next section)\n"
-                f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f} (skips if higher)\n"
+                f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
                 f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)"
             ),
             reply_markup=main_keyboard()
