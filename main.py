@@ -23,7 +23,7 @@ MARKETS = ["R_10", "R_25"]
 
 COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 60
-MAX_CONSEC_LOSSES = 10  # ✅ unchanged (NOT 2)
+MAX_CONSEC_LOSSES = 10  # ✅ unchanged
 
 TELEGRAM_TOKEN = "8253450930:AAHUhPk9TML-8kZlA9UaHZZvTUGdurN9MVY"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -44,33 +44,22 @@ EMA_SLOPE_LOOKBACK = 10
 EMA_SLOPE_MIN = 0.0
 DAILY_PROFIT_TARGET = 5.0  # keep as-is unless you change it
 
-# ========================= SECTIONS (✅ NEW) =========================
+# ========================= SECTIONS (UPDATED) =========================
 SECTIONS_PER_DAY = 4
-SECTION_PROFIT_TARGET = 0.48  # stop this section after +$0.48, then auto-resume next section
+SECTION_PROFIT_TARGET = 0.15  # ✅ UPDATED: profit target per section
 SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)  # 6 hours when 4 sections
 
 # ========================= PAYOUT MODE =========================
 USE_PAYOUT_MODE = True
 PAYOUT_TARGET = 0.74          # base payout (martingale will multiply this)
-MIN_PAYOUT = 0.35             # ✅ NEW: never request payout below this
+MIN_PAYOUT = 0.35             # never request payout below this
 MAX_STAKE_ALLOWED = 5.00      # safety cap: if Deriv needs > this stake, skip trade
 BUY_PRICE_BUFFER = 0.02       # kept (not used in fixed-cap buy)
 
-# ========================= MARTINGALE SETTINGS =========================
-MARTINGALE_MULT = 2.0         # 2x martingale
+# ========================= MARTINGALE SETTINGS (UPDATED) =========================
+MARTINGALE_MULT = 1.8         # ✅ UPDATED: 1.8x martingale
 MARTINGALE_MAX_STEPS = 5      # stop AFTER completing 5 martingales
 MARTINGALE_MAX_STAKE = 16.0   # kept for display only
-
-# ========================= ✅ HIGHER TIMEFRAME BIAS (ADDED) =========================
-# This is ONLY a filter (does not change your UI/flow):
-# - For CALL on M1: HTF must be BULL (HTF EMA20 > EMA50)
-# - For PUT on M1:  HTF must be BEAR (HTF EMA20 < EMA50)
-USE_HTF_BIAS = True
-HTF_SEC = 300                 # M5 candles
-HTF_CANDLES_COUNT = 140        # enough for EMA50 stability
-HTF_EMA_FAST = 20
-HTF_EMA_SLOW = 50
-HTF_REFRESH_SEC = 20           # cache refresh to reduce API calls
 
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period: int):
@@ -172,7 +161,7 @@ class DerivSniperBot:
         # for UI display
         self.current_stake = 0.0
         self.martingale_step = 0
-        self.martingale_halt = False  # stop-after-5-martingales flag
+        self.martingale_halt = False  # stop-after-max-steps flag
 
         # ✅ SECTIONS state
         self.section_profit = 0.0
@@ -188,9 +177,6 @@ class DerivSniperBot:
         self.tz = ZoneInfo("Africa/Lagos")
         self.current_day = datetime.now(self.tz).date()
         self.pause_until = 0.0
-
-        # ✅ HTF cache (ADDED)
-        self.htf_cache = {m: {"ts": 0.0, "bias": "N/A"} for m in MARKETS}
 
     # ---------- Gateway helpers ----------
     @staticmethod
@@ -237,7 +223,6 @@ class DerivSniperBot:
         sec_into_day = max(0, int(epoch_ts - midnight))
         idx0 = min(SECTIONS_PER_DAY - 1, sec_into_day // SECTION_LENGTH_SEC)
         next_start = midnight + (idx0 + 1) * SECTION_LENGTH_SEC
-        # if already past last section start, next is next midnight
         if idx0 + 1 >= SECTIONS_PER_DAY:
             next_midnight = (datetime.fromtimestamp(midnight, self.tz) + timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0
@@ -245,22 +230,13 @@ class DerivSniperBot:
             return next_midnight.timestamp()
         return float(next_start)
 
-    def _section_boundaries(self):
-        midnight = self._today_midnight_epoch()
-        starts = [midnight + i * SECTION_LENGTH_SEC for i in range(SECTIONS_PER_DAY)]
-        ends = [s + SECTION_LENGTH_SEC for s in starts]
-        return starts, ends
-
     def _sync_section_if_needed(self):
-        """Auto-advance section by time (and reset section_profit)"""
         now = time.time()
         today = datetime.now(self.tz).date()
         if today != self.current_day:
-            return  # daily reset handles everything
-
+            return
         new_idx = self._get_section_index_for_epoch(now)
         if new_idx != self.section_index:
-            # new time window -> reset section state
             self.section_index = new_idx
             self.section_profit = 0.0
             self.section_pause_until = 0.0
@@ -321,47 +297,6 @@ class DerivSniperBot:
         except Exception:
             pass
 
-    # ========================= ✅ HTF BIAS (ADDED) =========================
-    async def _get_htf_bias(self, symbol: str) -> str:
-        """
-        Returns: "BULL", "BEAR", or "N/A"
-        Cache is used to avoid hammering the API.
-        """
-        if not USE_HTF_BIAS:
-            return "N/A"
-
-        now = time.time()
-        cached = self.htf_cache.get(symbol, {"ts": 0.0, "bias": "N/A"})
-        if (now - float(cached.get("ts", 0.0))) < float(HTF_REFRESH_SEC) and cached.get("bias") != "N/A":
-            return str(cached.get("bias", "N/A"))
-
-        payload = {
-            "ticks_history": symbol,
-            "end": "latest",
-            "count": int(HTF_CANDLES_COUNT),
-            "style": "candles",
-            "granularity": int(HTF_SEC),
-        }
-        data = await self.safe_ticks_history(payload, retries=6)
-        candles = build_candles_from_deriv(data.get("candles", []))
-        if len(candles) < (HTF_EMA_SLOW + 5):
-            self.htf_cache[symbol] = {"ts": now, "bias": "N/A"}
-            return "N/A"
-
-        closes = [x["c"] for x in candles]
-        ema_fast_arr = calculate_ema(closes, int(HTF_EMA_FAST))
-        ema_slow_arr = calculate_ema(closes, int(HTF_EMA_SLOW))
-        if len(ema_fast_arr) == 0 or len(ema_slow_arr) == 0:
-            self.htf_cache[symbol] = {"ts": now, "bias": "N/A"}
-            return "N/A"
-
-        ema_fast = float(ema_fast_arr[-2])  # last closed HTF candle
-        ema_slow = float(ema_slow_arr[-2])
-
-        bias = "BULL" if ema_fast > ema_slow else "BEAR" if ema_fast < ema_slow else "N/A"
-        self.htf_cache[symbol] = {"ts": now, "bias": bias}
-        return bias
-
     # ========================= DAILY RESET / PAUSE =========================
     def _next_midnight_epoch(self) -> float:
         now = datetime.now(self.tz)
@@ -388,20 +323,15 @@ class DerivSniperBot:
             self.section_index = self._get_section_index_for_epoch(time.time())
             self.section_pause_until = 0.0
 
-            # ✅ reset HTF cache daily (ADDED)
-            self.htf_cache = {m: {"ts": 0.0, "bias": "N/A"} for m in MARKETS}
-
-        # Also auto-advance section by time within the same day
+        # Auto-advance section by time within same day
         self._sync_section_if_needed()
 
     def can_auto_trade(self) -> tuple[bool, str]:
         self._daily_reset_if_needed()
 
-        # ✅ stop only when 5 martingales have been completed and it still lost
         if self.martingale_halt:
             return False, f"Stopped: Martingale {MARTINGALE_MAX_STEPS} steps completed"
 
-        # ✅ section pause (auto resumes when time passes)
         if time.time() < self.section_pause_until:
             left = int(self.section_pause_until - time.time())
             return False, f"Section target hit (+${SECTION_PROFIT_TARGET:.2f}). Resumes {fmt_hhmm(self.section_pause_until)} ({left}s)"
@@ -570,14 +500,6 @@ class DerivSniperBot:
                     and close_below_ema20 and put_rsi_ok and not spike_block and not flat_block
                 )
 
-                # ✅ APPLY HTF BIAS FILTER (ADDED) — no UI changes
-                if USE_HTF_BIAS:
-                    htf_bias = await self._get_htf_bias(symbol)
-                    if call_ready and htf_bias != "BULL":
-                        call_ready = False
-                    if put_ready and htf_bias != "BEAR":
-                        put_ready = False
-
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
 
                 trend_label = "UPTREND" if uptrend else "DOWNTREND" if downtrend else "SIDEWAYS"
@@ -665,7 +587,7 @@ class DerivSniperBot:
 
             await asyncio.sleep(SCAN_SLEEP_SEC)
 
-    # ========================= PAYOUT MODE + 2x MARTINGALE (STOP AFTER 5) =========================
+    # ========================= PAYOUT MODE + MARTINGALE =========================
     async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL"):
         if not self.api or self.active_trade_info:
             return
@@ -676,12 +598,11 @@ class DerivSniperBot:
                 return
 
             try:
-                import math  # ✅ NEW (local import only)
+                import math
 
                 payout = float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step))
                 payout = money2(payout)
 
-                # ✅ NEW: hard safety clamp (prevents 0/NaN/inf payout + ensures >= MIN_PAYOUT)
                 if not math.isfinite(payout):
                     payout = float(MIN_PAYOUT)
                 payout = max(float(MIN_PAYOUT), float(payout))
@@ -690,7 +611,7 @@ class DerivSniperBot:
                 proposal_req = {
                     "proposal": 1,
                     "amount": payout,
-                    "basis": "payout",          # ✅ payout mode (NOT stake)
+                    "basis": "payout",
                     "contract_type": side,
                     "currency": "USD",
                     "duration": int(DURATION_MIN),
@@ -772,7 +693,6 @@ class DerivSniperBot:
                 # ✅ Section target logic
                 if self.section_profit >= float(SECTION_PROFIT_TARGET):
                     self.sections_won_today += 1
-                    # pause until next section boundary (auto resume)
                     self.section_pause_until = self._next_section_start_epoch(time.time())
 
                 if profit <= 0:
@@ -807,7 +727,6 @@ class DerivSniperBot:
                 section_note = f"\n🧩 Section hit (+${SECTION_PROFIT_TARGET:.2f}). Auto-resume at {fmt_hhmm(self.section_pause_until)}"
 
             next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step)))
-            # (no change here; clamp happens when executing trade)
 
             await self.safe_send_tg(
                 (
@@ -837,7 +756,7 @@ def main_keyboard():
          InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
         [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"),
          InlineKeyboardButton("🔄 REFRESH", callback_data="STATUS")],
-        [InlineKeyboardButton("🧩 SECTION", callback_data="NEXT_SECTION")],  # ✅ NEW
+        [InlineKeyboardButton("🧩 SECTION", callback_data="NEXT_SECTION")],
         [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY")],
         [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"),
          InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
@@ -920,7 +839,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 "📌 Strategy: Trend(EMA20/EMA50) + EMA50 Slope + Pullback touch EMA20 + Confirm color + Close vs EMA20 + RSI (M1)\n"
                 "🕯 Timeframe: M1\n"
                 f"⏱ Expiry: {DURATION_MIN}m\n"
-                f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} base payout (Martingale {MARTINGALE_MULT:.0f}x up to {MARTINGALE_MAX_STEPS})\n"
+                f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} base payout (Martingale {MARTINGALE_MULT:.2f}x up to {MARTINGALE_MAX_STEPS})\n"
                 f"🧩 Sections: {SECTIONS_PER_DAY}/day | Target per section: +${SECTION_PROFIT_TARGET:.2f} (auto resume next section)\n"
                 f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f} (skips if higher)\n"
                 f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)"
@@ -933,7 +852,6 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await _safe_edit(q, "⏹️ Scanner stopped.", reply_markup=main_keyboard())
 
     elif q.data == "NEXT_SECTION":
-        # ✅ NEW: manually advance to next section immediately, and auto resume (no other changes)
         bot_logic._daily_reset_if_needed()
         now = time.time()
         nxt = bot_logic._next_section_start_epoch(now)
@@ -1020,7 +938,7 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "📌 Strategy: Trend + EMA50Slope + Pullback + ConfirmColor + CloseVsEMA20 + RSI (M1)\n"
         "🕯 Timeframe: M1\n"
         f"⏱ Expiry: {DURATION_MIN}m\n"
-        f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} base payout (Martingale {MARTINGALE_MULT:.0f}x up to {MARTINGALE_MAX_STEPS})\n"
+        f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} base payout (Martingale {MARTINGALE_MULT:.2f}x up to {MARTINGALE_MAX_STEPS})\n"
         f"🧩 Sections: {SECTIONS_PER_DAY}/day | Target per section: +${SECTION_PROFIT_TARGET:.2f}\n"
         f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
         f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n",
