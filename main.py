@@ -51,7 +51,7 @@ SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)  # 6 hours when 4 sect
 
 # ========================= PAYOUT MODE =========================
 USE_PAYOUT_MODE = True
-PAYOUT_TARGET = 0.74          # base payout (martingale will multiply this)
+PAYOUT_TARGET = 1          # base payout (martingale will multiply this)
 MIN_PAYOUT = 0.35             # never request payout below this
 MAX_STAKE_ALLOWED = 5.00      # safety cap: if Deriv needs > this stake, skip trade
 BUY_PRICE_BUFFER = 0.02       # kept (not used in fixed-cap buy)
