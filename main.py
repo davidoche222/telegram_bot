@@ -66,7 +66,7 @@ MARTINGALE_MAX_STEPS = 4     # keep your current
 MARTINGALE_MAX_STAKE = 16.0  # kept for display only
 
 # ========================= CANDLE STRENGTH FILTER =========================
-MIN_BODY_RATIO = 0.60   # 60% body / range = strong candle
+MIN_BODY_RATIO = 0.50   # 60% body / range = strong candle
 MIN_CANDLE_RANGE = 1e-6 # avoids divide-by-zero
 
 
