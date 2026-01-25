@@ -38,7 +38,7 @@ TF_SEC = 60  # M1 candles
 CANDLES_COUNT = 120
 
 # ✅ reduced API stress
-SCAN_SLEEP_SEC = 5 # was 5
+SCAN_SLEEP_SEC = 10 # was 5
 
 RSI_PERIOD = 14
 DURATION_MIN = 2  # 2-minute expiry
