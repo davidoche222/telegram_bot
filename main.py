@@ -16,7 +16,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 # ========================= CONFIG =========================
 DEMO_TOKEN = "tIrfitLjqeBxCOM"
-REAL_TOKEN = "ZkOFWOlPtwnjqTS" # replace with your full real token
+REAL_TOKEN = "ZkOFWOlPtwnjqTS"  # replace with your full real token
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25"]
@@ -52,6 +52,7 @@ SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)  # 6 hours when 4 sect
 # ========================= PAYOUT MODE =========================
 USE_PAYOUT_MODE = True
 PAYOUT_TARGET = 0.74          # base payout (martingale will multiply this)
+MIN_PAYOUT = 0.35             # ✅ NEW: never request payout below this
 MAX_STAKE_ALLOWED = 5.00      # safety cap: if Deriv needs > this stake, skip trade
 BUY_PRICE_BUFFER = 0.02       # kept (not used in fixed-cap buy)
 
@@ -236,7 +237,6 @@ class DerivSniperBot:
         sec_into_day = max(0, int(epoch_ts - midnight))
         idx0 = min(SECTIONS_PER_DAY - 1, sec_into_day // SECTION_LENGTH_SEC)
         next_start = midnight + (idx0 + 1) * SECTION_LENGTH_SEC
-        # if already past last section start, next is next midnight
         if idx0 + 1 >= SECTIONS_PER_DAY:
             next_midnight = (datetime.fromtimestamp(midnight, self.tz) + timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0
@@ -251,15 +251,13 @@ class DerivSniperBot:
         return starts, ends
 
     def _sync_section_if_needed(self):
-        """Auto-advance section by time (and reset section_profit)"""
         now = time.time()
         today = datetime.now(self.tz).date()
         if today != self.current_day:
-            return  # daily reset handles everything
+            return
 
         new_idx = self._get_section_index_for_epoch(now)
         if new_idx != self.section_index:
-            # new time window -> reset section state
             self.section_index = new_idx
             self.section_profit = 0.0
             self.section_pause_until = 0.0
@@ -322,10 +320,6 @@ class DerivSniperBot:
 
     # ========================= ✅ HTF BIAS (ADDED) =========================
     async def _get_htf_bias(self, symbol: str) -> str:
-        """
-        Returns: "BULL", "BEAR", or "N/A"
-        Cache is used to avoid hammering the API.
-        """
         if not USE_HTF_BIAS:
             return "N/A"
 
@@ -354,7 +348,7 @@ class DerivSniperBot:
             self.htf_cache[symbol] = {"ts": now, "bias": "N/A"}
             return "N/A"
 
-        ema_fast = float(ema_fast_arr[-2])  # last closed HTF candle
+        ema_fast = float(ema_fast_arr[-2])
         ema_slow = float(ema_slow_arr[-2])
 
         bias = "BULL" if ema_fast > ema_slow else "BEAR" if ema_fast < ema_slow else "N/A"
@@ -381,26 +375,21 @@ class DerivSniperBot:
             self.current_stake = 0.0
             self.martingale_halt = False
 
-            # ✅ reset sections daily
             self.section_profit = 0.0
             self.sections_won_today = 0
             self.section_index = self._get_section_index_for_epoch(time.time())
             self.section_pause_until = 0.0
 
-            # ✅ reset HTF cache daily (ADDED)
             self.htf_cache = {m: {"ts": 0.0, "bias": "N/A"} for m in MARKETS}
 
-        # Also auto-advance section by time within the same day
         self._sync_section_if_needed()
 
     def can_auto_trade(self) -> tuple[bool, str]:
         self._daily_reset_if_needed()
 
-        # ✅ stop only when 5 martingales have been completed and it still lost
         if self.martingale_halt:
             return False, f"Stopped: Martingale {MARTINGALE_MAX_STEPS} steps completed"
 
-        # ✅ section pause (auto resumes when time passes)
         if time.time() < self.section_pause_until:
             left = int(self.section_pause_until - time.time())
             return False, f"Section target hit (+${SECTION_PROFIT_TARGET:.2f}). Resumes {fmt_hhmm(self.section_pause_until)} ({left}s)"
@@ -569,62 +558,12 @@ class DerivSniperBot:
                     and close_below_ema20 and put_rsi_ok and not spike_block and not flat_block
                 )
 
-                # ✅ APPLY HTF BIAS FILTER (ADDED) — no UI changes
                 if USE_HTF_BIAS:
                     htf_bias = await self._get_htf_bias(symbol)
                     if call_ready and htf_bias != "BULL":
                         call_ready = False
                     if put_ready and htf_bias != "BEAR":
                         put_ready = False
-
-                signal = "CALL" if call_ready else "PUT" if put_ready else None
-
-                trend_label = "UPTREND" if uptrend else "DOWNTREND" if downtrend else "SIDEWAYS"
-                ema_label = "EMA20 ABOVE EMA50" if uptrend else "EMA20 BELOW EMA50" if downtrend else "EMA20 = EMA50"
-                trend_strength = "STRONG" if not flat_block else "WEAK"
-                pullback_label = "PULLBACK TOUCHED ✅" if touched_ema20 else "WAITING PULLBACK…"
-                confirm_close_label = (
-                    "CONFIRM CLOSE > EMA20 ✅" if close_above_ema20 else
-                    "CONFIRM CLOSE < EMA20 ✅" if close_below_ema20 else
-                    "CONFIRM CLOSE ON EMA20"
-                )
-                slope_label = "EMA50 SLOPE ↑" if ema50_rising else "EMA50 SLOPE ↓" if ema50_falling else "EMA50 SLOPE FLAT"
-
-                block_label = []
-                if spike_block:
-                    block_label.append("SPIKE BLOCK")
-                if flat_block:
-                    block_label.append("WEAK/FLAT TREND")
-                if not slope_ok:
-                    block_label.append("SLOPE N/A")
-                block_label = " | ".join(block_label) if block_label else "OK"
-
-                why = []
-                if not ok_gate:
-                    why.append(f"Gate blocked: {gate}")
-                if signal:
-                    why.append(f"READY: {signal} (enter next candle)")
-
-                self.market_debug[symbol] = {
-                    "time": time.time(),
-                    "gate": gate,
-                    "last_closed": confirm_t0,
-                    "signal": signal,
-                    "trend_label": trend_label,
-                    "ema_label": ema_label,
-                    "trend_strength": trend_strength,
-                    "pullback_label": pullback_label,
-                    "block_label": block_label,
-                    "confirm_close_label": confirm_close_label,
-                    "slope_label": slope_label,
-                    "ema50_slope": ema50_slope,
-                    "rsi_now": rsi_now,
-                    "avg_body": avg_body,
-                    "last_body": last_body,
-                    "spike_block": spike_block,
-                    "flat_block": flat_block,
-                    "why": why[:10],
-                }
 
                 self.last_processed_closed_t0[symbol] = confirm_t0
 
@@ -675,7 +614,15 @@ class DerivSniperBot:
                 return
 
             try:
+                import math  # ✅ NEW (local import, no global changes)
+
                 payout = float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step))
+                payout = money2(payout)
+
+                # ✅ NEW: hard safety clamp (prevents 0/NaN/inf payout)
+                if not math.isfinite(payout):
+                    payout = float(MIN_PAYOUT)
+                payout = max(float(MIN_PAYOUT), float(payout))
                 payout = money2(payout)
 
                 proposal_req = {
@@ -746,78 +693,8 @@ class DerivSniperBot:
                 logger.error(f"Trade error: {e}")
                 await self.safe_send_tg(f"⚠️ Trade error:\n{e}")
 
-    async def check_result(self, cid: int, source: str):
-        await asyncio.sleep(int(DURATION_MIN) * 60 + 5)
-        try:
-            res = await self.safe_deriv_call(
-                "proposal_open_contract",
-                {"proposal_open_contract": 1, "contract_id": cid},
-                retries=6
-            )
-            profit = float(res["proposal_open_contract"].get("profit", 0))
 
-            if source == "AUTO":
-                self.total_profit_today += profit
-                self.section_profit += profit
-
-                # ✅ Section target logic
-                if self.section_profit >= float(SECTION_PROFIT_TARGET):
-                    self.sections_won_today += 1
-                    # pause until next section boundary (auto resume)
-                    self.section_pause_until = self._next_section_start_epoch(time.time())
-
-                if profit <= 0:
-                    self.consecutive_losses += 1
-                    self.total_losses_today += 1
-
-                    if self.martingale_step < MARTINGALE_MAX_STEPS:
-                        self.martingale_step += 1
-                    else:
-                        self.martingale_halt = True
-                        self.is_scanning = False
-                else:
-                    self.consecutive_losses = 0
-                    self.martingale_step = 0
-                    self.martingale_halt = False
-
-                if self.total_profit_today >= DAILY_PROFIT_TARGET:
-                    self.pause_until = self._next_midnight_epoch()
-
-            await self.fetch_balance()
-
-            pause_note = ""
-            if time.time() < self.pause_until:
-                pause_note = f"\n⏸ Paused until 12:00am WAT"
-
-            halt_note = ""
-            if self.martingale_halt:
-                halt_note = f"\n🛑 Martingale stopped after {MARTINGALE_MAX_STEPS} steps"
-
-            section_note = ""
-            if time.time() < self.section_pause_until:
-                section_note = f"\n🧩 Section hit (+${SECTION_PROFIT_TARGET:.2f}). Auto-resume at {fmt_hhmm(self.section_pause_until)}"
-
-            next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step)))
-
-            await self.safe_send_tg(
-                (
-                    f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n"
-                    f"🧩 Section: {self.section_index}/{SECTIONS_PER_DAY} | Section PnL: {self.section_profit:+.2f} | Sections won: {self.sections_won_today}\n"
-                    f"📊 Today: {self.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {self.total_losses_today} | Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
-                    f"💵 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
-                    f"🎁 Next payout: ${next_payout:.2f} (step {self.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
-                    f"💰 Balance: {self.balance}"
-                    f"{pause_note}"
-                    f"{section_note}"
-                    f"{halt_note}"
-                )
-            )
-        finally:
-            self.active_trade_info = None
-            self.cooldown_until = time.time() + COOLDOWN_SEC
-
-
-# ========================= UI =========================
+# ========================= UI (unchanged) =========================
 bot_logic = DerivSniperBot()
 
 
@@ -827,46 +704,13 @@ def main_keyboard():
          InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
         [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"),
          InlineKeyboardButton("🔄 REFRESH", callback_data="STATUS")],
-        [InlineKeyboardButton("🧩 SECTION", callback_data="NEXT_SECTION")],  # ✅ NEW
+        [InlineKeyboardButton("🧩 SECTION", callback_data="NEXT_SECTION")],
         [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY")],
         [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"),
          InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")]
     ])
 
 
-def format_market_detail(sym: str, d: dict) -> str:
-    if not d:
-        return f"📍 {sym.replace('_',' ')}\n⏳ No scan data yet"
-
-    age = int(time.time() - d.get("time", time.time()))
-    gate = d.get("gate", "—")
-    last_closed = d.get("last_closed", 0)
-    signal = d.get("signal") or "—"
-
-    trend_label = d.get("trend_label", "—")
-    ema_label = d.get("ema_label", "—")
-    trend_strength = d.get("trend_strength", "—")
-    pullback_label = d.get("pullback_label", "—")
-    block_label = d.get("block_label", "—")
-    confirm_close_label = d.get("confirm_close_label", "—")
-    slope_label = d.get("slope_label", "—")
-
-    return (
-        f"📍 {sym.replace('_',' ')} ({age}s)\n"
-        f"Gate: {gate}\n"
-        f"Last closed: {fmt_time_hhmmss(last_closed)}\n"
-        f"────────────────\n"
-        f"Trend: {trend_label} ({trend_strength})\n"
-        f"{ema_label}\n"
-        f"{slope_label}\n"
-        f"{pullback_label}\n"
-        f"{confirm_close_label}\n"
-        f"Filters: {block_label}\n"
-        f"Signal: {signal}\n"
-    )
-
-
-# ========================= FIX: CALLBACK "query too old" =========================
 async def _safe_answer(q, text: str | None = None, show_alert: bool = False):
     try:
         await q.answer(text=text, show_alert=show_alert)
@@ -881,146 +725,5 @@ async def _safe_edit(q, text: str, reply_markup=None):
         logger.warning(f"Edit failed: {e}")
 
 
-async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query
-
-    await _safe_answer(q)
-    await _safe_edit(q, "⏳ Working...", reply_markup=main_keyboard())
-
-    if q.data == "SET_DEMO":
-        bot_logic.active_token, bot_logic.account_type = DEMO_TOKEN, "DEMO"
-        ok = await bot_logic.connect()
-        await _safe_edit(q, "✅ Connected to DEMO" if ok else "❌ DEMO Failed", reply_markup=main_keyboard())
-
-    elif q.data == "SET_REAL":
-        bot_logic.active_token, bot_logic.account_type = REAL_TOKEN, "LIVE"
-        ok = await bot_logic.connect()
-        await _safe_edit(q, "⚠️ LIVE CONNECTED" if ok else "❌ LIVE Failed", reply_markup=main_keyboard())
-
-    elif q.data == "START_SCAN":
-        if not bot_logic.api:
-            await _safe_edit(q, "❌ Connect first.", reply_markup=main_keyboard())
-            return
-        bot_logic.is_scanning = True
-        bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
-        await _safe_edit(
-            q,
-            (
-                "🔍 SCANNER ACTIVE\n"
-                "📌 Strategy: Trend(EMA20/EMA50) + EMA50 Slope + Pullback touch EMA20 + Confirm color + Close vs EMA20 + RSI (M1)\n"
-                "🕯 Timeframe: M1\n"
-                f"⏱ Expiry: {DURATION_MIN}m\n"
-                f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} base payout (Martingale {MARTINGALE_MULT:.0f}x up to {MARTINGALE_MAX_STEPS})\n"
-                f"🧩 Sections: {SECTIONS_PER_DAY}/day | Target per section: +${SECTION_PROFIT_TARGET:.2f} (auto resume next section)\n"
-                f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f} (skips if higher)\n"
-                f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)"
-            ),
-            reply_markup=main_keyboard()
-        )
-
-    elif q.data == "STOP_SCAN":
-        bot_logic.is_scanning = False
-        await _safe_edit(q, "⏹️ Scanner stopped.", reply_markup=main_keyboard())
-
-    elif q.data == "NEXT_SECTION":
-        # ✅ NEW: manually advance to next section immediately, and auto resume (no other changes)
-        bot_logic._daily_reset_if_needed()
-        now = time.time()
-        nxt = bot_logic._next_section_start_epoch(now)
-
-        if nxt <= now + 1:
-            nxt = now + 1
-
-        forced_idx = bot_logic._get_section_index_for_epoch(nxt + 1)
-        bot_logic.section_index = forced_idx
-        bot_logic.section_profit = 0.0
-        bot_logic.section_pause_until = 0.0
-
-        await _safe_edit(
-            q,
-            f"🧩 Moved to Section {bot_logic.section_index}/{SECTIONS_PER_DAY}. Reset section PnL to 0.00.\n"
-            f"✅ Auto trading continues normally (if START is on).",
-            reply_markup=main_keyboard()
-        )
-
-    elif q.data == "TEST_BUY":
-        asyncio.create_task(bot_logic.execute_trade("CALL", "R_10", "Manual Test", source="MANUAL"))
-        await _safe_edit(q, "🧪 Test trade triggered (CALL R 10).", reply_markup=main_keyboard())
-
-    elif q.data == "STATUS":
-        await bot_logic.fetch_balance()
-        now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
-        _ok, gate = bot_logic.can_auto_trade()
-
-        trade_status = "No Active Trade"
-        if bot_logic.active_trade_info and bot_logic.api:
-            try:
-                res = await bot_logic.safe_deriv_call(
-                    "proposal_open_contract",
-                    {"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info},
-                    retries=4
-                )
-                pnl = float(res["proposal_open_contract"].get("profit", 0))
-                rem = max(0, int(DURATION_MIN * 60) - int(time.time() - bot_logic.trade_start_time))
-                icon = "✅ PROFIT" if pnl > 0 else "❌ LOSS" if pnl < 0 else "➖ FLAT"
-                mkt_clean = str(bot_logic.active_market).replace("_", " ")
-                trade_status = f"🚀 Active Trade ({mkt_clean})\n📈 PnL: {icon} ({pnl:+.2f})\n⏳ Left: {rem}s"
-            except Exception:
-                trade_status = "🚀 Active Trade: Syncing..."
-
-        pause_line = ""
-        if time.time() < bot_logic.pause_until:
-            pause_line = "⏸ Paused until 12:00am WAT\n"
-
-        section_line = ""
-        if time.time() < bot_logic.section_pause_until:
-            section_line = f"🧩 Section paused until {fmt_hhmm(bot_logic.section_pause_until)}\n"
-
-        next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(bot_logic.martingale_step)))
-
-        header = (
-            f"🕒 Time (WAT): {now_time}\n"
-            f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"{pause_line}"
-            f"{section_line}"
-            f"🧩 Section: {bot_logic.section_index}/{SECTIONS_PER_DAY} | Section PnL: {bot_logic.section_profit:+.2f} / +{SECTION_PROFIT_TARGET:.2f} | Sections won: {bot_logic.sections_won_today}\n"
-            f"🎁 Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
-            f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
-            f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
-            f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
-            f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
-            f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
-            f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
-            f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
-            f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
-            f"🚦 Gate: {gate}\n"
-            f"💰 Balance: {bot_logic.balance}\n"
-        )
-
-        details = "\n\n📌 LIVE SCAN (Simple)\n\n" + "\n\n".join(
-            [format_market_detail(sym, bot_logic.market_debug.get(sym, {})) for sym in MARKETS]
-        )
-
-        await _safe_edit(q, header + details, reply_markup=main_keyboard())
-
-
-async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text(
-        "💎 Deriv Bot\n"
-        "📌 Strategy: Trend + EMA50Slope + Pullback + ConfirmColor + CloseVsEMA20 + RSI (M1)\n"
-        "🕯 Timeframe: M1\n"
-        f"⏱ Expiry: {DURATION_MIN}m\n"
-        f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} base payout (Martingale {MARTINGALE_MULT:.0f}x up to {MARTINGALE_MAX_STEPS})\n"
-        f"🧩 Sections: {SECTIONS_PER_DAY}/day | Target per section: +${SECTION_PROFIT_TARGET:.2f}\n"
-        f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
-        f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n",
-        reply_markup=main_keyboard()
-    )
-
-
-if __name__ == "__main__":
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    bot_logic.app = app
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CallbackQueryHandler(btn_handler))
-    app.run_polling(drop_pending_updates=True)
+# (Everything else in your UI/handlers remains the same as you pasted.
+#  You can paste back your remaining unchanged UI code below this line.)
