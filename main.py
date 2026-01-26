@@ -60,7 +60,7 @@ MARTINGALE_MAX_STEPS = 4
 MARTINGALE_MAX_STAKE = 16.0
 
 # ========================= CANDLE STRENGTH FILTER =========================
-MIN_BODY_RATIO = 0.60
+MIN_BODY_RATIO = 0.50
 MIN_CANDLE_RANGE = 1e-6
 
 # ========================= ANTI RATE-LIMIT =========================
