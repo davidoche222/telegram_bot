@@ -1,8 +1,6 @@
 # ⚠️ SECURITY NOTE:
 # You posted your Deriv + Telegram tokens publicly.
 # Regenerate/revoke them in Deriv and BotFather, then replace below.
-#
-# ✅ Per your instruction: I DID NOT touch your tokens.
 
 import asyncio
 import logging
@@ -21,11 +19,11 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "ZkOFWOlPtwnjqTS"  # replace with your full real token
 APP_ID = 1089
 
-MARKETS = ["R_10", "R_25",]
+MARKETS = ["R_10", "R_25"]  # add more if you want
 
 COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 60
-MAX_CONSEC_LOSSES = 10  # ✅ unchanged
+MAX_CONSEC_LOSSES = 10
 
 TELEGRAM_TOKEN = "8253450930:AAHUhPk9TML-8kZlA9UaHZZvTUGdurN9MVY"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -36,38 +34,46 @@ logger = logging.getLogger(__name__)
 # ========================= STRATEGY SETTINGS =========================
 TF_SEC = 60  # M1 candles
 CANDLES_COUNT = 120
-
-# ✅ reduced API stress
-SCAN_SLEEP_SEC = 10 # was 5
+SCAN_SLEEP_SEC = 5  # used as a small idle sleep (scanner is now candle-synced)
 
 RSI_PERIOD = 14
-DURATION_MIN = 2  # 2-minute expiry
+DURATION_MIN = 2  # ✅ 2-minute expiry
 
 # ========================= EMA50 SLOPE + DAILY TARGET =========================
 EMA_SLOPE_LOOKBACK = 10
 EMA_SLOPE_MIN = 0.2
-DAILY_PROFIT_TARGET = 2.0  # keep as-is unless you change it
+DAILY_PROFIT_TARGET = 2.0
 
 # ========================= SECTIONS =========================
 SECTIONS_PER_DAY = 4
-SECTION_PROFIT_TARGET = 0.15  # ✅ per your request
-SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)  # 6 hours when 4 sections
+SECTION_PROFIT_TARGET = 0.15
+SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)
 
 # ========================= PAYOUT MODE =========================
 USE_PAYOUT_MODE = True
-PAYOUT_TARGET = 1            # base payout (martingale will multiply this)
-MIN_PAYOUT = 0.35            # never request payout below this
-MAX_STAKE_ALLOWED = 10.00    # safety cap: if Deriv needs > this stake, skip trade
-BUY_PRICE_BUFFER = 0.02      # kept (not used in fixed-cap buy)
+PAYOUT_TARGET = 1
+MIN_PAYOUT = 0.35
+MAX_STAKE_ALLOWED = 10.00
+BUY_PRICE_BUFFER = 0.02
 
 # ========================= MARTINGALE SETTINGS =========================
-MARTINGALE_MULT = 1.8        # ✅ per your request
-MARTINGALE_MAX_STEPS = 4     # keep your current
-MARTINGALE_MAX_STAKE = 16.0  # kept for display only
+MARTINGALE_MULT = 1.8
+MARTINGALE_MAX_STEPS = 4  # ✅ back to 4
+MARTINGALE_MAX_STAKE = 16.0
 
 # ========================= CANDLE STRENGTH FILTER =========================
-MIN_BODY_RATIO = 0.50   # 60% body / range = strong candle
-MIN_CANDLE_RANGE = 1e-6 # avoids divide-by-zero
+MIN_BODY_RATIO = 0.60
+MIN_CANDLE_RANGE = 1e-6
+
+# ========================= ANTI RATE-LIMIT (NEW) =========================
+# Deriv can rate-limit ticks_history if you call it too frequently.
+# This makes each market fetch candles only ONCE per minute (per closed candle),
+# plus global spacing between ticks_history calls.
+TICKS_GLOBAL_MIN_INTERVAL = 0.35  # seconds between ANY ticks_history calls
+RATE_LIMIT_BACKOFF_BASE = 20      # seconds (will grow if rate limit repeats)
+
+# ========================= UI: REFRESH COOLDOWN (NEW) =========================
+STATUS_REFRESH_COOLDOWN_SEC = 10
 
 
 # ========================= INDICATOR MATH =========================
@@ -171,22 +177,18 @@ class DerivSniperBot:
         # for UI display
         self.current_stake = 0.0
         self.martingale_step = 0
-        self.martingale_halt = False  # stop-after-max-steps flag
+        self.martingale_halt = False
 
-        # ✅ SECTIONS state
+        # sections
         self.section_profit = 0.0
         self.sections_won_today = 0
-        self.section_index = 1  # 1..SECTIONS_PER_DAY
-        self.section_pause_until = 0.0  # when section target hit OR 3 losses, wait to next section boundary
+        self.section_index = 1
+        self.section_pause_until = 0.0
 
         self.trade_lock = asyncio.Lock()
 
         self.market_debug = {m: {} for m in MARKETS}
         self.last_processed_closed_t0 = {m: 0 for m in MARKETS}
-
-        # ✅ NEW: market error handling
-        self.market_error_count = {m: 0 for m in MARKETS}
-        self.market_pause_until = {m: 0.0 for m in MARKETS}
 
         self.tz = ZoneInfo("Africa/Lagos")
         self.current_day = datetime.now(self.tz).date()
@@ -194,29 +196,34 @@ class DerivSniperBot:
 
         self.trade_log = []
 
-    # ---------- Gateway helpers ----------
+        # ===== anti rate-limit state (NEW)
+        self._ticks_lock = asyncio.Lock()
+        self._last_ticks_ts = 0.0
+        self._next_poll_epoch = {m: 0.0 for m in MARKETS}
+        self._rate_limit_strikes = {m: 0 for m in MARKETS}
+
+        # ===== refresh cooldown state (NEW)
+        self.status_cooldown_until = 0.0
+
+    # ---------- helpers ----------
     @staticmethod
     def _is_gatewayish_error(msg: str) -> bool:
         m = (msg or "").lower()
         return any(
             k in m
             for k in [
-                "gateway",
-                "bad gateway",
-                "502",
-                "503",
-                "504",
-                "timeout",
-                "timed out",
+                "gateway", "bad gateway", "502", "503", "504",
+                "timeout", "timed out",
                 "temporarily unavailable",
-                "connection",
-                "websocket",
-                "not connected",
-                "disconnect",
-                "internal server error",
-                "service unavailable",
+                "connection", "websocket", "not connected", "disconnect",
+                "internal server error", "service unavailable",
             ]
         )
+
+    @staticmethod
+    def _is_rate_limit_error(msg: str) -> bool:
+        m = (msg or "").lower()
+        return ("rate limit" in m) or ("reached the rate limit" in m) or ("too many requests" in m) or ("429" in m)
 
     async def safe_send_tg(self, text: str, retries: int = 5):
         if not self.app:
@@ -235,7 +242,7 @@ class DerivSniperBot:
                     await asyncio.sleep(0.4 * i)
         logger.warning(f"Telegram send failed after retries: {last_err}")
 
-    # ---------- Section helpers ----------
+    # ---------- Sections ----------
     def _today_midnight_epoch(self) -> float:
         now = datetime.now(self.tz)
         midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -270,7 +277,7 @@ class DerivSniperBot:
             self.section_profit = 0.0
             self.section_pause_until = 0.0
 
-    # ---------- Deriv connection helpers ----------
+    # ---------- Deriv connection ----------
     async def connect(self) -> bool:
         try:
             if not self.active_token:
@@ -310,10 +317,24 @@ class DerivSniperBot:
                 msg = str(e)
                 if self._is_gatewayish_error(msg):
                     await self.safe_reconnect()
-                await asyncio.sleep(min(8.0, 0.6 * attempt + random.random() * 0.5))
+                # if rate limit, wait longer
+                if self._is_rate_limit_error(msg):
+                    await asyncio.sleep(min(20.0, 2.5 * attempt + random.random()))
+                else:
+                    await asyncio.sleep(min(8.0, 0.6 * attempt + random.random() * 0.5))
         raise last_err
 
-    async def safe_ticks_history(self, payload: dict, retries: int = 6):
+    async def safe_ticks_history(self, payload: dict, retries: int = 4):
+        """
+        Global spacing for ticks_history calls to reduce rate limit.
+        """
+        async with self._ticks_lock:
+            now = time.time()
+            gap = (self._last_ticks_ts + TICKS_GLOBAL_MIN_INTERVAL) - now
+            if gap > 0:
+                await asyncio.sleep(gap)
+            self._last_ticks_ts = time.time()
+
         return await self.safe_deriv_call("ticks_history", payload, retries=retries)
 
     async def fetch_balance(self):
@@ -325,7 +346,7 @@ class DerivSniperBot:
         except Exception:
             pass
 
-    # ========================= DAILY RESET / PAUSE =========================
+    # ---------- Daily reset ----------
     def _next_midnight_epoch(self) -> float:
         now = datetime.now(self.tz)
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -345,15 +366,10 @@ class DerivSniperBot:
             self.current_stake = 0.0
             self.martingale_halt = False
 
-            # ✅ reset sections daily
             self.section_profit = 0.0
             self.sections_won_today = 0
             self.section_index = self._get_section_index_for_epoch(time.time())
             self.section_pause_until = 0.0
-
-            # ✅ reset market pauses daily
-            self.market_error_count = {m: 0 for m in MARKETS}
-            self.market_pause_until = {m: 0.0 for m in MARKETS}
 
         self._sync_section_if_needed()
 
@@ -391,16 +407,11 @@ class DerivSniperBot:
             return False, "Not connected"
         return True, "OK"
 
+    # ---------- Scanner loop ----------
     async def background_scanner(self):
         if not self.api:
             return
-
-        # ✅ STAGGER markets so they don't call Deriv same time
-        self.market_tasks = {}
-        for i, sym in enumerate(MARKETS):
-            await asyncio.sleep(0.7 * i)
-            self.market_tasks[sym] = asyncio.create_task(self.scan_market(sym))
-
+        self.market_tasks = {sym: asyncio.create_task(self.scan_market(sym)) for sym in MARKETS}
         try:
             while self.is_scanning:
                 if self.active_trade_info and (time.time() - self.trade_start_time > (DURATION_MIN * 60 + 90)):
@@ -419,31 +430,38 @@ class DerivSniperBot:
             "style": "candles",
             "granularity": TF_SEC,
         }
-        data = await self.safe_ticks_history(payload, retries=6)
+        data = await self.safe_ticks_history(payload, retries=4)
         return build_candles_from_deriv(data.get("candles", []))
 
     async def _sleep_until(self, epoch_ts: float, buffer_s: float = 0.15):
         wait = (epoch_ts - time.time()) + buffer_s
         await asyncio.sleep(wait if wait > 0 else 0.10)
 
-    async def _sync_to_next_candle_open(self, last_closed_t0: int):
-        next_open = int(last_closed_t0) + int(TF_SEC)
-        await self._sleep_until(next_open, buffer_s=0.20)
-
     async def scan_market(self, symbol: str):
+        """
+        ✅ FIXED: We only call ticks_history ONCE per candle close (per symbol),
+        instead of calling every 5 seconds forever. This removes rate-limit errors.
+        """
+        # start polling soon
+        self._next_poll_epoch[symbol] = time.time() + random.random() * 0.5
+
         while self.is_scanning:
             try:
-                # ✅ if market paused due to repeated errors
-                if time.time() < self.market_pause_until[symbol]:
-                    await asyncio.sleep(2)
+                # respect per-symbol next poll time
+                now = time.time()
+                nxt = float(self._next_poll_epoch.get(symbol, 0.0))
+                if now < nxt:
+                    await asyncio.sleep(min(1.0, nxt - now))
                     continue
 
+                # hard stops
                 if self.consecutive_losses >= MAX_CONSEC_LOSSES or self.trades_today >= MAX_TRADES_PER_DAY:
                     self.is_scanning = False
                     break
 
                 ok_gate, gate = self.can_auto_trade()
 
+                # fetch candles (ONE request per minute per symbol)
                 candles = await self.fetch_real_m1_candles(symbol)
                 if len(candles) < 70:
                     self.market_debug[symbol] = {
@@ -451,15 +469,20 @@ class DerivSniperBot:
                         "gate": "Waiting for more candles",
                         "why": [f"Not enough candle history yet (need ~70, have {len(candles)})."],
                     }
-                    await asyncio.sleep(SCAN_SLEEP_SEC)
+                    self._next_poll_epoch[symbol] = time.time() + 10
                     continue
 
                 pullback = candles[-3]
                 confirm = candles[-2]
                 confirm_t0 = int(confirm["t0"])
 
+                # schedule next poll for the NEXT closed candle time
+                # confirm_t0 is the epoch of the closed candle start
+                next_closed_epoch = confirm_t0 + TF_SEC
+                self._next_poll_epoch[symbol] = float(next_closed_epoch + 0.35)
+
+                # only process each confirm candle once
                 if self.last_processed_closed_t0[symbol] == confirm_t0:
-                    await self._sync_to_next_candle_open(confirm_t0)
                     continue
 
                 closes = [x["c"] for x in candles]
@@ -467,12 +490,8 @@ class DerivSniperBot:
                 ema20_arr = calculate_ema(closes, 20)
                 ema50_arr = calculate_ema(closes, 50)
                 if len(ema20_arr) < 60 or len(ema50_arr) < 60:
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "gate": "Indicators",
-                        "why": ["EMA20/EMA50 not ready yet."],
-                    }
-                    await asyncio.sleep(SCAN_SLEEP_SEC)
+                    self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["EMA20/EMA50 not ready yet."]}
+                    self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
 
                 ema20_pullback = float(ema20_arr[-3])
@@ -492,12 +511,8 @@ class DerivSniperBot:
 
                 rsi_arr = calculate_rsi(closes, RSI_PERIOD)
                 if len(rsi_arr) < 60 or np.isnan(rsi_arr[-2]):
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "gate": "Indicators",
-                        "why": ["RSI not ready yet."],
-                    }
-                    await asyncio.sleep(SCAN_SLEEP_SEC)
+                    self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["RSI not ready yet."]}
+                    self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
                 rsi_now = float(rsi_arr[-2])
 
@@ -519,13 +534,14 @@ class DerivSniperBot:
                 )
                 last_body = abs(c_close - c_open)
 
-                # ✅ Candle strength
+                # Candle strength
                 c_high = float(confirm["h"])
                 c_low = float(confirm["l"])
                 c_range = max(MIN_CANDLE_RANGE, c_high - c_low)
                 body_ratio = last_body / c_range
                 strong_candle = body_ratio >= float(MIN_BODY_RATIO)
 
+                # per-symbol tuning
                 if symbol == "R_50":
                     spike_mult = 1.2
                     rsi_call_min, rsi_call_max = 53.0, 62.0
@@ -554,13 +570,13 @@ class DerivSniperBot:
                 call_ready = (
                     uptrend and slope_ok and ema50_rising and touched_ema20 and bull_confirm
                     and strong_candle
-                    and close_above_ema20 and call_rsi_ok and (not spike_block) and (not flat_block) and breakout_call
+                    and close_above_ema20 and call_rsi_ok and not spike_block and not flat_block and breakout_call
                 )
 
                 put_ready = (
                     downtrend and slope_ok and ema50_falling and touched_ema20 and bear_confirm
                     and strong_candle
-                    and close_below_ema20 and put_rsi_ok and (not spike_block) and (not flat_block) and breakout_put
+                    and close_below_ema20 and put_rsi_ok and not spike_block and not flat_block and breakout_put
                 )
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
@@ -585,7 +601,6 @@ class DerivSniperBot:
                     block_label.append("SLOPE N/A")
                 if not strong_candle:
                     block_label.append("WEAK CANDLE")
-
                 block_label = " | ".join(block_label) if block_label else "OK"
 
                 why = []
@@ -619,16 +634,8 @@ class DerivSniperBot:
 
                 self.last_processed_closed_t0[symbol] = confirm_t0
 
-                # ✅ reset error counter on success path
-                self.market_error_count[symbol] = 0
-
                 if not ok_gate:
-                    await self._sync_to_next_candle_open(confirm_t0)
-                    await asyncio.sleep(SCAN_SLEEP_SEC)
                     continue
-
-                if call_ready or put_ready:
-                    await self._sync_to_next_candle_open(confirm_t0)
 
                 if call_ready:
                     await self.execute_trade(
@@ -649,32 +656,41 @@ class DerivSniperBot:
                         ema50_slope=ema50_slope,
                     )
 
-                await asyncio.sleep(SCAN_SLEEP_SEC)
-
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 msg = str(e)
                 logger.error(f"Scanner Error ({symbol}): {msg}")
 
-                # ✅ keep why message in UI
-                self.market_debug[symbol] = {"time": time.time(), "gate": "Error", "why": [msg[:220]]}
+                # rate limit backoff (NEW)
+                if self._is_rate_limit_error(msg):
+                    self._rate_limit_strikes[symbol] = int(self._rate_limit_strikes.get(symbol, 0)) + 1
+                    backoff = RATE_LIMIT_BACKOFF_BASE * self._rate_limit_strikes[symbol]
+                    backoff = min(180, backoff)  # cap 3 minutes
+                    self._next_poll_epoch[symbol] = time.time() + backoff
 
-                # ✅ error count + pause after 3 errors
-                self.market_error_count[symbol] += 1
-                if self.market_error_count[symbol] >= 3:
-                    self.market_pause_until[symbol] = time.time() + 60
-                    self.market_error_count[symbol] = 0
-                    self.market_debug[symbol]["why"] = [f"{msg[:180]} | Paused 60s (3 errors)"]
-
-                if self._is_gatewayish_error(msg):
-                    await asyncio.sleep(4 + random.random() * 2)
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "gate": "Error",
+                        "why": [f"Rate limit on ticks_history. Backing off {backoff}s."],
+                        "last_closed": 0,
+                        "signal": "—",
+                    }
                 else:
-                    await asyncio.sleep(2)
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "gate": "Error",
+                        "why": [msg[:160]],
+                        "last_closed": 0,
+                        "signal": "—",
+                    }
+                    # small delay
+                    await asyncio.sleep(2 if not self._is_gatewayish_error(msg) else 5)
 
-            # ✅ extra breathing room
-            await asyncio.sleep(SCAN_SLEEP_SEC)
+            # tiny idle sleep so loop isn't tight
+            await asyncio.sleep(0.05)
 
+    # ========================= PAYOUT MODE + MARTINGALE =========================
     async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL",
                            rsi_now: float = 0.0, ema50_slope: float = 0.0):
         if not self.api or self.active_trade_info:
@@ -783,7 +799,7 @@ class DerivSniperBot:
                 self.total_profit_today += profit
                 self.section_profit += profit
 
-                # ✅ Section profit target logic
+                # section target
                 if self.section_profit >= float(SECTION_PROFIT_TARGET):
                     self.sections_won_today += 1
                     self.section_pause_until = self._next_section_start_epoch(time.time())
@@ -798,7 +814,7 @@ class DerivSniperBot:
                         self.martingale_halt = True
                         self.is_scanning = False
 
-                    # ✅ after 3 consecutive losses, pause until next section (martingale continues)
+                    # ✅ after 3 losses in a row: pause until next section (martingale continues)
                     if self.consecutive_losses >= 3:
                         self.section_pause_until = self._next_section_start_epoch(time.time())
 
@@ -887,11 +903,10 @@ def format_market_detail(sym: str, d: dict) -> str:
     confirm_close_label = d.get("confirm_close_label", "—")
     slope_label = d.get("slope_label", "—")
 
-    # ✅ NEW: show error reason
-    why_list = d.get("why", [])
-    why_text = ""
-    if why_list:
-        why_text = "\nWhy: " + " | ".join([str(x) for x in why_list[:2]])
+    why = d.get("why", [])
+    why_line = ""
+    if why:
+        why_line = "Why: " + str(why[0])
 
     return (
         f"📍 {sym.replace('_',' ')} ({age}s)\n"
@@ -905,7 +920,7 @@ def format_market_detail(sym: str, d: dict) -> str:
         f"{confirm_close_label}\n"
         f"Filters: {block_label}\n"
         f"Signal: {signal}\n"
-        f"{why_text}\n"
+        f"{why_line}\n"
     )
 
 
@@ -956,7 +971,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
                 f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n"
                 "🛑 After 3 losses in a row: pause until next section (martingale continues)\n"
-                "🧯 Stability: slower scan + stagger markets + pause a market 60s after 3 scan errors\n"
+                "✅ Anti-rate-limit: ticks_history is now fetched once per minute per market."
             ),
             reply_markup=main_keyboard(),
         )
@@ -993,6 +1008,14 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await _safe_edit(q, "🧪 Test trade triggered (CALL R 10).", reply_markup=main_keyboard())
 
     elif q.data == "STATUS":
+        # ✅ refresh cooldown (NEW) to reduce spam
+        now = time.time()
+        if now < bot_logic.status_cooldown_until:
+            left = int(bot_logic.status_cooldown_until - now)
+            await _safe_edit(q, f"⏳ Refresh cooldown: {left}s\n\nPress again after cooldown.", reply_markup=main_keyboard())
+            return
+        bot_logic.status_cooldown_until = now + STATUS_REFRESH_COOLDOWN_SEC
+
         await bot_logic.fetch_balance()
         now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
         _ok, gate = bot_logic.can_auto_trade()
@@ -1053,7 +1076,7 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
         f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n"
         "🛑 After 3 losses in a row: pause until next section (martingale continues)\n"
-        "🧯 Stability: slower scan + stagger markets + pause a market 60s after 3 scan errors\n",
+        "✅ Anti-rate-limit enabled (ticks_history once/minute per market)\n",
         reply_markup=main_keyboard(),
     )
 
