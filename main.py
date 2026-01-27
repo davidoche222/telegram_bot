@@ -68,7 +68,7 @@ STATUS_REFRESH_COOLDOWN_SEC = 10
 # ========================= ADX + ATR FILTERS (UPDATED) =========================
 ADX_PERIOD = 14
 ATR_PERIOD = 14
-ADX_MIN = 24.0
+ADX_MIN = 22.0
 
 # D+1 ADX (ADX rising)
 USE_ADX_DPLUS1 = True
