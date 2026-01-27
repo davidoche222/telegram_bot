@@ -41,7 +41,7 @@ DURATION_MIN = 2  # ✅ 2-minute expiry
 # ========================= EMA50 SLOPE + DAILY TARGET =========================
 EMA_SLOPE_LOOKBACK = 10
 EMA_SLOPE_MIN = 0.2
-DAILY_PROFIT_TARGET = 2.  # ✅ CHANGED: stop trading for the day when this is hit
+DAILY_PROFIT_TARGET = 2.50  # ✅ CHANGED: stop trading for the day when this is hit
 
 # ========================= PAYOUT MODE =========================
 USE_PAYOUT_MODE = True
@@ -50,7 +50,7 @@ MIN_PAYOUT = 0.35
 MAX_STAKE_ALLOWED = 10.00
 
 # ========================= MARTINGALE SETTINGS =========================
-MARTINGALE_MULT = 1.8
+MARTINGALE_MULT = 2
 MARTINGALE_MAX_STEPS = 4
 MARTINGALE_MAX_STAKE = 16.0
 
