@@ -71,7 +71,7 @@ ATR_PERIOD = 14
 ADX_MIN = 22.0
 
 # D+1 ADX (ADX rising)
-USE_ADX_DPLUS1 = True
+USE_ADX_DPLUS1 = False
 ADX_STEP_MIN = 0.0  # set 0.5 for stricter rising
 
 # DMI direction (+DI/-DI)
