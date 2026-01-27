@@ -588,7 +588,7 @@ class DerivSniperBot:
                 body_ratio = last_body / c_range
                 strong_candle = body_ratio >= float(MIN_BODY_RATIO)
 
-                spike_mult = 1.5
+                spike_mult = 2.0
                 rsi_call_min, rsi_call_max = 45.0, 65.0
                 rsi_put_min, rsi_put_max = 35.0, 55.0
                 ema_diff_min = 0.40
