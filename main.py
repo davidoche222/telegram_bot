@@ -1,6 +1,6 @@
 # ⚠️ SECURITY NOTE:
 # Do NOT post your Deriv / Telegram tokens publicly.
-# Paste them only on your local machine.
+# Regenerate/revoke them in Deriv and BotFather, then replace below on YOUR PC.
 
 import asyncio
 import logging
@@ -41,12 +41,7 @@ DURATION_MIN = 2  # ✅ 2-minute expiry
 # ========================= EMA50 SLOPE + DAILY TARGET =========================
 EMA_SLOPE_LOOKBACK = 10
 EMA_SLOPE_MIN = 0.2
-DAILY_PROFIT_TARGET = 2.0
-
-# ========================= SECTIONS =========================
-SECTIONS_PER_DAY = 4
-SECTION_PROFIT_TARGET = 0.15
-SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)
+DAILY_PROFIT_TARGET = 2.50  # ✅ CHANGED: stop trading for the day when this is hit
 
 # ========================= PAYOUT MODE =========================
 USE_PAYOUT_MODE = True
@@ -251,12 +246,6 @@ class DerivSniperBot:
         self.martingale_step = 0
         self.martingale_halt = False
 
-        # sections
-        self.section_profit = 0.0
-        self.sections_won_today = 0
-        self.section_index = 1
-        self.section_pause_until = 0.0
-
         self.trade_lock = asyncio.Lock()
 
         self.market_debug = {m: {} for m in MARKETS}
@@ -312,40 +301,25 @@ class DerivSniperBot:
                     await asyncio.sleep(0.4 * i)
         logger.warning(f"Telegram send failed after retries: {last_err}")
 
-    # ---------- Sections ----------
-    def _today_midnight_epoch(self) -> float:
+    # ---------- Daily reset ----------
+    def _next_midnight_epoch(self) -> float:
         now = datetime.now(self.tz)
-        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return midnight.timestamp()
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return next_midnight.timestamp()
 
-    def _get_section_index_for_epoch(self, epoch_ts: float) -> int:
-        midnight = self._today_midnight_epoch()
-        sec_into_day = max(0, int(epoch_ts - midnight))
-        idx0 = min(SECTIONS_PER_DAY - 1, sec_into_day // SECTION_LENGTH_SEC)
-        return int(idx0 + 1)
-
-    def _next_section_start_epoch(self, epoch_ts: float) -> float:
-        midnight = self._today_midnight_epoch()
-        sec_into_day = max(0, int(epoch_ts - midnight))
-        idx0 = min(SECTIONS_PER_DAY - 1, sec_into_day // SECTION_LENGTH_SEC)
-        next_start = midnight + (idx0 + 1) * SECTION_LENGTH_SEC
-        if idx0 + 1 >= SECTIONS_PER_DAY:
-            next_midnight = (datetime.fromtimestamp(midnight, self.tz) + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-            return next_midnight.timestamp()
-        return float(next_start)
-
-    def _sync_section_if_needed(self):
-        now = time.time()
+    def _daily_reset_if_needed(self):
         today = datetime.now(self.tz).date()
         if today != self.current_day:
-            return
-        new_idx = self._get_section_index_for_epoch(now)
-        if new_idx != self.section_index:
-            self.section_index = new_idx
-            self.section_profit = 0.0
-            self.section_pause_until = 0.0
+            self.current_day = today
+            self.trades_today = 0
+            self.total_losses_today = 0
+            self.consecutive_losses = 0
+            self.total_profit_today = 0.0
+            self.cooldown_until = 0.0
+            self.pause_until = 0.0
+            self.martingale_step = 0
+            self.current_stake = 0.0
+            self.martingale_halt = False
 
     # ---------- Deriv connection ----------
     async def connect(self) -> bool:
@@ -411,42 +385,11 @@ class DerivSniperBot:
         except Exception:
             pass
 
-    # ---------- Daily reset ----------
-    def _next_midnight_epoch(self) -> float:
-        now = datetime.now(self.tz)
-        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        return next_midnight.timestamp()
-
-    def _daily_reset_if_needed(self):
-        today = datetime.now(self.tz).date()
-        if today != self.current_day:
-            self.current_day = today
-            self.trades_today = 0
-            self.total_losses_today = 0
-            self.consecutive_losses = 0
-            self.total_profit_today = 0.0
-            self.cooldown_until = 0.0
-            self.pause_until = 0.0
-            self.martingale_step = 0
-            self.current_stake = 0.0
-            self.martingale_halt = False
-
-            self.section_profit = 0.0
-            self.sections_won_today = 0
-            self.section_index = self._get_section_index_for_epoch(time.time())
-            self.section_pause_until = 0.0
-
-        self._sync_section_if_needed()
-
     def can_auto_trade(self) -> tuple[bool, str]:
         self._daily_reset_if_needed()
 
         if self.martingale_halt:
             return False, f"Stopped: Martingale {MARTINGALE_MAX_STEPS} steps completed"
-
-        if time.time() < self.section_pause_until:
-            left = int(self.section_pause_until - time.time())
-            return False, f"Section paused. Resumes {fmt_hhmm(self.section_pause_until)} ({left}s)"
 
         if time.time() < self.pause_until:
             left = int(self.pause_until - time.time())
@@ -576,7 +519,7 @@ class DerivSniperBot:
                     continue
                 rsi_now = float(rsi_arr[-2])
 
-                # ===== ADX + ATR (NEW) =====
+                # ===== ADX + ATR =====
                 atr_arr = calculate_atr(highs, lows, closes, ATR_PERIOD)
                 adx_arr = calculate_adx(highs, lows, closes, ADX_PERIOD)
 
@@ -762,8 +705,6 @@ class DerivSniperBot:
                 payout = max(float(MIN_PAYOUT), float(payout))
                 payout = money2(payout)
 
-                # ✅ BALANCE PROTECTION REMOVED (this was the limiter)
-
                 proposal_req = {
                     "proposal": 1,
                     "amount": payout,
@@ -842,11 +783,6 @@ class DerivSniperBot:
 
             if source == "AUTO":
                 self.total_profit_today += profit
-                self.section_profit += profit
-
-                if self.section_profit >= float(SECTION_PROFIT_TARGET):
-                    self.sections_won_today += 1
-                    self.section_pause_until = self._next_section_start_epoch(time.time())
 
                 if profit <= 0:
                     self.consecutive_losses += 1
@@ -856,8 +792,6 @@ class DerivSniperBot:
                     else:
                         self.martingale_halt = True
                         self.is_scanning = False
-                    if self.consecutive_losses >= 3:
-                        self.section_pause_until = self._next_section_start_epoch(time.time())
                 else:
                     self.consecutive_losses = 0
                     self.martingale_step = 0
@@ -870,23 +804,16 @@ class DerivSniperBot:
 
             pause_note = "\n⏸ Paused until 12:00am WAT" if time.time() < self.pause_until else ""
             halt_note = f"\n🛑 Martingale stopped after {MARTINGALE_MAX_STEPS} steps" if self.martingale_halt else ""
-            section_note = (
-                f"\n🧩 Section paused until {fmt_hhmm(self.section_pause_until)}"
-                if time.time() < self.section_pause_until
-                else ""
-            )
-
             next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step)))
 
             await self.safe_send_tg(
                 (
                     f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n"
-                    f"🧩 Section: {self.section_index}/{SECTIONS_PER_DAY} | Section PnL: {self.section_profit:+.2f} | Sections won: {self.sections_won_today}\n"
                     f"📊 Today: {self.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {self.total_losses_today} | Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
                     f"💵 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
                     f"🎁 Next payout: ${next_payout:.2f} (step {self.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
                     f"💰 Balance: {self.balance}"
-                    f"{pause_note}{section_note}{halt_note}"
+                    f"{pause_note}{halt_note}"
                 )
             )
         finally:
@@ -909,7 +836,6 @@ def main_keyboard():
                 InlineKeyboardButton("📊 STATUS", callback_data="STATUS"),
                 InlineKeyboardButton("🔄 REFRESH", callback_data="STATUS"),
             ],
-            [InlineKeyboardButton("🧩 SECTION", callback_data="NEXT_SECTION")],
             [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY")],
             [
                 InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"),
@@ -1027,24 +953,6 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             bot_logic.scanner_task.cancel()
         await _safe_edit(q, "⏹️ Scanner stopped.", reply_markup=main_keyboard())
 
-    elif q.data == "NEXT_SECTION":
-        bot_logic._daily_reset_if_needed()
-        now = time.time()
-        nxt = bot_logic._next_section_start_epoch(now)
-        if nxt <= now + 1:
-            nxt = now + 1
-
-        forced_idx = bot_logic._get_section_index_for_epoch(nxt + 1)
-        bot_logic.section_index = forced_idx
-        bot_logic.section_profit = 0.0
-        bot_logic.section_pause_until = 0.0
-
-        await _safe_edit(
-            q,
-            f"🧩 Moved to Section {bot_logic.section_index}/{SECTIONS_PER_DAY}. Reset section PnL to 0.00.",
-            reply_markup=main_keyboard(),
-        )
-
     elif q.data == "TEST_BUY":
         asyncio.create_task(bot_logic.execute_trade("CALL", "R_10", "Manual Test", source="MANUAL"))
         await _safe_edit(q, "🧪 Test trade triggered (CALL R 10).", reply_markup=main_keyboard())
@@ -1078,15 +986,13 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 trade_status = "🚀 Active Trade: Syncing..."
 
         pause_line = "⏸ Paused until 12:00am WAT\n" if time.time() < bot_logic.pause_until else ""
-        section_line = f"🧩 Section paused until {fmt_hhmm(bot_logic.section_pause_until)}\n" if time.time() < bot_logic.section_pause_until else ""
 
         next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(bot_logic.martingale_step)))
 
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"{pause_line}{section_line}"
-            f"🧩 Section: {bot_logic.section_index}/{SECTIONS_PER_DAY} | Section PnL: {bot_logic.section_profit:+.2f} / +{SECTION_PROFIT_TARGET:.2f} | Sections won: {bot_logic.sections_won_today}\n"
+            f"{pause_line}"
             f"🎁 Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
             f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
