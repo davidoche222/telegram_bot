@@ -1,6 +1,6 @@
 # ⚠️ SECURITY NOTE:
-# You posted your Deriv + Telegram tokens publicly.
-# Regenerate/revoke them in Deriv and BotFather, then replace below.
+# Do NOT post your Deriv / Telegram tokens publicly.
+# Paste them only on your local machine.
 
 import asyncio
 import logging
@@ -16,7 +16,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 # ========================= CONFIG =========================
 DEMO_TOKEN = "tIrfitLjqeBxCOM"
-REAL_TOKEN = "ZkOFWOlPtwnjqTS"  # replace with your full real token
+REAL_TOKEN = "ZkOFWOlPtwnjqTS"
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25"]  # add more if you want
@@ -70,6 +70,15 @@ RATE_LIMIT_BACKOFF_BASE = 20      # seconds (will grow if rate limit repeats)
 # ========================= UI: REFRESH COOLDOWN =========================
 STATUS_REFRESH_COOLDOWN_SEC = 10
 
+# ========================= ADX + ATR FILTERS (NEW) =========================
+ADX_PERIOD = 14
+ATR_PERIOD = 14
+
+ADX_MIN = 25.0       # trend strength threshold
+ATR_MIN = 0.0        # 0.0 = show ATR but don't block trades by ATR
+
+TREND_FILTER_MODE = "BOTH"  # "BOTH" requires ADX✅ and ATR✅, "EITHER" allows ADX✅ OR ATR✅
+
 
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period: int):
@@ -110,6 +119,75 @@ def calculate_rsi(values, period=14):
         rsi[i] = 100.0 - (100.0 / (1.0 + rs))
 
     return rsi
+
+
+def calculate_atr(highs, lows, closes, period=14):
+    highs = np.array(highs, dtype=float)
+    lows = np.array(lows, dtype=float)
+    closes = np.array(closes, dtype=float)
+
+    n = len(closes)
+    if n < period + 2:
+        return np.array([])
+
+    prev_close = np.roll(closes, 1)
+    prev_close[0] = closes[0]
+
+    tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_close), np.abs(lows - prev_close)))
+
+    atr = np.full(n, np.nan, dtype=float)
+    atr[period] = np.mean(tr[1:period + 1])
+    for i in range(period + 1, n):
+        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+
+    return atr
+
+
+def calculate_adx(highs, lows, closes, period=14):
+    highs = np.array(highs, dtype=float)
+    lows = np.array(lows, dtype=float)
+    closes = np.array(closes, dtype=float)
+
+    n = len(closes)
+    if n < period * 2 + 2:
+        return np.array([])
+
+    up_move = highs[1:] - highs[:-1]
+    down_move = lows[:-1] - lows[1:]
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    prev_close = closes[:-1]
+    tr = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - prev_close), np.abs(lows[1:] - prev_close)))
+
+    tr_s = np.zeros_like(tr)
+    plus_s = np.zeros_like(plus_dm)
+    minus_s = np.zeros_like(minus_dm)
+
+    tr_s[period - 1] = np.sum(tr[:period])
+    plus_s[period - 1] = np.sum(plus_dm[:period])
+    minus_s[period - 1] = np.sum(minus_dm[:period])
+
+    for i in range(period, len(tr)):
+        tr_s[i] = tr_s[i - 1] - (tr_s[i - 1] / period) + tr[i]
+        plus_s[i] = plus_s[i - 1] - (plus_s[i - 1] / period) + plus_dm[i]
+        minus_s[i] = minus_s[i - 1] - (minus_s[i - 1] / period) + minus_dm[i]
+
+    plus_di = 100.0 * (plus_s / (tr_s + 1e-12))
+    minus_di = 100.0 * (minus_s / (tr_s + 1e-12))
+    dx = 100.0 * (np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12))
+
+    adx = np.full(n, np.nan, dtype=float)
+    dx_full = np.full(n, np.nan, dtype=float)
+    dx_full[1:] = dx
+
+    start = period * 2
+    adx[start] = np.nanmean(dx_full[period:start + 1])
+    for i in range(start + 1, n):
+        adx[i] = ((adx[i - 1] * (period - 1)) + dx_full[i]) / period
+
+    return adx
 
 
 def build_candles_from_deriv(candles_raw):
@@ -458,11 +536,17 @@ class DerivSniperBot:
                     continue
 
                 closes = [x["c"] for x in candles]
+                highs = [x["h"] for x in candles]
+                lows = [x["l"] for x in candles]
 
                 ema20_arr = calculate_ema(closes, 20)
                 ema50_arr = calculate_ema(closes, 50)
                 if len(ema20_arr) < 60 or len(ema50_arr) < 60:
-                    self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["EMA20/EMA50 not ready yet."]}
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "gate": "Indicators",
+                        "why": ["EMA20/EMA50 not ready yet."],
+                    }
                     self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
 
@@ -483,10 +567,29 @@ class DerivSniperBot:
 
                 rsi_arr = calculate_rsi(closes, RSI_PERIOD)
                 if len(rsi_arr) < 60 or np.isnan(rsi_arr[-2]):
-                    self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["RSI not ready yet."]}
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "gate": "Indicators",
+                        "why": ["RSI not ready yet."],
+                    }
                     self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
                 rsi_now = float(rsi_arr[-2])
+
+                # ===== ADX + ATR (NEW) =====
+                atr_arr = calculate_atr(highs, lows, closes, ATR_PERIOD)
+                adx_arr = calculate_adx(highs, lows, closes, ADX_PERIOD)
+
+                atr_now = float(atr_arr[-2]) if len(atr_arr) and not np.isnan(atr_arr[-2]) else float("nan")
+                adx_now = float(adx_arr[-2]) if len(adx_arr) and not np.isnan(adx_arr[-2]) else float("nan")
+
+                atr_ok = (not np.isnan(atr_now)) and (atr_now >= float(ATR_MIN))
+                adx_ok = (not np.isnan(adx_now)) and (adx_now >= float(ADX_MIN))
+
+                if TREND_FILTER_MODE.upper() == "EITHER":
+                    trend_filter_ok = adx_ok or atr_ok
+                else:
+                    trend_filter_ok = adx_ok and atr_ok
 
                 pb_high = float(pullback["h"])
                 pb_low = float(pullback["l"])
@@ -534,31 +637,78 @@ class DerivSniperBot:
                     uptrend and slope_ok and ema50_rising and touched_ema20 and bull_confirm
                     and strong_candle
                     and close_above_ema20 and call_rsi_ok and not spike_block and not flat_block and breakout_call
+                    and trend_filter_ok
                 )
                 put_ready = (
                     downtrend and slope_ok and ema50_falling and touched_ema20 and bear_confirm
                     and strong_candle
                     and close_below_ema20 and put_rsi_ok and not spike_block and not flat_block and breakout_put
+                    and trend_filter_ok
                 )
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
+
+                trend_label = "UPTREND" if uptrend else "DOWNTREND" if downtrend else "SIDEWAYS"
+                ema_label = "EMA20 ABOVE EMA50" if uptrend else "EMA20 BELOW EMA50" if downtrend else "EMA20 = EMA50"
+                trend_strength = "STRONG" if not flat_block else "WEAK"
+                pullback_label = "PULLBACK TOUCHED ✅" if touched_ema20 else "WAITING PULLBACK…"
+                confirm_close_label = (
+                    "CONFIRM CLOSE > EMA20 ✅" if close_above_ema20 else
+                    "CONFIRM CLOSE < EMA20 ✅" if close_below_ema20 else
+                    "CONFIRM CLOSE ON EMA20"
+                )
+                slope_label = "EMA50 SLOPE ↑" if ema50_rising else "EMA50 SLOPE ↓" if ema50_falling else "EMA50 SLOPE FLAT"
+
+                block_label_parts = []
+                if spike_block:
+                    block_label_parts.append("SPIKE BLOCK")
+                if flat_block:
+                    block_label_parts.append("WEAK/FLAT TREND")
+                if not slope_ok:
+                    block_label_parts.append("SLOPE N/A")
+                if not strong_candle:
+                    block_label_parts.append("WEAK CANDLE")
+                if not adx_ok:
+                    block_label_parts.append("ADX LOW")
+                if not atr_ok:
+                    block_label_parts.append("ATR LOW")
+                if not trend_filter_ok:
+                    block_label_parts.append("TREND FILTER FAIL")
+
+                block_label = " | ".join(block_label_parts) if block_label_parts else "OK"
 
                 why = []
                 if not ok_gate:
                     why.append(f"Gate blocked: {gate}")
                 if signal:
                     why.append(f"READY: {signal} (enter next candle)")
-
-                trend_label = "UPTREND" if uptrend else "DOWNTREND" if downtrend else "SIDEWAYS"
-                trend_strength = "STRONG" if not flat_block else "WEAK"
+                else:
+                    why.append("No entry yet (conditions not aligned).")
 
                 self.market_debug[symbol] = {
                     "time": time.time(),
                     "gate": gate,
                     "last_closed": confirm_t0,
                     "signal": signal,
+
                     "trend_label": trend_label,
+                    "ema_label": ema_label,
                     "trend_strength": trend_strength,
+                    "pullback_label": pullback_label,
+                    "confirm_close_label": confirm_close_label,
+                    "slope_label": slope_label,
+                    "block_label": block_label,
+
+                    "ema50_slope": ema50_slope,
+                    "rsi_now": rsi_now,
+                    "body_ratio": body_ratio,
+
+                    "adx_now": adx_now,
+                    "atr_now": atr_now,
+                    "adx_ok": adx_ok,
+                    "atr_ok": atr_ok,
+                    "trend_filter_ok": trend_filter_ok,
+
                     "why": why[:10],
                 }
 
@@ -613,10 +763,6 @@ class DerivSniperBot:
                 payout = money2(payout)
 
                 # ✅ BALANCE PROTECTION REMOVED (this was the limiter)
-                # bal_response = await self.safe_deriv_call("balance", {"balance": 1})
-                # bal = float(bal_response["balance"]["balance"])
-                # max_stake = bal * 0.01
-                # payout = min(payout, max_stake * 0.8)
 
                 proposal_req = {
                     "proposal": 1,
@@ -781,13 +927,57 @@ def format_market_detail(sym: str, d: dict) -> str:
     gate = d.get("gate", "—")
     last_closed = d.get("last_closed", 0)
     signal = d.get("signal") or "—"
+
+    trend_label = d.get("trend_label", "—")
+    ema_label = d.get("ema_label", "—")
+    trend_strength = d.get("trend_strength", "—")
+    pullback_label = d.get("pullback_label", "—")
+    confirm_close_label = d.get("confirm_close_label", "—")
+    slope_label = d.get("slope_label", "—")
+    block_label = d.get("block_label", "—")
+
+    rsi_now = d.get("rsi_now", None)
+    ema50_slope = d.get("ema50_slope", None)
+    body_ratio = d.get("body_ratio", None)
+
+    adx_now = d.get("adx_now", None)
+    atr_now = d.get("atr_now", None)
+    adx_ok = d.get("adx_ok", False)
+    atr_ok = d.get("atr_ok", False)
+
+    adx_line = "ADX: —"
+    atr_line = "ATR: —"
+    if isinstance(adx_now, (int, float)) and not np.isnan(adx_now):
+        adx_line = f"ADX: {adx_now:.2f} {'✅' if adx_ok else '❌'} (min {ADX_MIN})"
+    if isinstance(atr_now, (int, float)) and not np.isnan(atr_now):
+        atr_line = f"ATR: {atr_now:.5f} {'✅' if atr_ok else '❌'} (min {ATR_MIN})"
+
+    extra = []
+    if isinstance(rsi_now, (int, float)) and not np.isnan(rsi_now):
+        extra.append(f"RSI: {rsi_now:.2f}")
+    if isinstance(ema50_slope, (int, float)) and not np.isnan(ema50_slope):
+        extra.append(f"EMA50 slope: {ema50_slope:.3f}")
+    if isinstance(body_ratio, (int, float)) and not np.isnan(body_ratio):
+        extra.append(f"Body ratio: {body_ratio:.2f}")
+    extra_line = " | ".join(extra) if extra else "—"
+
     why = d.get("why", [])
-    why_line = ("Why: " + str(why[0])) if why else ""
+    why_line = "Why: " + (str(why[0]) if why else "—")
 
     return (
         f"📍 {sym.replace('_',' ')} ({age}s)\n"
         f"Gate: {gate}\n"
         f"Last closed: {fmt_time_hhmmss(last_closed)}\n"
+        f"────────────────\n"
+        f"Trend: {trend_label} ({trend_strength})\n"
+        f"{ema_label}\n"
+        f"{slope_label}\n"
+        f"{pullback_label}\n"
+        f"{confirm_close_label}\n"
+        f"{adx_line}\n"
+        f"{atr_line}\n"
+        f"Stats: {extra_line}\n"
+        f"Filters: {block_label}\n"
         f"Signal: {signal}\n"
         f"{why_line}\n"
     )
@@ -902,6 +1092,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
             f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
+            f"📌 Trend Filters: ADX(min {ADX_MIN}) + ATR(min {ATR_MIN}) | Mode: {TREND_FILTER_MODE}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
             f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
             f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
@@ -910,7 +1101,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"💰 Balance: {bot_logic.balance}\n"
         )
 
-        details = "\n\n📌 LIVE SCAN (Simple)\n\n" + "\n\n".join(
+        details = "\n\n📌 LIVE SCAN (FULL)\n\n" + "\n\n".join(
             [format_market_detail(sym, bot_logic.market_debug.get(sym, {})) for sym in MARKETS]
         )
 
