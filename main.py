@@ -6,6 +6,7 @@ import asyncio
 import logging
 import random
 import time
+from collections import deque
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -19,7 +20,7 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "ZkOFWOlPtwnjqTS"
 APP_ID = 1089
 
-MARKETS = ["R_10", "R_25"]  # add more if you want
+MARKETS = ["R_10", "R_25"]  # ✅ R10 + R25 only
 
 COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 60
@@ -39,8 +40,8 @@ RSI_PERIOD = 14
 DURATION_MIN = 2  # ✅ 2-minute expiry
 
 # ========================= EMA50 SLOPE + DAILY TARGET =========================
-EMA_SLOPE_LOOKBACK = 10
-EMA_SLOPE_MIN = 0.2
+EMA_SLOPE_LOOKBACK = 12      # ✅ was 10
+EMA_SLOPE_MIN = 0.05         # ✅ was 0.2 (too strict)
 DAILY_PROFIT_TARGET = 2.0
 
 # ========================= SECTIONS =========================
@@ -55,12 +56,13 @@ MIN_PAYOUT = 0.35
 MAX_STAKE_ALLOWED = 10.00
 
 # ========================= MARTINGALE SETTINGS =========================
-MARTINGALE_MULT = 1.85
+# ✅ You asked to KEEP martingale
+MARTINGALE_MULT = 1.8
 MARTINGALE_MAX_STEPS = 4
-MARTINGALE_MAX_STAKE = 16.0
+MARTINGALE_MAX_STAKE = 16.0  # (display only, stake is still capped by MAX_STAKE_ALLOWED)
 
 # ========================= CANDLE STRENGTH FILTER =========================
-MIN_BODY_RATIO = 0.45
+MIN_BODY_RATIO = 0.60
 MIN_CANDLE_RANGE = 1e-6
 
 # ========================= ANTI RATE-LIMIT =========================
@@ -70,14 +72,13 @@ RATE_LIMIT_BACKOFF_BASE = 20      # seconds (will grow if rate limit repeats)
 # ========================= UI: REFRESH COOLDOWN =========================
 STATUS_REFRESH_COOLDOWN_SEC = 10
 
-# ========================= ADX + ATR FILTERS (NEW) =========================
+# ========================= ADX + ATR FILTERS =========================
 ADX_PERIOD = 14
 ATR_PERIOD = 14
 
-ADX_MIN = 22.0       # trend strength threshold
-ATR_MIN = 0.0        # 0.0 = show ATR but don't block trades by ATR
-
-TREND_FILTER_MODE = "BOTH"  # "BOTH" requires ADX✅ and ATR✅, "EITHER" allows ADX✅ OR ATR✅
+ADX_MIN = 25.0       # trend strength threshold (if too few trades, try 20.0)
+ATR_MIN = 0.0        # 0.0 = ATR never blocks trades (still shown in status)
+TREND_FILTER_MODE = "BOTH"  # with ATR_MIN=0.0, ATR is always ✅, so effectively ADX drives the filter
 
 
 # ========================= INDICATOR MATH =========================
@@ -275,6 +276,10 @@ class DerivSniperBot:
         # refresh cooldown
         self.status_cooldown_until = 0.0
 
+        # ✅ win-rate stats
+        self.stats = {m: {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0} for m in MARKETS}
+        self.last_results = {m: deque(maxlen=20) for m in MARKETS}  # store 1 for win, 0 for loss, by market
+
     # ---------- helpers ----------
     @staticmethod
     def _is_gatewayish_error(msg: str) -> bool:
@@ -436,6 +441,10 @@ class DerivSniperBot:
             self.section_index = self._get_section_index_for_epoch(time.time())
             self.section_pause_until = 0.0
 
+            # reset stats daily
+            self.stats = {m: {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0} for m in MARKETS}
+            self.last_results = {m: deque(maxlen=20) for m in MARKETS}
+
         self._sync_section_if_needed()
 
     def can_auto_trade(self) -> tuple[bool, str]:
@@ -542,11 +551,7 @@ class DerivSniperBot:
                 ema20_arr = calculate_ema(closes, 20)
                 ema50_arr = calculate_ema(closes, 50)
                 if len(ema20_arr) < 60 or len(ema50_arr) < 60:
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "gate": "Indicators",
-                        "why": ["EMA20/EMA50 not ready yet."],
-                    }
+                    self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["EMA20/EMA50 not ready yet."]}
                     self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
 
@@ -554,6 +559,7 @@ class DerivSniperBot:
                 ema20_confirm = float(ema20_arr[-2])
                 ema50_confirm = float(ema50_arr[-2])
 
+                # EMA50 slope filter
                 slope_ok = False
                 ema50_slope = 0.0
                 ema50_rising = False
@@ -567,16 +573,12 @@ class DerivSniperBot:
 
                 rsi_arr = calculate_rsi(closes, RSI_PERIOD)
                 if len(rsi_arr) < 60 or np.isnan(rsi_arr[-2]):
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "gate": "Indicators",
-                        "why": ["RSI not ready yet."],
-                    }
+                    self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["RSI not ready yet."]}
                     self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
                 rsi_now = float(rsi_arr[-2])
 
-                # ===== ADX + ATR (NEW) =====
+                # ADX + ATR
                 atr_arr = calculate_atr(highs, lows, closes, ATR_PERIOD)
                 adx_arr = calculate_adx(highs, lows, closes, ADX_PERIOD)
 
@@ -615,9 +617,10 @@ class DerivSniperBot:
                 body_ratio = last_body / c_range
                 strong_candle = body_ratio >= float(MIN_BODY_RATIO)
 
+                # ✅ tuned for R10/R25 (tighter RSI, no breakout requirement)
                 spike_mult = 1.5
-                rsi_call_min, rsi_call_max = 45.0, 65.0
-                rsi_put_min, rsi_put_max = 35.0, 55.0
+                rsi_call_min, rsi_call_max = 54.0, 59.0
+                rsi_put_min, rsi_put_max = 41.0, 46.0
                 ema_diff_min = 0.40
 
                 spike_block = (avg_body > 0 and last_body > spike_mult * avg_body)
@@ -630,19 +633,17 @@ class DerivSniperBot:
                 call_rsi_ok = (rsi_call_min <= rsi_now <= rsi_call_max)
                 put_rsi_ok = (rsi_put_min <= rsi_now <= rsi_put_max)
 
-                breakout_call = c_close > pb_high
-                breakout_put = c_close < pb_low
-
+                # ✅ breakout removed (was forcing late entries)
                 call_ready = (
                     uptrend and slope_ok and ema50_rising and touched_ema20 and bull_confirm
                     and strong_candle
-                    and close_above_ema20 and call_rsi_ok and not spike_block and not flat_block and breakout_call
+                    and close_above_ema20 and call_rsi_ok and not spike_block and not flat_block
                     and trend_filter_ok
                 )
                 put_ready = (
                     downtrend and slope_ok and ema50_falling and touched_ema20 and bear_confirm
                     and strong_candle
-                    and close_below_ema20 and put_rsi_ok and not spike_block and not flat_block and breakout_put
+                    and close_below_ema20 and put_rsi_ok and not spike_block and not flat_block
                     and trend_filter_ok
                 )
 
@@ -690,7 +691,6 @@ class DerivSniperBot:
                     "gate": gate,
                     "last_closed": confirm_t0,
                     "signal": signal,
-
                     "trend_label": trend_label,
                     "ema_label": ema_label,
                     "trend_strength": trend_strength,
@@ -698,17 +698,14 @@ class DerivSniperBot:
                     "confirm_close_label": confirm_close_label,
                     "slope_label": slope_label,
                     "block_label": block_label,
-
                     "ema50_slope": ema50_slope,
                     "rsi_now": rsi_now,
                     "body_ratio": body_ratio,
-
                     "adx_now": adx_now,
                     "atr_now": atr_now,
                     "adx_ok": adx_ok,
                     "atr_ok": atr_ok,
                     "trend_filter_ok": trend_filter_ok,
-
                     "why": why[:10],
                 }
 
@@ -761,8 +758,6 @@ class DerivSniperBot:
 
                 payout = max(float(MIN_PAYOUT), float(payout))
                 payout = money2(payout)
-
-                # ✅ BALANCE PROTECTION REMOVED (this was the limiter)
 
                 proposal_req = {
                     "proposal": 1,
@@ -824,13 +819,13 @@ class DerivSniperBot:
                 )
                 await self.safe_send_tg(msg)
 
-                asyncio.create_task(self.check_result(self.active_trade_info, source, side, rsi_now, ema50_slope))
+                asyncio.create_task(self.check_result(self.active_trade_info, source, symbol))
 
             except Exception as e:
                 logger.error(f"Trade error: {e}")
                 await self.safe_send_tg(f"⚠️ Trade error:\n{e}")
 
-    async def check_result(self, cid: int, source: str, side: str, rsi_now: float, ema50_slope: float):
+    async def check_result(self, cid: int, source: str, symbol: str):
         await asyncio.sleep(int(DURATION_MIN) * 60 + 5)
         try:
             res = await self.safe_deriv_call(
@@ -843,6 +838,17 @@ class DerivSniperBot:
             if source == "AUTO":
                 self.total_profit_today += profit
                 self.section_profit += profit
+
+                # ✅ update stats
+                if symbol in self.stats:
+                    self.stats[symbol]["trades"] += 1
+                    self.stats[symbol]["pnl"] += profit
+                    if profit > 0:
+                        self.stats[symbol]["wins"] += 1
+                        self.last_results[symbol].append(1)
+                    else:
+                        self.stats[symbol]["losses"] += 1
+                        self.last_results[symbol].append(0)
 
                 if self.section_profit >= float(SECTION_PROFIT_TARGET):
                     self.sections_won_today += 1
@@ -917,6 +923,21 @@ def main_keyboard():
             ],
         ]
     )
+
+
+def _winrate_line_for(mkt: str) -> str:
+    s = bot_logic.stats.get(mkt, {})
+    trades = int(s.get("trades", 0))
+    wins = int(s.get("wins", 0))
+    losses = int(s.get("losses", 0))
+    pnl = float(s.get("pnl", 0.0))
+
+    wr = (wins / trades * 100.0) if trades > 0 else 0.0
+    last = list(bot_logic.last_results.get(mkt, []))
+    last_wr = (sum(last) / len(last) * 100.0) if last else 0.0
+    last_n = len(last)
+
+    return f"{mkt.replace('_',' ')}: {wins}/{trades} ({wr:.1f}%) | last{last_n}: {last_wr:.1f}% | pnl {pnl:+.2f}"
 
 
 def format_market_detail(sym: str, d: dict) -> str:
@@ -1082,6 +1103,8 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(bot_logic.martingale_step)))
 
+        winrate_lines = "\n".join(_winrate_line_for(m) for m in MARKETS)
+
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
@@ -1093,6 +1116,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
             f"📌 Trend Filters: ADX(min {ADX_MIN}) + ATR(min {ATR_MIN}) | Mode: {TREND_FILTER_MODE}\n"
+            f"📈 Winrate:\n{winrate_lines}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
             f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
             f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
