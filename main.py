@@ -51,7 +51,7 @@ MAX_STAKE_ALLOWED = 5.00      # safety cap: if Deriv needs > this stake for $1 p
 BUY_PRICE_BUFFER = 0.02       # buffer above ask_price to avoid rounding/refusal
 
 # ========================= MARTINGALE SETTINGS =========================
-MARTINGALE_MULT = 2.0
+MARTINGALE_MULT = 1.8
 MARTINGALE_MAX_STEPS = 4
 MARTINGALE_MAX_STAKE = 16.0
 
