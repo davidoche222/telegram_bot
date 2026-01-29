@@ -76,7 +76,7 @@ STATUS_REFRESH_COOLDOWN_SEC = 10
 ADX_PERIOD = 14
 ATR_PERIOD = 14
 
-ADX_MIN = 22.0       # trend strength threshold (if too few trades, try 20.0)
+ADX_MIN = 24.0       # trend strength threshold (if too few trades, try 20.0)
 ATR_MIN = 0.0        # 0.0 = ATR never blocks trades (still shown in status)
 TREND_FILTER_MODE = "BOTH"  # with ATR_MIN=0.0, ATR is always ✅, so effectively ADX drives the filter
 
