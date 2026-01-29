@@ -13,7 +13,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # ========================= CONFIG =========================
 
 DEMO_TOKEN = "tIrfitLjqeBxCOM"
-REAL_TOKEN = "2hsJzopRHG5w"
+REAL_TOKEN = "ZkOFWOlPtwnjqTS"
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50"]
