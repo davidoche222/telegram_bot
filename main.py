@@ -4,6 +4,7 @@
 
 import asyncio
 import logging
+import random
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -15,7 +16,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 # ========================= CONFIG =========================
 DEMO_TOKEN = "tIrfitLjqeBxCOM"
-REAL_TOKEN = "ZkOFWOlPtwnjqTS"  # replace with your full real token
+REAL_TOKEN = ""ZkOFWOlPtwnjqTS"  # replace with your full real token
 APP_ID = 1089
 
 MARKETS = ["R_10", "R_25", "R_50"]
@@ -49,10 +50,14 @@ PAYOUT_TARGET = 1.00          # ✅ payout = $1
 MAX_STAKE_ALLOWED = 5.00      # safety cap: if Deriv needs > this stake for $1 payout, skip trade
 BUY_PRICE_BUFFER = 0.02       # buffer above ask_price to avoid rounding/refusal
 
-# ========================= MARTINGALE SETTINGS (kept for display only) =========================
-MARTINGALE_MULT = 1.8
+# ========================= MARTINGALE SETTINGS =========================
+MARTINGALE_MULT = 2.0
 MARTINGALE_MAX_STEPS = 4
 MARTINGALE_MAX_STAKE = 16.0
+
+# ========================= ANTI RATE-LIMIT (YOUR FIX STYLE) =========================
+TICKS_GLOBAL_MIN_INTERVAL = 0.35
+RATE_LIMIT_BACKOFF_BASE = 20
 
 
 # ========================= INDICATOR MATH =========================
@@ -116,7 +121,7 @@ def fmt_time_hhmmss(epoch):
         return "—"
 
 
-# ✅ CHANGED: round UP to 2dp (prevents buy cap rounding down)
+# ✅ round UP to 2dp (prevents buy cap rounding down)
 def money2(x: float) -> float:
     import math
     return math.ceil(float(x) * 100.0) / 100.0
@@ -158,6 +163,32 @@ class DerivSniperBot:
         self.current_day = datetime.now(self.tz).date()
         self.pause_until = 0.0
 
+        # ✅ rate-limit pacing state (global + per-market schedule)
+        self._ticks_lock = asyncio.Lock()
+        self._last_ticks_ts = 0.0
+        self._next_poll_epoch = {m: 0.0 for m in MARKETS}
+        self._rate_limit_strikes = {m: 0 for m in MARKETS}
+
+    # ---------- error helpers ----------
+    @staticmethod
+    def _is_rate_limit_error(msg: str) -> bool:
+        m = (msg or "").lower()
+        return ("rate limit" in m) or ("reached the rate limit" in m) or ("too many requests" in m) or ("429" in m)
+
+    @staticmethod
+    def _is_gatewayish_error(msg: str) -> bool:
+        m = (msg or "").lower()
+        return any(
+            k in m
+            for k in [
+                "gateway", "bad gateway", "502", "503", "504",
+                "timeout", "timed out",
+                "temporarily unavailable",
+                "connection", "websocket", "not connected", "disconnect",
+                "internal server error", "service unavailable",
+            ]
+        )
+
     async def connect(self) -> bool:
         try:
             if not self.active_token:
@@ -182,7 +213,7 @@ class DerivSniperBot:
         self.api = None
         return await self.connect()
 
-    async def safe_ticks_history(self, payload: dict, retries: int = 4):
+    async def safe_deriv_call(self, fn_name: str, payload: dict, retries: int = 6):
         last_err = None
         for attempt in range(1, retries + 1):
             try:
@@ -190,26 +221,37 @@ class DerivSniperBot:
                     ok = await self.safe_reconnect()
                     if not ok:
                         raise RuntimeError("Reconnect failed")
-                return await self.api.ticks_history(payload)
+                fn = getattr(self.api, fn_name)
+                return await fn(payload)
             except Exception as e:
                 last_err = e
-                msg = str(e).lower()
+                msg = str(e)
 
-                if "rate limit" in msg or "too many" in msg or "throttle" in msg:
-                    await asyncio.sleep(2.5 * attempt)
-                else:
-                    await asyncio.sleep(1.0 * attempt)
-
-                if any(k in msg for k in ["disconnect", "connection", "websocket", "not connected", "authorize", "auth"]):
+                if self._is_gatewayish_error(msg):
                     await self.safe_reconnect()
 
+                if self._is_rate_limit_error(msg):
+                    await asyncio.sleep(min(20.0, 2.5 * attempt + random.random()))
+                else:
+                    await asyncio.sleep(min(8.0, 0.6 * attempt + random.random() * 0.5))
+
         raise last_err
+
+    async def safe_ticks_history(self, payload: dict, retries: int = 4):
+        # ✅ global pacing across ALL markets
+        async with self._ticks_lock:
+            now = time.time()
+            gap = (self._last_ticks_ts + TICKS_GLOBAL_MIN_INTERVAL) - now
+            if gap > 0:
+                await asyncio.sleep(gap)
+            self._last_ticks_ts = time.time()
+        return await self.safe_deriv_call("ticks_history", payload, retries=retries)
 
     async def fetch_balance(self):
         if not self.api:
             return
         try:
-            bal = await self.api.balance({"balance": 1})
+            bal = await self.safe_deriv_call("balance", {"balance": 1}, retries=4)
             self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
         except Exception:
             pass
@@ -293,8 +335,18 @@ class DerivSniperBot:
         await self._sleep_until(next_open, buffer_s=0.20)
 
     async def scan_market(self, symbol: str):
+        # start slightly staggered to avoid bursts
+        self._next_poll_epoch[symbol] = time.time() + random.random() * 0.5
+
         while self.is_scanning:
             try:
+                # ✅ per-market scheduling (poll only when allowed)
+                now = time.time()
+                nxt = float(self._next_poll_epoch.get(symbol, 0.0))
+                if now < nxt:
+                    await asyncio.sleep(min(1.0, nxt - now))
+                    continue
+
                 if self.consecutive_losses >= MAX_CONSEC_LOSSES or self.trades_today >= MAX_TRADES_PER_DAY:
                     self.is_scanning = False
                     break
@@ -308,16 +360,19 @@ class DerivSniperBot:
                         "gate": "Waiting for more candles",
                         "why": [f"Not enough candle history yet (need ~70, have {len(candles)})."],
                     }
-                    await asyncio.sleep(SCAN_SLEEP_SEC)
+                    self._next_poll_epoch[symbol] = time.time() + 10
                     continue
 
                 pullback = candles[-3]
                 confirm = candles[-2]
                 confirm_t0 = int(confirm["t0"])
 
-                # ✅ Rate-limit fix: don't reprocess same closed candle
+                # ✅ schedule next poll for after next candle close (big rate-limit reducer)
+                next_closed_epoch = confirm_t0 + TF_SEC
+                self._next_poll_epoch[symbol] = float(next_closed_epoch + 0.35)
+
+                # don't reprocess same closed candle
                 if self.last_processed_closed_t0[symbol] == confirm_t0:
-                    await self._sync_to_next_candle_open(confirm_t0)
                     continue
 
                 closes = [x["c"] for x in candles]
@@ -326,7 +381,7 @@ class DerivSniperBot:
                 ema50_arr = calculate_ema(closes, 50)
                 if len(ema20_arr) < 60 or len(ema50_arr) < 60:
                     self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["EMA20/EMA50 not ready yet."]}
-                    await asyncio.sleep(SCAN_SLEEP_SEC)
+                    self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
 
                 ema20_pullback = float(ema20_arr[-3])
@@ -348,7 +403,7 @@ class DerivSniperBot:
                 rsi_arr = calculate_rsi(closes, RSI_PERIOD)
                 if len(rsi_arr) < 60 or np.isnan(rsi_arr[-2]):
                     self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["RSI not ready yet."]}
-                    await asyncio.sleep(SCAN_SLEEP_SEC)
+                    self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
                 rsi_now = float(rsi_arr[-2])
 
@@ -454,7 +509,6 @@ class DerivSniperBot:
                 self.last_processed_closed_t0[symbol] = confirm_t0
 
                 if not ok_gate:
-                    await self._sync_to_next_candle_open(confirm_t0)
                     continue
 
                 # wait for next candle open then place trade
@@ -474,8 +528,6 @@ class DerivSniperBot:
                         source="AUTO",
                     )
 
-                await asyncio.sleep(0.25)
-
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -483,16 +535,15 @@ class DerivSniperBot:
                 logger.error(f"Scanner Error ({symbol}): {msg}")
                 self.market_debug[symbol] = {"time": time.time(), "gate": "Error", "why": [msg[:160]]}
 
-                low = msg.lower()
-                if "rate limit" in low or "too many" in low or "throttle" in low:
-                    await asyncio.sleep(6)
-                elif any(k in low for k in ["disconnect", "connection", "websocket", "not connected"]):
-                    await self.safe_reconnect()
-                    await asyncio.sleep(2)
+                if self._is_rate_limit_error(msg):
+                    self._rate_limit_strikes[symbol] = int(self._rate_limit_strikes.get(symbol, 0)) + 1
+                    backoff = RATE_LIMIT_BACKOFF_BASE * self._rate_limit_strikes[symbol]
+                    backoff = min(180, backoff)
+                    self._next_poll_epoch[symbol] = time.time() + backoff
                 else:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(2 if not self._is_gatewayish_error(msg) else 5)
 
-            await asyncio.sleep(SCAN_SLEEP_SEC)
+            await asyncio.sleep(0.05)
 
     # ========================= ✅ UPDATED TRADE EXECUTION (PAYOUT + MARTINGALE ON PAYOUT) =========================
     async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL"):
@@ -516,7 +567,7 @@ class DerivSniperBot:
                 proposal_req = {
                     "proposal": 1,
                     "amount": payout,
-                    "basis": "payout",          # ✅ payout mode
+                    "basis": "payout",
                     "contract_type": side,
                     "currency": "USD",
                     "duration": int(DURATION_MIN),
@@ -524,8 +575,7 @@ class DerivSniperBot:
                     "symbol": symbol
                 }
 
-                # ---- Attempt 1 ----
-                prop = await self.api.proposal(proposal_req)
+                prop = await self.safe_deriv_call("proposal", proposal_req, retries=6)
                 if "error" in prop:
                     err = prop["error"].get("message", "Proposal error")
                     await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Proposal Error:\n{err}")
@@ -546,12 +596,10 @@ class DerivSniperBot:
                     self.cooldown_until = time.time() + COOLDOWN_SEC
                     return
 
-                # ✅ CHANGED (ONLY): use a fixed max price cap (prevents 0.00 -> x.xx mismatch)
-                buy_price_cap = float(MAX_STAKE_ALLOWED)
+                buy_price_cap = float(MAX_STAKE_ALLOWED) + float(BUY_PRICE_BUFFER)
 
-                buy = await self.api.buy({"buy": proposal_id, "price": buy_price_cap})
+                buy = await self.safe_deriv_call("buy", {"buy": proposal_id, "price": buy_price_cap}, retries=6)
 
-                # ✅ CHANGED: one retry if market moved too much (retry also uses fixed max price cap)
                 if "error" in buy:
                     err_msg = str(buy["error"].get("message", "Buy error"))
                     low = err_msg.lower()
@@ -559,7 +607,7 @@ class DerivSniperBot:
                     if ("moved too much" in low) or ("price has changed" in low):
                         await asyncio.sleep(0.25)
 
-                        prop2 = await self.api.proposal(proposal_req)
+                        prop2 = await self.safe_deriv_call("proposal", proposal_req, retries=6)
                         if "error" in prop2:
                             err2 = prop2["error"].get("message", "Proposal error")
                             await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Proposal Error (retry):\n{err2}")
@@ -581,18 +629,15 @@ class DerivSniperBot:
                             self.cooldown_until = time.time() + COOLDOWN_SEC
                             return
 
-                        buy_price_cap2 = float(MAX_STAKE_ALLOWED)
-                        buy = await self.api.buy({"buy": proposal_id2, "price": buy_price_cap2})
+                        buy = await self.safe_deriv_call("buy", {"buy": proposal_id2, "price": buy_price_cap}, retries=6)
 
                         if "error" in buy:
                             err3 = buy["error"].get("message", "Buy error")
                             await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Trade Refused (retry):\n{err3}")
                             return
 
-                        # use retry prices for display
                         proposal_id = proposal_id2
                         ask_price = ask_price2
-                        buy_price_cap = buy_price_cap2
                     else:
                         await self.app.bot.send_message(TELEGRAM_CHAT_ID, f"❌ Trade Refused:\n{err_msg}")
                         return
@@ -615,7 +660,8 @@ class DerivSniperBot:
                     f"🧾 Buy cap used: ${buy_price_cap:.2f}\n"
                     f"🧠 Reason: {reason}\n"
                     f"🤖 Source: {source}\n"
-                    f"🎯 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}"
+                    f"🎯 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
+                    f"🧪 Martingale step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}"
                 )
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, msg)
                 asyncio.create_task(self.check_result(self.active_trade_info, source))
@@ -630,7 +676,11 @@ class DerivSniperBot:
     async def check_result(self, cid: int, source: str):
         await asyncio.sleep(int(DURATION_MIN) * 60 + 5)
         try:
-            res = await self.api.proposal_open_contract({"proposal_open_contract": 1, "contract_id": cid})
+            res = await self.safe_deriv_call(
+                "proposal_open_contract",
+                {"proposal_open_contract": 1, "contract_id": cid},
+                retries=6
+            )
             profit = float(res["proposal_open_contract"].get("profit", 0))
 
             if source == "AUTO":
@@ -653,7 +703,6 @@ class DerivSniperBot:
             if time.time() < self.pause_until:
                 pause_note = f"\n⏸ Paused until 12:00am WAT"
 
-            # ✅ show next payout after updating martingale_step
             next_step = min(int(self.martingale_step), int(MARTINGALE_MAX_STEPS))
             next_payout = float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** next_step)
             next_payout = round(float(next_payout), 2)
@@ -765,9 +814,10 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 "📌 Strategy: Trend(EMA20/EMA50) + EMA50 Slope + Pullback touch EMA20 + Confirm color + Close vs EMA20 + RSI (M1)\n"
                 "🕯 Timeframe: M1\n"
                 f"⏱ Expiry: {DURATION_MIN}m\n"
-                f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} payout per trade\n"
+                f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} payout per trade (martingale affects payout)\n"
                 f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f} (skips if higher)\n"
-                f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)"
+                f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n"
+                "✅ Anti-rate-limit enabled (global pacing + candle-aligned polling)\n"
             ),
             reply_markup=main_keyboard()
         )
@@ -788,8 +838,10 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         trade_status = "No Active Trade"
         if bot_logic.active_trade_info and bot_logic.api:
             try:
-                res = await bot_logic.api.proposal_open_contract(
-                    {"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info}
+                res = await bot_logic.safe_deriv_call(
+                    "proposal_open_contract",
+                    {"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info},
+                    retries=4
                 )
                 pnl = float(res["proposal_open_contract"].get("profit", 0))
                 rem = max(0, int(DURATION_MIN * 60) - int(time.time() - bot_logic.trade_start_time))
@@ -803,11 +855,16 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if time.time() < bot_logic.pause_until:
             pause_line = "⏸ Paused until 12:00am WAT\n"
 
+        next_step = min(int(bot_logic.martingale_step), int(MARTINGALE_MAX_STEPS))
+        next_payout = float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** next_step)
+        next_payout = round(float(next_payout), 2)
+
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
             f"{pause_line}"
-            f"🎁 Payout mode: ${PAYOUT_TARGET:.2f} | Max stake: ${MAX_STAKE_ALLOWED:.2f}\n"
+            f"🎁 Payout: ${PAYOUT_TARGET:.2f} | Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
+            f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
             f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
@@ -832,9 +889,10 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "📌 Strategy: Trend + EMA50Slope + Pullback + ConfirmColor + CloseVsEMA20 + RSI (M1)\n"
         "🕯 Timeframe: M1\n"
         f"⏱ Expiry: {DURATION_MIN}m\n"
-        f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} payout per trade\n"
+        f"🎁 PAYOUT MODE: ${PAYOUT_TARGET:.2f} payout per trade (martingale affects payout)\n"
         f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
-        f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n",
+        f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} (pause till 12am WAT)\n"
+        "✅ Anti-rate-limit enabled (global pacing + candle-aligned polling)\n",
         reply_markup=main_keyboard()
     )
 
