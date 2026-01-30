@@ -25,7 +25,7 @@ APP_ID = 1089
 MARKETS = ["R_10", "R_25"]
 
 # Trade pacing
-COOLDOWN_SEC = 45                 # faster trading than 120s
+COOLDOWN_SEC = 120                 # faster trading than 120s
 MAX_TRADES_PER_DAY = 60
 MAX_CONSEC_LOSSES = 10
 
