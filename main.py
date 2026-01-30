@@ -51,7 +51,7 @@ PERSIST_MIN_PASS = 4
 
 # ========================= SECTIONS =========================
 SECTIONS_PER_DAY = 4
-SECTION_PROFIT_TARGET = 2
+SECTION_PROFIT_TARGET = 3
 SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)
 
 # Pause after 3 losses (short pause, not whole section)
@@ -64,7 +64,7 @@ MIN_PAYOUT = 0.35
 MAX_STAKE_ALLOWED = 10.00
 
 # ========================= MARTINGALE SETTINGS =========================
-MARTINGALE_MULT = 1.8 # ✅ recovery-focused
+MARTINGALE_MULT = 1.90 # ✅ recovery-focused
 MARTINGALE_MAX_STEPS = 4
 MARTINGALE_MAX_STAKE = 16.0
 
@@ -557,7 +557,6 @@ class DerivSniperBot:
                 ema50_confirm = float(ema50_arr[-2])
 
                 # ===== TREND PERSISTENCE (NEW) =====
-                # last closed bars: [-6:-1] ends at confirm candle (-2), excludes forming candle (-1)
                 w20 = ema20_arr[-(PERSIST_BARS + 1):-1]
                 w50 = ema50_arr[-(PERSIST_BARS + 1):-1]
                 if len(w20) == PERSIST_BARS and len(w50) == PERSIST_BARS:
@@ -595,7 +594,6 @@ class DerivSniperBot:
 
                 atr_ok = (not np.isnan(atr_now)) and (atr_now >= float(ATR_MIN))
                 adx_ok = (not np.isnan(adx_now)) and (adx_now >= float(ADX_MIN))
-
                 trend_filter_ok = (adx_ok or atr_ok) if TREND_FILTER_MODE.upper() == "EITHER" else (adx_ok and atr_ok)
 
                 pb_high = float(pullback["h"])
@@ -623,14 +621,11 @@ class DerivSniperBot:
                 strong_candle = body_ratio >= float(MIN_BODY_RATIO)
 
                 spike_mult = 1.5
-                # ✅ tighter RSI windows (win-rate focused)
                 rsi_call_min, rsi_call_max = 48.0, 62.0
                 rsi_put_min, rsi_put_max = 38.0, 52.0
 
-                # ✅ stronger flat filter
                 ema_diff_min = 0.25
                 spike_block = (avg_body > 0 and last_body > spike_mult * avg_body)
-
                 ema_diff = abs(ema20_confirm - ema50_confirm)
                 flat_block = ema_diff < ema_diff_min
 
@@ -640,7 +635,6 @@ class DerivSniperBot:
                 call_rsi_ok = (rsi_call_min <= rsi_now <= rsi_call_max)
                 put_rsi_ok = (rsi_put_min <= rsi_now <= rsi_put_max)
 
-                # ✅ stricter close near candle extreme
                 close_pos = (c_close - c_low) / (c_range + 1e-12)
                 breakout_call = close_pos >= 0.80
                 breakout_put = close_pos <= 0.20
@@ -666,7 +660,6 @@ class DerivSniperBot:
                 if signal:
                     why.append(f"READY: {signal} (enter now)")
                 else:
-                    # Helpful diagnosis without blocking too much
                     if uptrend and not trend_persist_up:
                         why.append(f"No entry: trend not persistent ({up_votes}/{PERSIST_BARS})")
                     elif downtrend and not trend_persist_down:
@@ -974,9 +967,16 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         now = time.time()
         if now < bot_logic.status_cooldown_until:
             left = int(bot_logic.status_cooldown_until - now)
-            await _safe_edit(q, f"⏳ Refresh cooldown: {left}s\n\nPress again after cooldown.", reply_markup=main_keyboard())
+            await _safe_edit(
+                q,
+                f"⏳ Refresh cooldown: {left}s\n\nPress again after cooldown.",
+                reply_markup=main_keyboard(),
+            )
             return
         bot_logic.status_cooldown_until = now + STATUS_REFRESH_COOLDOWN_SEC
+
+        # keep section/day state synced before rendering
+        bot_logic._daily_reset_if_needed()
 
         await bot_logic.fetch_balance()
         now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
@@ -984,16 +984,46 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(bot_logic.martingale_step)))
 
+        # timers
+        cooldown_left = max(0, int(bot_logic.cooldown_until - time.time()))
+        pause_left = max(0, int(bot_logic.pause_until - time.time()))
+        section_pause_left = max(0, int(bot_logic.section_pause_until - time.time()))
+
+        # next section start
+        next_section_epoch = bot_logic._next_section_start_epoch(time.time())
+        next_section_time = fmt_hhmm(next_section_epoch)
+
+        section_block = (
+            f"🧩 Section: {bot_logic.section_index}/{SECTIONS_PER_DAY}\n"
+            f"🧩 Section PnL: {bot_logic.section_profit:+.2f} / +{SECTION_PROFIT_TARGET:.2f}\n"
+            f"🏆 Sections won today: {bot_logic.sections_won_today}\n"
+            f"⏭️ Next section: {next_section_time} WAT\n"
+        )
+        if section_pause_left > 0:
+            section_block += (
+                f"⏸ Loss-streak pause: {section_pause_left}s left "
+                f"(resumes {fmt_hhmm(bot_logic.section_pause_until)} WAT)\n"
+            )
+
+        extra_timers = ""
+        if pause_left > 0:
+            extra_timers += f"⏸ Daily pause: {pause_left}s left (until 12:00am WAT)\n"
+        if cooldown_left > 0:
+            extra_timers += f"🧊 Cooldown: {cooldown_left}s left\n"
+
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
             f"🎁 Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
             f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
-            f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
+            f"⏱ Expiry: {DURATION_MIN}m | Cooldown base: {COOLDOWN_SEC}s\n"
             f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
             f"📌 Trend Persistence: {PERSIST_MIN_PASS}/{PERSIST_BARS} candles (EMA20 vs EMA50)\n"
-            f"━━━━━━━━━━━━━━━\n"
+            f"{'━━━━━━━━━━━━━━━'}\n"
+            f"{section_block}"
+            f"{extra_timers}"
+            f"{'━━━━━━━━━━━━━━━'}\n"
             f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
             f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
             f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
