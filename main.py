@@ -28,7 +28,7 @@ MAX_TRADES_PER_DAY = 60
 MAX_CONSEC_LOSSES = 10
 
 TELEGRAM_TOKEN = "8253450930:AAHUhPk9TML-8kZlA9UaHZZvTUGdurN9MVY"
-TELEGRAM_CHAT_ID = ""7634818949"
+TELEGRAM_CHAT_ID = "7634818949"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
