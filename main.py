@@ -40,7 +40,7 @@ DURATION_MIN = 1  # 1-minute expiry
 
 # ========================= SECTIONS =========================
 SECTIONS_PER_DAY = 4
-SECTION_PROFIT_TARGET = 2
+SECTION_PROFIT_TARGET = 1
 SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)
 DAILY_PROFIT_TARGET = float(SECTIONS_PER_DAY) * float(SECTION_PROFIT_TARGET)
 
@@ -52,7 +52,7 @@ EMA_SLOPE_MIN = 0.0
 USE_PAYOUT_MODE = True
 PAYOUT_TARGET = 1.00
 MAX_STAKE_ALLOWED = 5.00
-BUY_PRICE_BUFFER = 0.02
+BUY_PRICE_BUFFER = 0.02  # (kept, but no longer used for cap in this version)
 
 # ========================= MARTINGALE SETTINGS =========================
 MARTINGALE_MULT = 1.8
@@ -588,7 +588,6 @@ class DerivSniperBot:
                 return
 
             try:
-                # ✅ FIX 1: Compute payout with money2 (round UP), matching STATUS + real execution
                 step = min(int(self.martingale_step), int(MARTINGALE_MAX_STEPS))
                 if source == "AUTO":
                     payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** step))
@@ -619,6 +618,7 @@ class DerivSniperBot:
                     await self.safe_send_tg("❌ Proposal returned invalid ask_price.")
                     return
 
+                # keep safety cap
                 if ask_price > float(MAX_STAKE_ALLOWED):
                     await self.safe_send_tg(
                         f"⛔️ Skipped trade: payout=${payout:.2f} needs stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
@@ -626,8 +626,8 @@ class DerivSniperBot:
                     self.cooldown_until = time.time() + COOLDOWN_SEC
                     return
 
-                # ✅ FIX 2: Buy cap tied to THIS proposal stake, so it actually executes at the increased stake
-                buy_price_cap = money2(float(ask_price) + float(BUY_PRICE_BUFFER))
+                # ✅ MAIN FIX: generous cap (like your working bot)
+                buy_price_cap = float(MAX_STAKE_ALLOWED)
 
                 if DEBUG_MARTINGALE and source == "AUTO":
                     await self.safe_send_tg(
@@ -643,7 +643,6 @@ class DerivSniperBot:
                     err_msg = str(buy["error"].get("message", "Buy error"))
                     low = err_msg.lower()
 
-                    # retry on moved price
                     if ("moved too much" in low) or ("price has changed" in low):
                         await asyncio.sleep(0.25)
 
@@ -667,10 +666,8 @@ class DerivSniperBot:
                             self.cooldown_until = time.time() + COOLDOWN_SEC
                             return
 
-                        # ✅ recompute cap for the new ask_price
-                        buy_price_cap2 = money2(float(ask_price2) + float(BUY_PRICE_BUFFER))
-
-                        buy = await self.safe_deriv_call("buy", {"buy": proposal_id2, "price": buy_price_cap2}, retries=6)
+                        # ✅ retry uses generous cap too
+                        buy = await self.safe_deriv_call("buy", {"buy": proposal_id2, "price": buy_price_cap}, retries=6)
                         if "error" in buy:
                             err3 = buy["error"].get("message", "Buy error")
                             await self.safe_send_tg(f"❌ Trade Refused (retry):\n{err3}")
@@ -678,7 +675,6 @@ class DerivSniperBot:
 
                         proposal_id = proposal_id2
                         ask_price = ask_price2
-                        buy_price_cap = buy_price_cap2
                     else:
                         await self.safe_send_tg(f"❌ Trade Refused:\n{err_msg}")
                         return
@@ -851,7 +847,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 "📌 Strategy: EMA20/EMA50 + EMA50 slope + pullback touch + confirm candle + RSI\n"
                 f"🧩 Sections: {SECTIONS_PER_DAY}/day | Target: +${SECTION_PROFIT_TARGET:.2f} per section\n"
                 f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
-                "✅ Martingale FIX: payout uses money2 + buy cap tied to ask_price\n"
+                "✅ FIX: buy cap is MAX_STAKE_ALLOWED (prevents price-change refusals)\n"
             ),
             reply_markup=main_keyboard()
         )
