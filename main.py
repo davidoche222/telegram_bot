@@ -44,6 +44,9 @@ SECTION_PROFIT_TARGET = 1
 SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)
 DAILY_PROFIT_TARGET = float(SECTIONS_PER_DAY) * float(SECTION_PROFIT_TARGET)
 
+# ✅ NEW: SESSION TARGET (NET profit since START)
+SESSION_PROFIT_TARGET = 1.00
+
 # ========================= EMA50 SLOPE =========================
 EMA_SLOPE_LOOKBACK = 10
 EMA_SLOPE_MIN = 0.0
@@ -65,6 +68,11 @@ RATE_LIMIT_BACKOFF_BASE = 20
 
 # Optional debug message to Telegram showing computed payout/stake each entry
 DEBUG_MARTINGALE = False
+
+# ========================= LOSS STREAK GUARD (✅ NEW) =========================
+# Activate AFTER 2 losses to make 4 losses in a row very hard, without late entry.
+DANGER_MODE_AFTER_LOSSES = 2   # activate guard after 2 consecutive losses
+BREAK_BUFFER = 0.0             # 0 = minimal break (no late entry)
 
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period: int):
@@ -165,6 +173,9 @@ class DerivSniperBot:
         self.consecutive_losses = 0
         self.total_profit_today = 0.0
         self.balance = "0.00"
+
+        # ✅ NEW: Session profit (net) since START_SCAN
+        self.session_profit = 0.0
 
         # Martingale
         self.current_stake = 0.0
@@ -498,6 +509,14 @@ class DerivSniperBot:
                 close_above_ema20 = c_close > ema20_confirm
                 close_below_ema20 = c_close < ema20_confirm
 
+                # ========================= LOSS STREAK GUARD (✅ NEW) =========================
+                danger_mode = self.consecutive_losses >= DANGER_MODE_AFTER_LOSSES
+                call_breakout_ok = True
+                put_breakout_ok = True
+                if danger_mode:
+                    call_breakout_ok = c_close > (pb_high + BREAK_BUFFER)
+                    put_breakout_ok = c_close < (pb_low - BREAK_BUFFER)
+
                 bodies = [abs(float(candles[i]["c"]) - float(candles[i]["o"])) for i in range(-22, -2)]
                 avg_body = float(np.mean(bodies)) if len(bodies) >= 10 else float(
                     np.mean([abs(float(c["c"]) - float(c["o"])) for c in candles[-60:-2]])
@@ -522,11 +541,13 @@ class DerivSniperBot:
                 call_ready = (
                     uptrend and slope_ok and ema50_rising and touched_ema20 and bull_confirm
                     and close_above_ema20 and call_rsi_ok and not spike_block and not flat_block
+                    and call_breakout_ok  # ✅ NEW (only active after 2 losses)
                 )
 
                 put_ready = (
                     downtrend and slope_ok and ema50_falling and touched_ema20 and bear_confirm
                     and close_below_ema20 and put_rsi_ok and not spike_block and not flat_block
+                    and put_breakout_ok   # ✅ NEW (only active after 2 losses)
                 )
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
@@ -722,6 +743,17 @@ class DerivSniperBot:
                 self.total_profit_today += profit
                 self.section_profit += profit
 
+                # ✅ track net session profit
+                self.session_profit += profit
+
+                # ✅ stop session ONLY when net session profit hits +$1
+                if self.session_profit >= float(SESSION_PROFIT_TARGET):
+                    self.is_scanning = False
+                    await self.safe_send_tg(
+                        f"✅ SESSION TARGET HIT (NET): {self.session_profit:+.2f}\n"
+                        f"🛑 Scanner stopped (session)."
+                    )
+
                 if profit <= 0:
                     self.consecutive_losses += 1
                     self.total_losses_today += 1
@@ -757,6 +789,7 @@ class DerivSniperBot:
             await self.safe_send_tg(
                 (
                     f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n"
+                    f"🧾 Session PnL: {self.session_profit:+.2f} / +{SESSION_PROFIT_TARGET:.2f}\n"
                     f"🧩 Section: {self.section_index}/{SECTIONS_PER_DAY} | Section PnL: {self.section_profit:+.2f} / +{SECTION_PROFIT_TARGET:.2f} | Sections won: {self.sections_won_today}\n"
                     f"📊 Today: {self.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {self.total_losses_today} | Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
                     f"💵 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
@@ -838,6 +871,10 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if not bot_logic.api:
             await _safe_edit(q, "❌ Connect first.", reply_markup=main_keyboard())
             return
+
+        # ✅ reset session profit on every START
+        bot_logic.session_profit = 0.0
+
         bot_logic.is_scanning = True
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
         await _safe_edit(
@@ -845,9 +882,11 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             (
                 "🔍 SCANNER ACTIVE\n"
                 "📌 Strategy: EMA20/EMA50 + EMA50 slope + pullback touch + confirm candle + RSI\n"
+                f"🧾 Session Target (NET): +${SESSION_PROFIT_TARGET:.2f}\n"
                 f"🧩 Sections: {SECTIONS_PER_DAY}/day | Target: +${SECTION_PROFIT_TARGET:.2f} per section\n"
                 f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
                 "✅ FIX: buy cap is MAX_STAKE_ALLOWED (prevents price-change refusals)\n"
+                f"🛡 Loss-streak guard: activates after {DANGER_MODE_AFTER_LOSSES} losses (no late entry)\n"
             ),
             reply_markup=main_keyboard()
         )
@@ -879,6 +918,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
             f"{pause_line}"
+            f"🧾 Session PnL: {bot_logic.session_profit:+.2f} / +{SESSION_PROFIT_TARGET:.2f}\n"
             f"🧩 Section: {bot_logic.section_index}/{SECTIONS_PER_DAY} | Section PnL: {bot_logic.section_profit:+.2f} / +{SECTION_PROFIT_TARGET:.2f}\n"
             f"🎁 Base payout: ${PAYOUT_TARGET:.2f} | Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
             f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
@@ -904,6 +944,7 @@ async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         "💎 Deriv Bot\n"
         "📌 Strategy: EMA20/EMA50 + EMA50 slope + pullback + confirm candle + RSI\n"
+        f"🧾 Session Target (NET): +${SESSION_PROFIT_TARGET:.2f}\n"
         f"🧩 Sections: {SECTIONS_PER_DAY}/day | Target: +${SECTION_PROFIT_TARGET:.2f} per section\n"
         f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n",
         reply_markup=main_keyboard()
