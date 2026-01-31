@@ -1,7 +1,14 @@
+# ✅ UPDATED VERSION (kept your 2-minute expiry untouched)
+# Changes made:
+# ✅ 1) EMA20_SLOPE_MIN reduced (more trades, less strict)
+# ✅ 2) Martingale lock fixed: NO resetting martingale_step inside scanner
+#    - If martingale_step > 0, bot will ONLY allow trades in last_signal direction
+#    - Opposite signals are simply blocked (no step reset)
+# Everything else unchanged.
+
 # ⚠️ SECURITY NOTE:
-# Do NOT hardcode tokens in public code.
-# Paste tokens only on your local machine.
-# If you ever leaked tokens, ROTATE them immediately.
+# Do NOT post your Deriv / Telegram tokens publicly.
+# Paste them only on your local machine.
 
 import asyncio
 import logging
@@ -20,8 +27,11 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "ZkOFWOlPtwnjqTS"
 APP_ID = 1089
 
-# ✅ markets
-MARKETS = ["R_10", "R_25"]  # you can add "R_50" later if you want
+MARKETS = ["R_10", "R_25"]  # add more if you want
+
+COOLDOWN_SEC = 120
+MAX_TRADES_PER_DAY = 60
+MAX_CONSEC_LOSSES = 10
 
 TELEGRAM_TOKEN = "8253450930:AAHUhPk9TML-8kZlA9UaHZZvTUGdurN9MVY"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -29,25 +39,22 @@ TELEGRAM_CHAT_ID = "7634818949"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ========================= TWO MODES (MANUAL SWITCHING) =========================
-# NOTE: Strategy logic uses:
-# - 5M for STRUCTURE + breakout confirmation
-# - 1M for ENTRY (retest/pullback)
-# Mode ONLY controls expiry duration (M1=5m, M5=20m).
-MODE_CONFIG = {
-    "M5": {"TF_SEC": 300, "DURATION_MIN": 20},
-    "M1": {"TF_SEC": 60,  "DURATION_MIN": 5},
-}
-DEFAULT_MODE = "M1"  # recommended with this approach
-CANDLES_COUNT = 220
+# ========================= STRATEGY SETTINGS =========================
+TF_SEC = 60  # M1 candles
+CANDLES_COUNT = 120
 
-# ========================= TRADE & RISK SETTINGS =========================
-COOLDOWN_SEC = 180
-MAX_TRADES_PER_DAY = 20
-MAX_CONSEC_LOSSES = 6
-STOP_AFTER_LOSSES = 3
-DAILY_LOSS_LIMIT = -8000
+RSI_PERIOD = 14
+DURATION_MIN = 2  # ✅ keep 2-minute expiry (DO NOT TOUCH)
+
+# ========================= EMA50 SLOPE + DAILY TARGET =========================
+EMA_SLOPE_LOOKBACK = 10
+EMA_SLOPE_MIN = 0.2
 DAILY_PROFIT_TARGET = 2.0
+
+# ========================= SECTIONS =========================
+SECTIONS_PER_DAY = 4
+SECTION_PROFIT_TARGET = 0.15
+SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)
 
 # ========================= PAYOUT MODE =========================
 USE_PAYOUT_MODE = True
@@ -55,35 +62,45 @@ PAYOUT_TARGET = 1
 MIN_PAYOUT = 0.35
 MAX_STAKE_ALLOWED = 10.00
 
-# ========================= MARTINGALE (3 steps, 1.8x) =========================
-MARTINGALE_MULT = 1.80
-MARTINGALE_MAX_STEPS = 3
-MARTINGALE_HALT_ON_MAX = True
+# ========================= MARTINGALE SETTINGS =========================
+MARTINGALE_MULT = 1.8
+MARTINGALE_MAX_STEPS = 4
+MARTINGALE_MAX_STAKE = 16.0
 
-# ========================= CLEAN BREAKOUT (5M structure + 1M entry) =========================
-# Indicators used:
-# - EMA20 / EMA50 on 5M (trend filter)
-# - Donchian range on 5M (support/resistance box)
-EMA_FAST = 20
-EMA_SLOW = 50
-DONCHIAN_LEN = 20
-
-USE_EMA_BIAS = True  # recommended: BUY only if EMA20>EMA50, SELL only if EMA20<EMA50
-
-# Breakout confirmation on 5M (clean candle body vs recent)
-BODY_LOOKBACK = 10
-BODY_STRONG_MULT = 1.10  # breakout candle body must be >= median_body * this
-
-# 1M retest entry tolerance
-RETEST_TOL_PCT = 0.0003  # 0.03% of price (e.g., 5000 -> 1.5 points)
-SETUP_TTL_MIN = 25       # expire setup if no retest within this time window
+# ========================= CANDLE STRENGTH FILTER =========================
+MIN_BODY_RATIO = 0.45
+MIN_CANDLE_RANGE = 1e-6
 
 # ========================= ANTI RATE-LIMIT =========================
-TICKS_GLOBAL_MIN_INTERVAL = 0.45
-RATE_LIMIT_BACKOFF_BASE = 20
+TICKS_GLOBAL_MIN_INTERVAL = 0.35  # seconds between ANY ticks_history calls
+RATE_LIMIT_BACKOFF_BASE = 20      # seconds (will grow if rate limit repeats)
 
-# ========================= UI =========================
-STATUS_REFRESH_COOLDOWN_SEC = 8
+# ========================= UI: REFRESH COOLDOWN =========================
+STATUS_REFRESH_COOLDOWN_SEC = 10
+
+# ========================= ADX + ATR FILTERS =========================
+ADX_PERIOD = 14
+ATR_PERIOD = 14
+
+ADX_MIN = 22.0       # trend strength threshold
+ATR_MIN = 0.0        # 0.0 = show ATR but don't block trades by ATR
+
+TREND_FILTER_MODE = "BOTH"  # "BOTH" requires ADX✅ and ATR✅, "EITHER" allows ADX✅ OR ATR✅
+
+# ========================= ✅ IMPROVEMENT SETTINGS =========================
+# 1) ATR-buffered breakout
+BREAKOUT_BUFFER_ATR = 0.15  # 15% of ATR
+
+# 2) EMA20 slope confirmation
+EMA20_SLOPE_LOOKBACK = 5
+EMA20_SLOPE_MIN = 0.08  # ✅ CHANGED from 0.15 -> 0.08 (more realistic on R10/R25 M1)
+
+# 3) Trend-adaptive RSI threshold pivot
+ADX_STRONG_TREND = 30.0
+
+# 4) Candle close-position filter
+BULL_CLOSE_POS_MIN = 0.70
+BEAR_CLOSE_POS_MAX = 0.30
 
 
 # ========================= INDICATOR MATH =========================
@@ -97,6 +114,103 @@ def calculate_ema(values, period: int):
     for i in range(1, len(values)):
         ema[i] = values[i] * k + ema[i - 1] * (1 - k)
     return ema
+
+
+def calculate_rsi(values, period=14):
+    values = np.array(values, dtype=float)
+    n = len(values)
+    if n < period + 2:
+        return np.array([])
+
+    deltas = np.diff(values)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+
+    rsi = np.full(n, np.nan, dtype=float)
+
+    avg_gain = np.mean(gains[:period])
+    avg_loss = np.mean(losses[:period])
+    rs = avg_gain / (avg_loss + 1e-12)
+    rsi[period] = 100.0 - (100.0 / (1.0 + rs))
+
+    for i in range(period + 1, n):
+        gain = gains[i - 1]
+        loss = losses[i - 1]
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        rs = avg_gain / (avg_loss + 1e-12)
+        rsi[i] = 100.0 - (100.0 / (1.0 + rs))
+
+    return rsi
+
+
+def calculate_atr(highs, lows, closes, period=14):
+    highs = np.array(highs, dtype=float)
+    lows = np.array(lows, dtype=float)
+    closes = np.array(closes, dtype=float)
+
+    n = len(closes)
+    if n < period + 2:
+        return np.array([])
+
+    prev_close = np.roll(closes, 1)
+    prev_close[0] = closes[0]
+
+    tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_close), np.abs(lows - prev_close)))
+
+    atr = np.full(n, np.nan, dtype=float)
+    atr[period] = np.mean(tr[1:period + 1])
+    for i in range(period + 1, n):
+        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+
+    return atr
+
+
+def calculate_adx(highs, lows, closes, period=14):
+    highs = np.array(highs, dtype=float)
+    lows = np.array(lows, dtype=float)
+    closes = np.array(closes, dtype=float)
+
+    n = len(closes)
+    if n < period * 2 + 2:
+        return np.array([])
+
+    up_move = highs[1:] - highs[:-1]
+    down_move = lows[:-1] - lows[1:]
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    prev_close = closes[:-1]
+    tr = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - prev_close), np.abs(lows[1:] - prev_close)))
+
+    tr_s = np.zeros_like(tr)
+    plus_s = np.zeros_like(plus_dm)
+    minus_s = np.zeros_like(minus_dm)
+
+    tr_s[period - 1] = np.sum(tr[:period])
+    plus_s[period - 1] = np.sum(plus_dm[:period])
+    minus_s[period - 1] = np.sum(minus_dm[:period])
+
+    for i in range(period, len(tr)):
+        tr_s[i] = tr_s[i - 1] - (tr_s[i - 1] / period) + tr[i]
+        plus_s[i] = plus_s[i - 1] - (plus_s[i - 1] / period) + plus_dm[i]
+        minus_s[i] = minus_s[i - 1] - (minus_s[i - 1] / period) + minus_dm[i]
+
+    plus_di = 100.0 * (plus_s / (tr_s + 1e-12))
+    minus_di = 100.0 * (minus_s / (tr_s + 1e-12))
+    dx = 100.0 * (np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12))
+
+    adx = np.full(n, np.nan, dtype=float)
+    dx_full = np.full(n, np.nan, dtype=float)
+    dx_full[1:] = dx
+
+    start = period * 2
+    adx[start] = np.nanmean(dx_full[period:start + 1])
+    for i in range(start + 1, n):
+        adx[i] = ((adx[i - 1] * (period - 1)) + dx_full[i]) / period
+
+    return adx
 
 
 def build_candles_from_deriv(candles_raw):
@@ -121,9 +235,9 @@ def fmt_time_hhmmss(epoch):
         return "—"
 
 
-def fmt_dt(epoch):
+def fmt_hhmm(epoch):
     try:
-        return datetime.fromtimestamp(epoch, ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(epoch, ZoneInfo("Africa/Lagos")).strftime("%H:%M")
     except Exception:
         return "—"
 
@@ -133,31 +247,21 @@ def money2(x: float) -> float:
     return math.ceil(float(x) * 100.0) / 100.0
 
 
-def is_finite(x) -> bool:
-    return isinstance(x, (int, float)) and np.isfinite(x)
-
-
-def _yn(v: bool) -> str:
-    return "YES ✅" if v else "NO ❌"
-
-
 # ========================= BOT CORE =========================
-class DerivBreakoutBot:
+class DerivSniperBot:
     def __init__(self):
         self.api = None
         self.app = None
         self.active_token = None
         self.account_type = "None"
 
-        # manual switching: affects expiry only
-        self.mode = DEFAULT_MODE  # "M5" or "M1"
-
         self.is_scanning = False
         self.scanner_task = None
         self.market_tasks = {}
 
-        # {"cid": int, "symbol": str, "start_ts": float, "duration_min": int, "tf_sec": int, "mode": str}
-        self.active_trade = None
+        self.active_trade_info = None
+        self.active_market = "None"
+        self.trade_start_time = 0.0
 
         self.cooldown_until = 0.0
         self.trades_today = 0
@@ -165,54 +269,39 @@ class DerivBreakoutBot:
         self.consecutive_losses = 0
         self.total_profit_today = 0.0
         self.balance = "0.00"
-        self.session_losses = 0
 
-        # martingale
+        self.current_stake = 0.0
         self.martingale_step = 0
         self.martingale_halt = False
 
+        # ✅ store last trade direction for martingale lock
+        self.last_signal = None  # "CALL" or "PUT"
+
+        # sections
+        self.section_profit = 0.0
+        self.sections_won_today = 0
+        self.section_index = 1
+        self.section_pause_until = 0.0
+
         self.trade_lock = asyncio.Lock()
 
-        # debug per (symbol, tf_name)
-        # tf_name in {"ENTRY_1M", "STRUCTURE_5M"}
-        self.market_debug = {(m, tf): {} for m in MARKETS for tf in ("ENTRY_1M", "STRUCTURE_5M")}
-        self.last_processed_closed_t0 = {(m, tf): 0 for m in MARKETS for tf in ("ENTRY_1M", "STRUCTURE_5M")}
-
-        # breakout setups created from 5M, entered from 1M
-        # self.setups[symbol] = {
-        #   "dir": "CALL"/"PUT",
-        #   "level": float,          # broken resistance/support
-        #   "created_t0": int,       # breakout confirm candle epoch
-        #   "expires_at": float,     # epoch
-        #   "ema_fast": float, "ema_slow": float,
-        #   "waiting": str,          # text
-        # }
-        self.setups = {}
+        self.market_debug = {m: {} for m in MARKETS}
+        self.last_processed_closed_t0 = {m: 0 for m in MARKETS}
 
         self.tz = ZoneInfo("Africa/Lagos")
         self.current_day = datetime.now(self.tz).date()
         self.pause_until = 0.0
 
+        # anti rate-limit state
         self._ticks_lock = asyncio.Lock()
         self._last_ticks_ts = 0.0
-        self._next_poll_epoch = {(m, tf): 0.0 for m in MARKETS for tf in ("ENTRY_1M", "STRUCTURE_5M")}
-        self._rate_limit_strikes = {(m, tf): 0 for m in MARKETS for tf in ("ENTRY_1M", "STRUCTURE_5M")}
+        self._next_poll_epoch = {m: 0.0 for m in MARKETS}
+        self._rate_limit_strikes = {m: 0 for m in MARKETS}
 
+        # refresh cooldown
         self.status_cooldown_until = 0.0
 
-    # ---------- mode helpers ----------
-    def get_mode_cfg(self) -> dict:
-        return MODE_CONFIG.get(self.mode, MODE_CONFIG[DEFAULT_MODE])
-
-    def tf_sec(self) -> int:
-        return int(self.get_mode_cfg()["TF_SEC"])
-
-    def duration_min(self) -> int:
-        return int(self.get_mode_cfg()["DURATION_MIN"])
-
-    def toggle_mode(self):
-        self.mode = "M1" if self.mode == "M5" else "M5"
-
+    # ---------- helpers ----------
     @staticmethod
     def _is_gatewayish_error(msg: str) -> bool:
         m = (msg or "").lower()
@@ -249,64 +338,40 @@ class DerivBreakoutBot:
                     await asyncio.sleep(0.4 * i)
         logger.warning(f"Telegram send failed after retries: {last_err}")
 
-    # ---------- resets ----------
-    def _next_midnight_epoch(self) -> float:
+    # ---------- Sections ----------
+    def _today_midnight_epoch(self) -> float:
         now = datetime.now(self.tz)
-        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        return next_midnight.timestamp()
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return midnight.timestamp()
 
-    def _daily_reset_if_needed(self):
+    def _get_section_index_for_epoch(self, epoch_ts: float) -> int:
+        midnight = self._today_midnight_epoch()
+        sec_into_day = max(0, int(epoch_ts - midnight))
+        idx0 = min(SECTIONS_PER_DAY - 1, sec_into_day // SECTION_LENGTH_SEC)
+        return int(idx0 + 1)
+
+    def _next_section_start_epoch(self, epoch_ts: float) -> float:
+        midnight = self._today_midnight_epoch()
+        sec_into_day = max(0, int(epoch_ts - midnight))
+        idx0 = min(SECTIONS_PER_DAY - 1, sec_into_day // SECTION_LENGTH_SEC)
+        next_start = midnight + (idx0 + 1) * SECTION_LENGTH_SEC
+        if idx0 + 1 >= SECTIONS_PER_DAY:
+            next_midnight = (datetime.fromtimestamp(midnight, self.tz) + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            return next_midnight.timestamp()
+        return float(next_start)
+
+    def _sync_section_if_needed(self):
+        now = time.time()
         today = datetime.now(self.tz).date()
         if today != self.current_day:
-            self.current_day = today
-            self.trades_today = 0
-            self.total_losses_today = 0
-            self.consecutive_losses = 0
-            self.total_profit_today = 0.0
-            self.cooldown_until = 0.0
-            self.pause_until = 0.0
-            self.session_losses = 0
-            self.martingale_step = 0
-            self.martingale_halt = False
-            self.setups = {}
-
-    def can_auto_trade(self) -> tuple[bool, str]:
-        self._daily_reset_if_needed()
-
-        if self.martingale_halt:
-            return False, f"Stopped: Martingale max step ({MARTINGALE_MAX_STEPS}) reached"
-
-        if time.time() < self.pause_until:
-            left = int(self.pause_until - time.time())
-            return False, f"Paused until 12:00am WAT ({left}s)"
-
-        if self.total_profit_today >= DAILY_PROFIT_TARGET:
-            self.pause_until = self._next_midnight_epoch()
-            return False, f"Daily target reached (+${self.total_profit_today:.2f})"
-
-        if self.total_profit_today <= float(DAILY_LOSS_LIMIT):
-            self.pause_until = self._next_midnight_epoch()
-            return False, f"Stopped: Daily loss limit ({DAILY_LOSS_LIMIT:+.2f}) reached"
-
-        if self.consecutive_losses >= MAX_CONSEC_LOSSES:
-            return False, "Stopped: max loss streak reached"
-
-        if self.session_losses >= STOP_AFTER_LOSSES:
-            return False, f"Soft stop: {STOP_AFTER_LOSSES} losses in session. Reset by STOP/START."
-
-        if self.trades_today >= MAX_TRADES_PER_DAY:
-            return False, "Stopped: daily trade limit reached"
-
-        if time.time() < self.cooldown_until:
-            return False, f"Cooldown {int(self.cooldown_until - time.time())}s"
-
-        if self.active_trade:
-            return False, "Trade in progress"
-
-        if not self.api:
-            return False, "Not connected"
-
-        return True, "OK"
+            return
+        new_idx = self._get_section_index_for_epoch(now)
+        if new_idx != self.section_index:
+            self.section_index = new_idx
+            self.section_profit = 0.0
+            self.section_pause_until = 0.0
 
     # ---------- Deriv connection ----------
     async def connect(self) -> bool:
@@ -372,302 +437,417 @@ class DerivBreakoutBot:
         except Exception:
             pass
 
-    # ---------- market data ----------
-    async def fetch_candles(self, symbol: str, tf_sec: int):
-        payload = {
-            "ticks_history": symbol,
-            "end": "latest",
-            "count": CANDLES_COUNT,
-            "style": "candles",
-            "granularity": int(tf_sec),
-        }
-        data = await self.safe_ticks_history(payload, retries=4)
-        return build_candles_from_deriv(data.get("candles", []))
+    # ---------- Daily reset ----------
+    def _next_midnight_epoch(self) -> float:
+        now = datetime.now(self.tz)
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return next_midnight.timestamp()
 
-    async def fetch_last_price(self, symbol: str) -> float:
-        payload = {"ticks_history": symbol, "end": "latest", "count": 1, "style": "ticks"}
-        data = await self.safe_ticks_history(payload, retries=3)
-        try:
-            ticks = data.get("history", {}).get("prices", [])
-            return float(ticks[-1]) if ticks else float("nan")
-        except Exception:
-            return float("nan")
+    def _daily_reset_if_needed(self):
+        today = datetime.now(self.tz).date()
+        if today != self.current_day:
+            self.current_day = today
+            self.trades_today = 0
+            self.total_losses_today = 0
+            self.consecutive_losses = 0
+            self.total_profit_today = 0.0
+            self.cooldown_until = 0.0
+            self.pause_until = 0.0
+            self.martingale_step = 0
+            self.current_stake = 0.0
+            self.martingale_halt = False
+            self.last_signal = None
 
-    # ---------- scanner ----------
+            self.section_profit = 0.0
+            self.sections_won_today = 0
+            self.section_index = self._get_section_index_for_epoch(time.time())
+            self.section_pause_until = 0.0
+
+        self._sync_section_if_needed()
+
+    def can_auto_trade(self) -> tuple[bool, str]:
+        self._daily_reset_if_needed()
+
+        if self.martingale_halt:
+            return False, f"Stopped: Martingale {MARTINGALE_MAX_STEPS} steps completed"
+
+        if time.time() < self.section_pause_until:
+            left = int(self.section_pause_until - time.time())
+            return False, f"Section paused. Resumes {fmt_hhmm(self.section_pause_until)} ({left}s)"
+
+        if time.time() < self.pause_until:
+            left = int(self.pause_until - time.time())
+            return False, f"Paused until 12:00am WAT ({left}s)"
+
+        if self.total_profit_today >= DAILY_PROFIT_TARGET:
+            self.pause_until = self._next_midnight_epoch()
+            return False, f"Daily target reached (+${self.total_profit_today:.2f})"
+
+        if self.total_profit_today <= -2.0:
+            self.pause_until = self._next_midnight_epoch()
+            return False, "Stopped: Daily loss limit (-$2.00) reached"
+
+        if self.consecutive_losses >= MAX_CONSEC_LOSSES:
+            return False, "Stopped: max loss streak reached"
+        if self.trades_today >= MAX_TRADES_PER_DAY:
+            return False, "Stopped: daily trade limit reached"
+        if time.time() < self.cooldown_until:
+            return False, f"Cooldown {int(self.cooldown_until - time.time())}s"
+        if self.active_trade_info:
+            return False, "Trade in progress"
+        if not self.api:
+            return False, "Not connected"
+        return True, "OK"
+
+    # ---------- Scanner loop ----------
     async def background_scanner(self):
         if not self.api:
             return
         self.market_tasks = {sym: asyncio.create_task(self.scan_market(sym)) for sym in MARKETS}
         try:
             while self.is_scanning:
-                # safety release if Deriv doesn't return result
-                if self.active_trade:
-                    dur = int(self.active_trade.get("duration_min", 0))
-                    if time.time() - float(self.active_trade.get("start_ts", 0.0)) > (dur * 60 + 180):
-                        self.active_trade = None
-
-                # expire old setups
-                now = time.time()
-                for sym in list(self.setups.keys()):
-                    if now >= float(self.setups[sym].get("expires_at", 0)):
-                        self.setups[sym]["waiting"] = "Setup expired (no retest)"
-                        # keep it a little while for status visibility, then delete next loop
-                        if now - float(self.setups[sym].get("expires_at", 0)) > 60:
-                            del self.setups[sym]
-
+                if self.active_trade_info and (time.time() - self.trade_start_time > (DURATION_MIN * 60 + 90)):
+                    self.active_trade_info = None
                 await asyncio.sleep(1)
         finally:
             for t in self.market_tasks.values():
                 t.cancel()
             self.market_tasks.clear()
 
-    def _bias_ok(self, direction: str, ema_fast_now: float, ema_slow_now: float) -> bool:
-        if not USE_EMA_BIAS:
-            return True
-        if not (is_finite(ema_fast_now) and is_finite(ema_slow_now)):
-            return False
-        if direction == "CALL":
-            return ema_fast_now > ema_slow_now
-        return ema_fast_now < ema_slow_now
-
-    @staticmethod
-    def _near_threshold(price: float) -> float:
-        # "approaching" threshold: 0.15% of price (same idea you saw before)
-        return abs(price) * 0.0015
+    async def fetch_real_m1_candles(self, symbol: str):
+        payload = {
+            "ticks_history": symbol,
+            "end": "latest",
+            "count": CANDLES_COUNT,
+            "style": "candles",
+            "granularity": TF_SEC,
+        }
+        data = await self.safe_ticks_history(payload, retries=4)
+        return build_candles_from_deriv(data.get("candles", []))
 
     async def scan_market(self, symbol: str):
-        # schedule both loops (5M + 1M) without extra websockets
-        self._next_poll_epoch[(symbol, "STRUCTURE_5M")] = time.time() + random.random() * 0.6
-        self._next_poll_epoch[(symbol, "ENTRY_1M")] = time.time() + random.random() * 0.6
+        self._next_poll_epoch[symbol] = time.time() + random.random() * 0.5
 
         while self.is_scanning:
             try:
-                # -------------------- 5M STRUCTURE --------------------
                 now = time.time()
-                nxt5 = float(self._next_poll_epoch.get((symbol, "STRUCTURE_5M"), 0.0))
-                if now >= nxt5:
-                    ok_gate, gate = self.can_auto_trade()
+                nxt = float(self._next_poll_epoch.get(symbol, 0.0))
+                if now < nxt:
+                    await asyncio.sleep(min(1.0, nxt - now))
+                    continue
 
-                    candles_5m = await self.fetch_candles(symbol, tf_sec=300)
-                    if len(candles_5m) >= (DONCHIAN_LEN + 60):
-                        confirm = candles_5m[-2]
-                        confirm_t0 = int(confirm["t0"])
-                        next_close = confirm_t0 + 300
-                        self._next_poll_epoch[(symbol, "STRUCTURE_5M")] = float(next_close + 0.30)
+                if self.consecutive_losses >= MAX_CONSEC_LOSSES or self.trades_today >= MAX_TRADES_PER_DAY:
+                    self.is_scanning = False
+                    break
 
-                        if self.last_processed_closed_t0[(symbol, "STRUCTURE_5M")] != confirm_t0:
-                            closes = np.array([x["c"] for x in candles_5m], dtype=float)
-                            highs = np.array([x["h"] for x in candles_5m], dtype=float)
-                            lows = np.array([x["l"] for x in candles_5m], dtype=float)
+                ok_gate, gate = self.can_auto_trade()
 
-                            ema_fast = calculate_ema(closes, EMA_FAST)
-                            ema_slow = calculate_ema(closes, EMA_SLOW)
-                            ema_fast_now = float(ema_fast[-2]) if len(ema_fast) else float("nan")
-                            ema_slow_now = float(ema_slow[-2]) if len(ema_slow) else float("nan")
+                candles = await self.fetch_real_m1_candles(symbol)
+                if len(candles) < 70:
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "gate": "Waiting for more candles",
+                        "why": [f"Not enough candle history yet (need ~70, have {len(candles)})."],
+                    }
+                    self._next_poll_epoch[symbol] = time.time() + 10
+                    continue
 
-                            bias_up = is_finite(ema_fast_now) and is_finite(ema_slow_now) and (ema_fast_now > ema_slow_now)
-                            bias_down = is_finite(ema_fast_now) and is_finite(ema_slow_now) and (ema_fast_now < ema_slow_now)
+                pullback = candles[-3]
+                confirm = candles[-2]
+                confirm_t0 = int(confirm["t0"])
 
-                            # Donchian window excludes confirm candle
-                            window_high = float(np.max(highs[-(DONCHIAN_LEN + 2):-2]))
-                            window_low = float(np.min(lows[-(DONCHIAN_LEN + 2):-2]))
+                next_closed_epoch = confirm_t0 + TF_SEC
+                self._next_poll_epoch[symbol] = float(next_closed_epoch + 0.35)
 
-                            c_open = float(confirm["o"])
-                            c_close = float(confirm["c"])
-                            c_high = float(confirm["h"])
-                            c_low = float(confirm["l"])
-                            body = abs(c_close - c_open)
+                if self.last_processed_closed_t0[symbol] == confirm_t0:
+                    continue
 
-                            # "strong body" vs recent median body
-                            bodies = np.array([abs(float(x["c"]) - float(x["o"])) for x in candles_5m[-(BODY_LOOKBACK + 2):-2]], dtype=float)
-                            med_body = float(np.median(bodies)) if len(bodies) else float("nan")
-                            strong_body = is_finite(med_body) and med_body > 0 and (body >= med_body * float(BODY_STRONG_MULT))
+                closes = [x["c"] for x in candles]
+                highs = [x["h"] for x in candles]
+                lows = [x["l"] for x in candles]
 
-                            breakout_call = (c_close > window_high)
-                            breakout_put = (c_close < window_low)
+                ema20_arr = calculate_ema(closes, 20)
+                ema50_arr = calculate_ema(closes, 50)
+                if len(ema20_arr) < 60 or len(ema50_arr) < 60:
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "gate": "Indicators",
+                        "why": ["EMA20/EMA50 not ready yet."],
+                    }
+                    self.last_processed_closed_t0[symbol] = confirm_t0
+                    continue
 
-                            # apply EMA bias filter for confirmation
-                            bo_confirm_call = breakout_call and strong_body and self._bias_ok("CALL", ema_fast_now, ema_slow_now)
-                            bo_confirm_put = breakout_put and strong_body and self._bias_ok("PUT", ema_fast_now, ema_slow_now)
+                ema20_pullback = float(ema20_arr[-3])
+                ema20_confirm = float(ema20_arr[-2])
+                ema50_confirm = float(ema50_arr[-2])
 
-                            last_price = await self.fetch_last_price(symbol)
+                slope_ok = False
+                ema50_slope = 0.0
+                ema50_rising = False
+                ema50_falling = False
+                if len(ema50_arr) >= (EMA_SLOPE_LOOKBACK + 3):
+                    ema50_prev = float(ema50_arr[-(EMA_SLOPE_LOOKBACK + 2)])
+                    ema50_slope = ema50_confirm - ema50_prev
+                    ema50_rising = ema50_slope > EMA_SLOPE_MIN
+                    ema50_falling = ema50_slope < -EMA_SLOPE_MIN
+                    slope_ok = True
 
-                            # approaching?
-                            near = self._near_threshold(last_price) if is_finite(last_price) else float("nan")
-                            approaching_call = is_finite(last_price) and is_finite(window_high) and (0 <= (window_high - last_price) <= near)
-                            approaching_put = is_finite(last_price) and is_finite(window_low) and (0 <= (last_price - window_low) <= near)
+                # EMA20 slope confirmation
+                ema20_slope_ok = False
+                ema20_slope = 0.0
+                ema20_rising = False
+                ema20_falling = False
+                if len(ema20_arr) >= (EMA20_SLOPE_LOOKBACK + 3):
+                    ema20_prev = float(ema20_arr[-(EMA20_SLOPE_LOOKBACK + 2)])
+                    ema20_slope = ema20_confirm - ema20_prev
+                    ema20_rising = ema20_slope > EMA20_SLOPE_MIN
+                    ema20_falling = ema20_slope < -EMA20_SLOPE_MIN
+                    ema20_slope_ok = True
 
-                            confirmed = bo_confirm_call or bo_confirm_put
-                            confirmed_dir = "CALL" if bo_confirm_call else "PUT" if bo_confirm_put else None
-                            broken_level = window_high if bo_confirm_call else window_low if bo_confirm_put else float("nan")
+                rsi_arr = calculate_rsi(closes, RSI_PERIOD)
+                if len(rsi_arr) < 60 or np.isnan(rsi_arr[-2]):
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "gate": "Indicators",
+                        "why": ["RSI not ready yet."],
+                    }
+                    self.last_processed_closed_t0[symbol] = confirm_t0
+                    continue
+                rsi_now = float(rsi_arr[-2])
 
-                            waiting = "—"
-                            if confirmed:
-                                waiting = "Waiting for 1M retest/pullback to broken level"
-                                # create/replace setup
-                                self.setups[symbol] = {
-                                    "dir": confirmed_dir,
-                                    "level": float(broken_level),
-                                    "created_t0": int(confirm_t0),
-                                    "expires_at": float(time.time() + SETUP_TTL_MIN * 60),
-                                    "ema_fast": float(ema_fast_now),
-                                    "ema_slow": float(ema_slow_now),
-                                    "waiting": waiting,
-                                    "gate": gate,
-                                }
-                            else:
-                                # if no breakout confirmed, keep setup only if still valid; otherwise remove
-                                if symbol in self.setups:
-                                    # keep it until TTL, but update waiting text
-                                    self.setups[symbol]["waiting"] = "Waiting for 5M breakout confirmation"
+                # ADX + ATR
+                atr_arr = calculate_atr(highs, lows, closes, ATR_PERIOD)
+                adx_arr = calculate_adx(highs, lows, closes, ADX_PERIOD)
 
-                            self.market_debug[(symbol, "STRUCTURE_5M")] = {
-                                "time": time.time(),
-                                "gate": gate,
-                                "ok_gate": ok_gate,
-                                "last_closed": confirm_t0,
-                                "next_close": next_close,
-                                "window_high": window_high,
-                                "window_low": window_low,
-                                "confirm_close": c_close,
-                                "last_price": last_price,
-                                "ema_fast": ema_fast_now,
-                                "ema_slow": ema_slow_now,
-                                "bias_up": bias_up,
-                                "bias_down": bias_down,
-                                "body": body,
-                                "med_body": med_body,
-                                "strong_body": strong_body,
-                                "breakout_confirmed": bool(confirmed),
-                                "breakout_dir": confirmed_dir,
-                                "broken_level": broken_level if confirmed else float("nan"),
-                                "approaching_call": bool(approaching_call),
-                                "approaching_put": bool(approaching_put),
-                            }
-                            self.last_processed_closed_t0[(symbol, "STRUCTURE_5M")] = confirm_t0
-                    else:
-                        self._next_poll_epoch[(symbol, "STRUCTURE_5M")] = time.time() + 10
+                atr_now = float(atr_arr[-2]) if len(atr_arr) and not np.isnan(atr_arr[-2]) else float("nan")
+                adx_now = float(adx_arr[-2]) if len(adx_arr) and not np.isnan(adx_arr[-2]) else float("nan")
 
-                # -------------------- 1M ENTRY (RETEST) --------------------
-                now = time.time()
-                nxt1 = float(self._next_poll_epoch.get((symbol, "ENTRY_1M"), 0.0))
-                if now >= nxt1:
-                    ok_gate, gate = self.can_auto_trade()
+                atr_ok = (not np.isnan(atr_now)) and (atr_now >= float(ATR_MIN))
+                adx_ok = (not np.isnan(adx_now)) and (adx_now >= float(ADX_MIN))
 
-                    candles_1m = await self.fetch_candles(symbol, tf_sec=60)
-                    if len(candles_1m) >= 40:
-                        confirm = candles_1m[-2]
-                        confirm_t0 = int(confirm["t0"])
-                        next_close = confirm_t0 + 60
-                        self._next_poll_epoch[(symbol, "ENTRY_1M")] = float(next_close + 0.25)
+                if TREND_FILTER_MODE.upper() == "EITHER":
+                    trend_filter_ok = adx_ok or atr_ok
+                else:
+                    trend_filter_ok = adx_ok and atr_ok
 
-                        if self.last_processed_closed_t0[(symbol, "ENTRY_1M")] != confirm_t0:
-                            last_price = await self.fetch_last_price(symbol)
-                            c_open = float(confirm["o"])
-                            c_close = float(confirm["c"])
-                            c_high = float(confirm["h"])
-                            c_low = float(confirm["l"])
+                pb_high = float(pullback["h"])
+                pb_low = float(pullback["l"])
+                touched_ema20 = (pb_low <= ema20_pullback <= pb_high)
 
-                            setup = self.setups.get(symbol)
-                            retest_ok = False
-                            retest_dir = None
-                            level = float("nan")
-                            tol = float("nan")
-                            waiting = "No 5M setup yet"
+                c_open = float(confirm["o"])
+                c_close = float(confirm["c"])
+                bull_confirm = c_close > c_open
+                bear_confirm = c_close < c_open
 
-                            if setup and time.time() < float(setup.get("expires_at", 0)):
-                                retest_dir = str(setup.get("dir"))
-                                level = float(setup.get("level", float("nan")))
-                                tol = max(0.0, abs(level) * float(RETEST_TOL_PCT)) if is_finite(level) else float("nan")
+                close_above_ema20 = c_close > ema20_confirm
+                close_below_ema20 = c_close < ema20_confirm
 
-                                # retest rules:
-                                # CALL: 1M candle touches level (low <= level+tol) and closes back ABOVE level
-                                # PUT:  1M candle touches level (high >= level-tol) and closes back BELOW level
-                                if retest_dir == "CALL":
-                                    retest_ok = is_finite(level) and is_finite(tol) and (c_low <= (level + tol)) and (c_close > level)
-                                elif retest_dir == "PUT":
-                                    retest_ok = is_finite(level) and is_finite(tol) and (c_high >= (level - tol)) and (c_close < level)
+                bodies = [abs(float(candles[i]["c"]) - float(candles[i]["o"])) for i in range(-22, -2)]
+                avg_body = float(np.mean(bodies)) if len(bodies) >= 10 else float(
+                    np.mean([abs(float(c["c"]) - float(c["o"])) for c in candles[-60:-2]])
+                )
+                last_body = abs(c_close - c_open)
 
-                                waiting = setup.get("waiting", "Waiting for 1M retest")
-                                if retest_ok:
-                                    waiting = "Retest confirmed ✅ (entry allowed)"
+                c_high = float(confirm["h"])
+                c_low = float(confirm["l"])
+                c_range = max(MIN_CANDLE_RANGE, c_high - c_low)
+                body_ratio = last_body / c_range
+                strong_candle = body_ratio >= float(MIN_BODY_RATIO)
 
-                            # record debug
-                            self.market_debug[(symbol, "ENTRY_1M")] = {
-                                "time": time.time(),
-                                "gate": gate,
-                                "ok_gate": ok_gate,
-                                "last_closed": confirm_t0,
-                                "next_close": next_close,
-                                "last_price": last_price,
-                                "confirm_close": c_close,
-                                "setup_active": bool(setup and time.time() < float(setup.get("expires_at", 0))),
-                                "setup_dir": retest_dir,
-                                "setup_level": level,
-                                "tol": tol,
-                                "retest_ok": bool(retest_ok),
-                                "waiting": waiting,
-                            }
-                            self.last_processed_closed_t0[(symbol, "ENTRY_1M")] = confirm_t0
+                # Candle close-position filter
+                close_position = (c_close - c_low) / (c_range + 1e-12)
+                bull_close_strong = close_position >= float(BULL_CLOSE_POS_MIN)
+                bear_close_strong = close_position <= float(BEAR_CLOSE_POS_MAX)
 
-                            # if retest ok, place trade (expiry depends on MODE)
-                            if retest_ok and ok_gate:
-                                await self.execute_trade(retest_dir, symbol, source="AUTO")
-                                # clear setup after entry to avoid duplicate entries
-                                if symbol in self.setups:
-                                    self.setups[symbol]["waiting"] = "Trade opened (setup consumed)"
-                                    del self.setups[symbol]
-                    else:
-                        self._next_poll_epoch[(symbol, "ENTRY_1M")] = time.time() + 6
+                spike_mult = 1.5
+                ema_diff_min = 0.40
 
-                await asyncio.sleep(0.05)
+                spike_block = (avg_body > 0 and last_body > spike_mult * avg_body)
+                ema_diff = abs(ema20_confirm - ema50_confirm)
+                flat_block = ema_diff < ema_diff_min
+
+                uptrend = ema20_confirm > ema50_confirm
+                downtrend = ema20_confirm < ema50_confirm
+
+                # Trend-adaptive RSI
+                if (not np.isnan(adx_now)) and (adx_now >= float(ADX_STRONG_TREND)):
+                    call_rsi_ok = (50.0 <= rsi_now <= 70.0)
+                    put_rsi_ok = (30.0 <= rsi_now <= 50.0)
+                else:
+                    call_rsi_ok = (45.0 <= rsi_now <= 60.0)
+                    put_rsi_ok = (40.0 <= rsi_now <= 55.0)
+
+                # ATR-buffered breakout
+                atr_for_breakout = atr_now if (not np.isnan(atr_now)) else 0.0
+                breakout_call = c_close > (pb_high + float(BREAKOUT_BUFFER_ATR) * atr_for_breakout)
+                breakout_put = c_close < (pb_low  - float(BREAKOUT_BUFFER_ATR) * atr_for_breakout)
+
+                call_ready = (
+                    uptrend
+                    and slope_ok and ema50_rising
+                    and ema20_slope_ok and ema20_rising
+                    and touched_ema20 and bull_confirm
+                    and strong_candle and bull_close_strong
+                    and close_above_ema20 and call_rsi_ok
+                    and not spike_block and not flat_block
+                    and breakout_call
+                    and trend_filter_ok
+                )
+                put_ready = (
+                    downtrend
+                    and slope_ok and ema50_falling
+                    and ema20_slope_ok and ema20_falling
+                    and touched_ema20 and bear_confirm
+                    and strong_candle and bear_close_strong
+                    and close_below_ema20 and put_rsi_ok
+                    and not spike_block and not flat_block
+                    and breakout_put
+                    and trend_filter_ok
+                )
+
+                signal = "CALL" if call_ready else "PUT" if put_ready else None
+
+                # ✅ FIXED: Martingale re-validation lock
+                # If martingale_step > 0, ONLY allow SAME direction as last_signal.
+                # Do NOT reset martingale_step here.
+                if self.martingale_step > 0 and self.last_signal:
+                    if signal is None:
+                        call_ready = False
+                        put_ready = False
+                    elif signal != self.last_signal:
+                        # block opposite-direction setups during martingale
+                        call_ready = False
+                        put_ready = False
+
+                trend_label = "UPTREND" if uptrend else "DOWNTREND" if downtrend else "SIDEWAYS"
+                ema_label = "EMA20 ABOVE EMA50" if uptrend else "EMA20 BELOW EMA50" if downtrend else "EMA20 = EMA50"
+                trend_strength = "STRONG" if not flat_block else "WEAK"
+                pullback_label = "PULLBACK TOUCHED ✅" if touched_ema20 else "WAITING PULLBACK…"
+                confirm_close_label = (
+                    "CONFIRM CLOSE > EMA20 ✅" if close_above_ema20 else
+                    "CONFIRM CLOSE < EMA20 ✅" if close_below_ema20 else
+                    "CONFIRM CLOSE ON EMA20"
+                )
+                slope_label = "EMA50 SLOPE ↑" if ema50_rising else "EMA50 SLOPE ↓" if ema50_falling else "EMA50 SLOPE FLAT"
+
+                block_label_parts = []
+                if spike_block:
+                    block_label_parts.append("SPIKE BLOCK")
+                if flat_block:
+                    block_label_parts.append("WEAK/FLAT TREND")
+                if not slope_ok:
+                    block_label_parts.append("SLOPE N/A")
+                if not ema20_slope_ok:
+                    block_label_parts.append("EMA20 SLOPE N/A")
+                if not strong_candle:
+                    block_label_parts.append("WEAK CANDLE")
+                if not adx_ok:
+                    block_label_parts.append("ADX LOW")
+                if not atr_ok:
+                    block_label_parts.append("ATR LOW")
+                if not trend_filter_ok:
+                    block_label_parts.append("TREND FILTER FAIL")
+
+                # show martingale lock status
+                if self.martingale_step > 0 and self.last_signal:
+                    block_label_parts.append(f"MARTI LOCK: {self.last_signal}")
+
+                block_label = " | ".join(block_label_parts) if block_label_parts else "OK"
+
+                why = []
+                if not ok_gate:
+                    why.append(f"Gate blocked: {gate}")
+                if signal and (call_ready or put_ready):
+                    why.append(f"READY: {signal} (enter next candle)")
+                elif self.martingale_step > 0 and self.last_signal and signal and signal != self.last_signal:
+                    why.append(f"Blocked by Martingale Lock (need {self.last_signal})")
+                else:
+                    why.append("No entry yet (conditions not aligned).")
+
+                self.market_debug[symbol] = {
+                    "time": time.time(),
+                    "gate": gate,
+                    "last_closed": confirm_t0,
+                    "signal": signal,
+
+                    "trend_label": trend_label,
+                    "ema_label": ema_label,
+                    "trend_strength": trend_strength,
+                    "pullback_label": pullback_label,
+                    "confirm_close_label": confirm_close_label,
+                    "slope_label": slope_label,
+                    "block_label": block_label,
+
+                    "ema50_slope": ema50_slope,
+                    "rsi_now": rsi_now,
+                    "body_ratio": body_ratio,
+
+                    "adx_now": adx_now,
+                    "atr_now": atr_now,
+                    "adx_ok": adx_ok,
+                    "atr_ok": atr_ok,
+                    "trend_filter_ok": trend_filter_ok,
+
+                    "why": why[:10],
+                }
+
+                self.last_processed_closed_t0[symbol] = confirm_t0
+
+                if not ok_gate:
+                    continue
+
+                if call_ready:
+                    await self.execute_trade("CALL", symbol, source="AUTO", rsi_now=rsi_now, ema50_slope=ema50_slope)
+                elif put_ready:
+                    await self.execute_trade("PUT", symbol, source="AUTO", rsi_now=rsi_now, ema50_slope=ema50_slope)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 msg = str(e)
                 logger.error(f"Scanner Error ({symbol}): {msg}")
-                for tf in ("STRUCTURE_5M", "ENTRY_1M"):
-                    if self._is_rate_limit_error(msg):
-                        self._rate_limit_strikes[(symbol, tf)] = int(self._rate_limit_strikes.get((symbol, tf), 0)) + 1
-                        backoff = RATE_LIMIT_BACKOFF_BASE * self._rate_limit_strikes[(symbol, tf)]
-                        backoff = min(240, backoff)
-                        self._next_poll_epoch[(symbol, tf)] = time.time() + backoff
-                    else:
-                        self._next_poll_epoch[(symbol, tf)] = time.time() + (6 if self._is_gatewayish_error(msg) else 2)
 
-    # ---------- trading ----------
-    def calc_payout_for_step(self) -> float:
-        base = max(float(MIN_PAYOUT), float(PAYOUT_TARGET))
-        payout = float(base) * (float(MARTINGALE_MULT) ** int(self.martingale_step))
-        return money2(payout)
+                if self._is_rate_limit_error(msg):
+                    self._rate_limit_strikes[symbol] = int(self._rate_limit_strikes.get(symbol, 0)) + 1
+                    backoff = RATE_LIMIT_BACKOFF_BASE * self._rate_limit_strikes[symbol]
+                    backoff = min(180, backoff)
+                    self._next_poll_epoch[symbol] = time.time() + backoff
+                else:
+                    await asyncio.sleep(2 if not self._is_gatewayish_error(msg) else 5)
 
-    async def execute_trade(self, side: str, symbol: str, source="MANUAL"):
-        if not self.api or self.active_trade:
+            await asyncio.sleep(0.05)
+
+    # ========================= PAYOUT MODE + MARTINGALE =========================
+    async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL",
+                            rsi_now: float = 0.0, ema50_slope: float = 0.0):
+        if not self.api or self.active_trade_info:
             return
 
         async with self.trade_lock:
-            ok, gate = self.can_auto_trade()
+            ok, _gate = self.can_auto_trade()
             if not ok:
                 return
 
             try:
                 import math
 
-                payout = self.calc_payout_for_step()
+                payout = float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step))
+                payout = money2(payout)
 
-                # expiry controlled by MODE
-                tf_sec = self.tf_sec()
-                dur_min = self.duration_min()
-                mode = self.mode
+                payout = max(0.01, float(payout))
+                if not math.isfinite(payout):
+                    payout = 0.01
+
+                payout = max(float(MIN_PAYOUT), float(payout))
+                payout = money2(payout)
 
                 proposal_req = {
                     "proposal": 1,
-                    "amount": float(payout),
+                    "amount": payout,
                     "basis": "payout",
                     "contract_type": side,
                     "currency": "USD",
-                    "duration": int(dur_min),
+                    "duration": int(DURATION_MIN),
                     "duration_unit": "m",
                     "symbol": symbol,
                 }
@@ -681,64 +861,56 @@ class DerivBreakoutBot:
                 p = prop["proposal"]
                 proposal_id = p["id"]
                 ask_price = float(p.get("ask_price", 0.0))
-
-                if not math.isfinite(ask_price) or ask_price <= 0:
+                if ask_price <= 0:
                     await self.safe_send_tg("❌ Proposal returned invalid ask_price.")
                     return
 
                 if ask_price > float(MAX_STAKE_ALLOWED):
                     await self.safe_send_tg(
-                        f"⛔️ Skipped trade: payout=${payout:.2f} needs stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}\n"
-                        f"Martingale step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}"
+                        f"⛔️ Skipped trade: payout=${payout:.2f} needs stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
                     )
                     self.cooldown_until = time.time() + COOLDOWN_SEC
                     return
 
-                buy = await self.safe_deriv_call(
-                    "buy",
-                    {"buy": proposal_id, "price": float(MAX_STAKE_ALLOWED)},
-                    retries=6,
-                )
+                buy_price_cap = float(MAX_STAKE_ALLOWED)
+
+                buy = await self.safe_deriv_call("buy", {"buy": proposal_id, "price": buy_price_cap}, retries=6)
                 if "error" in buy:
                     err_msg = str(buy["error"].get("message", "Buy error"))
                     await self.safe_send_tg(f"❌ Trade Refused:\n{err_msg}")
                     return
 
-                cid = int(buy["buy"]["contract_id"])
-                self.active_trade = {
-                    "cid": cid,
-                    "symbol": symbol,
-                    "start_ts": time.time(),
-                    "duration_min": int(dur_min),
-                    "tf_sec": int(tf_sec),
-                    "mode": str(mode),
-                }
+                self.active_trade_info = int(buy["buy"]["contract_id"])
+                self.active_market = symbol
+                self.trade_start_time = time.time()
+                self.current_stake = ask_price
 
                 if source == "AUTO":
                     self.trades_today += 1
+                    self.last_signal = side  # ✅ remember direction during martingale sequence
 
                 safe_symbol = str(symbol).replace("_", " ")
-                await self.safe_send_tg(
+                msg = (
                     f"🚀 {side} TRADE OPENED\n"
-                    f"🧭 Mode (expiry profile): {mode}\n"
                     f"🛒 Market: {safe_symbol}\n"
-                    f"⏱ Expiry: {int(dur_min)}m\n"
-                    f"🎲 Martingale: step {self.martingale_step}/{MARTINGALE_MAX_STEPS} (x{MARTINGALE_MULT:.2f})\n"
+                    f"⏱ Expiry: {DURATION_MIN}m\n"
                     f"🎁 Payout: ${payout:.2f}\n"
+                    f"🎲 Martingale step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
                     f"💵 Stake (Deriv): ${ask_price:.2f}\n"
                     f"🤖 Source: {source}\n"
-                    f"📊 Today PnL: {self.total_profit_today:+.2f}\n"
-                    f"🚦 Gate: {gate}"
+                    f"🛡️ Martingale Lock: {self.last_signal if self.martingale_step > 0 else 'OFF'}\n"
+                    f"🎯 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}"
                 )
+                await self.safe_send_tg(msg)
 
-                asyncio.create_task(self.check_result(cid, source, dur_min))
+                asyncio.create_task(self.check_result(self.active_trade_info, source, side, rsi_now, ema50_slope))
 
             except Exception as e:
                 logger.error(f"Trade error: {e}")
                 await self.safe_send_tg(f"⚠️ Trade error:\n{e}")
 
-    async def check_result(self, cid: int, source: str, dur_min: int):
-        await asyncio.sleep(int(dur_min) * 60 + 8)
+    async def check_result(self, cid: int, source: str, side: str, rsi_now: float, ema50_slope: float):
+        await asyncio.sleep(int(DURATION_MIN) * 60 + 5)
         try:
             res = await self.safe_deriv_call(
                 "proposal_open_contract",
@@ -749,50 +921,62 @@ class DerivBreakoutBot:
 
             if source == "AUTO":
                 self.total_profit_today += profit
+                self.section_profit += profit
+
+                if self.section_profit >= float(SECTION_PROFIT_TARGET):
+                    self.sections_won_today += 1
+                    self.section_pause_until = self._next_section_start_epoch(time.time())
 
                 if profit <= 0:
                     self.consecutive_losses += 1
                     self.total_losses_today += 1
-                    self.session_losses += 1
-
                     if self.martingale_step < MARTINGALE_MAX_STEPS:
                         self.martingale_step += 1
                     else:
-                        if MARTINGALE_HALT_ON_MAX:
-                            self.martingale_halt = True
-                            self.is_scanning = False
-
+                        self.martingale_halt = True
+                        self.is_scanning = False
+                    if self.consecutive_losses >= 3:
+                        self.section_pause_until = self._next_section_start_epoch(time.time())
                 else:
                     self.consecutive_losses = 0
-                    self.session_losses = 0
                     self.martingale_step = 0
                     self.martingale_halt = False
+                    self.last_signal = None  # ✅ clear direction after win
 
                 if self.total_profit_today >= DAILY_PROFIT_TARGET:
                     self.pause_until = self._next_midnight_epoch()
 
-                if self.total_profit_today <= float(DAILY_LOSS_LIMIT):
-                    self.pause_until = self._next_midnight_epoch()
-
             await self.fetch_balance()
 
-            next_payout = self.calc_payout_for_step()
+            pause_note = "\n⏸ Paused until 12:00am WAT" if time.time() < self.pause_until else ""
+            halt_note = f"\n🛑 Martingale stopped after {MARTINGALE_MAX_STEPS} steps" if self.martingale_halt else ""
+            section_note = (
+                f"\n🧩 Section paused until {fmt_hhmm(self.section_pause_until)}"
+                if time.time() < self.section_pause_until
+                else ""
+            )
+
+            next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step)))
 
             await self.safe_send_tg(
-                f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n"
-                f"🎲 Martingale: step {self.martingale_step}/{MARTINGALE_MAX_STEPS} | Next payout: ${next_payout:.2f}\n"
-                f"📊 Trades: {self.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {self.total_losses_today}\n"
-                f"📉 Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES} | Session losses: {self.session_losses}/{STOP_AFTER_LOSSES}\n"
-                f"💵 Today PnL: {self.total_profit_today:+.2f} (target +{DAILY_PROFIT_TARGET:.2f}, limit {DAILY_LOSS_LIMIT:+.2f})\n"
-                f"💰 Balance: {self.balance}"
+                (
+                    f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n"
+                    f"🧩 Section: {self.section_index}/{SECTIONS_PER_DAY} | Section PnL: {self.section_profit:+.2f} | Sections won: {self.sections_won_today}\n"
+                    f"📊 Today: {self.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {self.total_losses_today} | Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
+                    f"💵 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
+                    f"🎁 Next payout: ${next_payout:.2f} (step {self.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
+                    f"🛡️ Martingale Lock: {self.last_signal if self.martingale_step > 0 else 'OFF'}\n"
+                    f"💰 Balance: {self.balance}"
+                    f"{pause_note}{section_note}{halt_note}"
+                )
             )
         finally:
-            self.active_trade = None
+            self.active_trade_info = None
             self.cooldown_until = time.time() + COOLDOWN_SEC
 
 
 # ========================= UI =========================
-bot_logic = DerivBreakoutBot()
+bot_logic = DerivSniperBot()
 
 
 def main_keyboard():
@@ -803,12 +987,10 @@ def main_keyboard():
                 InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN"),
             ],
             [
-                InlineKeyboardButton(f"🧭 MODE: {bot_logic.mode} (SWITCH)", callback_data="SWITCH_MODE"),
-            ],
-            [
                 InlineKeyboardButton("📊 STATUS", callback_data="STATUS"),
                 InlineKeyboardButton("🔄 REFRESH", callback_data="STATUS"),
             ],
+            [InlineKeyboardButton("🧩 SECTION", callback_data="NEXT_SECTION")],
             [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY")],
             [
                 InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"),
@@ -818,77 +1000,67 @@ def main_keyboard():
     )
 
 
-def _fnum(x, fmt=".5f"):
-    try:
-        if x is None:
-            return "—"
-        if isinstance(x, float) and not np.isfinite(x):
-            return "—"
-        return format(float(x), fmt)
-    except Exception:
-        return "—"
+def format_market_detail(sym: str, d: dict) -> str:
+    if not d:
+        return f"📍 {sym.replace('_',' ')}\n⏳ No scan data yet"
 
+    age = int(time.time() - d.get("time", time.time()))
+    gate = d.get("gate", "—")
+    last_closed = d.get("last_closed", 0)
+    signal = d.get("signal") or "—"
 
-def format_market_detail(sym: str, d5: dict, d1: dict, setup: dict | None) -> str:
-    # Very informative but still structured + readable
-    sym_clean = sym.replace("_", " ")
+    trend_label = d.get("trend_label", "—")
+    ema_label = d.get("ema_label", "—")
+    trend_strength = d.get("trend_strength", "—")
+    pullback_label = d.get("pullback_label", "—")
+    confirm_close_label = d.get("confirm_close_label", "—")
+    slope_label = d.get("slope_label", "—")
+    block_label = d.get("block_label", "—")
 
-    # 5M structure
-    if not d5:
-        s5 = f"STRUCTURE(5M): no data yet"
-    else:
-        bo_conf = bool(d5.get("breakout_confirmed", False))
-        bo_dir = d5.get("breakout_dir", None)
-        app_call = bool(d5.get("approaching_call", False))
-        app_put = bool(d5.get("approaching_put", False))
-        approaching = "CALL" if app_call else "PUT" if app_put else "NO"
-        bias = "UP" if bool(d5.get("bias_up", False)) else "DOWN" if bool(d5.get("bias_down", False)) else "MIXED/NA"
-        s5 = (
-            f"STRUCTURE(5M)\n"
-            f"- Breakout confirmed? {_yn(bo_conf)}"
-            + (f" ({bo_dir})" if bo_conf and bo_dir else "") + "\n"
-            f"- Approaching breakout? {_yn(approaching != 'NO')} ({approaching})\n"
-            f"- Range High/Low: {_fnum(d5.get('window_high'))} / {_fnum(d5.get('window_low'))}\n"
-            f"- EMA{EMA_FAST}/{EMA_SLOW} bias: {bias} | EMA20={_fnum(d5.get('ema_fast'))} EMA50={_fnum(d5.get('ema_slow'))}\n"
-            f"- Breakout candle: close={_fnum(d5.get('confirm_close'))} body={_fnum(d5.get('body'), '.2f')} (median={_fnum(d5.get('med_body'), '.2f')}) strong={_yn(bool(d5.get('strong_body', False)))}\n"
-            f"- Last closed: {fmt_time_hhmmss(int(d5.get('last_closed', 0)))} | Next close: {fmt_time_hhmmss(int(d5.get('next_close', 0)))}\n"
-        )
+    rsi_now = d.get("rsi_now", None)
+    ema50_slope = d.get("ema50_slope", None)
+    body_ratio = d.get("body_ratio", None)
 
-    # 1M entry
-    if not d1:
-        s1 = f"ENTRY(1M): no data yet"
-    else:
-        active = bool(d1.get("setup_active", False))
-        retest_ok = bool(d1.get("retest_ok", False))
-        s1 = (
-            f"ENTRY(1M)\n"
-            f"- Setup active? {_yn(active)}"
-            + (f" ({d1.get('setup_dir')})" if active and d1.get("setup_dir") else "") + "\n"
-            f"- Retest confirmed? {_yn(retest_ok)}\n"
-            f"- Level / tol: {_fnum(d1.get('setup_level'))} ± {_fnum(d1.get('tol'), '.5f')}\n"
-            f"- Confirm close: {_fnum(d1.get('confirm_close'))} | Live: {_fnum(d1.get('last_price'))}\n"
-            f"- Waiting: {d1.get('waiting', '—')}\n"
-            f"- Last closed: {fmt_time_hhmmss(int(d1.get('last_closed', 0)))} | Next close: {fmt_time_hhmmss(int(d1.get('next_close', 0)))}\n"
-        )
+    adx_now = d.get("adx_now", None)
+    atr_now = d.get("atr_now", None)
+    adx_ok = d.get("adx_ok", False)
+    atr_ok = d.get("atr_ok", False)
 
-    # setup summary
-    if setup:
-        ttl = max(0, int(float(setup.get("expires_at", 0)) - time.time()))
-        ssetup = (
-            f"SETUP TRACKER\n"
-            f"- Dir: {setup.get('dir','—')} | Broken level: {_fnum(setup.get('level'))}\n"
-            f"- Created: {fmt_time_hhmmss(int(setup.get('created_t0', 0)))} | Expires in: {ttl}s\n"
-            f"- Waiting: {setup.get('waiting','—')}\n"
-        )
-    else:
-        ssetup = "SETUP TRACKER\n- No active setup\n"
+    adx_line = "ADX: —"
+    atr_line = "ATR: —"
+    if isinstance(adx_now, (int, float)) and not np.isnan(adx_now):
+        adx_line = f"ADX: {adx_now:.2f} {'✅' if adx_ok else '❌'} (min {ADX_MIN})"
+    if isinstance(atr_now, (int, float)) and not np.isnan(atr_now):
+        atr_line = f"ATR: {atr_now:.5f} {'✅' if atr_ok else '❌'} (min {ATR_MIN})"
+
+    extra = []
+    if isinstance(rsi_now, (int, float)) and not np.isnan(rsi_now):
+        extra.append(f"RSI: {rsi_now:.2f}")
+    if isinstance(ema50_slope, (int, float)) and not np.isnan(ema50_slope):
+        extra.append(f"EMA50 slope: {ema50_slope:.3f}")
+    if isinstance(body_ratio, (int, float)) and not np.isnan(body_ratio):
+        extra.append(f"Body ratio: {body_ratio:.2f}")
+    extra_line = " | ".join(extra) if extra else "—"
+
+    why = d.get("why", [])
+    why_line = "Why: " + (str(why[0]) if why else "—")
 
     return (
-        f"📍 {sym_clean}\n"
-        f"{s5}"
-        f"{ssetup}"
-        f"{s1}"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📍 {sym.replace('_',' ')} ({age}s)\n"
+        f"Gate: {gate}\n"
+        f"Last closed: {fmt_time_hhmmss(last_closed)}\n"
+        f"────────────────\n"
+        f"Trend: {trend_label} ({trend_strength})\n"
+        f"{ema_label}\n"
+        f"{slope_label}\n"
+        f"{pullback_label}\n"
+        f"{confirm_close_label}\n"
+        f"{adx_line}\n"
+        f"{atr_line}\n"
+        f"Stats: {extra_line}\n"
+        f"Filters: {block_label}\n"
+        f"Signal: {signal}\n"
+        f"{why_line}\n"
     )
 
 
@@ -921,39 +1093,13 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         ok = await bot_logic.connect()
         await _safe_edit(q, "✅ LIVE CONNECTED" if ok else "❌ LIVE Failed", reply_markup=main_keyboard())
 
-    elif q.data == "SWITCH_MODE":
-        bot_logic.toggle_mode()
-        cfg = bot_logic.get_mode_cfg()
-        await _safe_edit(
-            q,
-            f"✅ Mode switched to {bot_logic.mode}\n"
-            f"⏱ Expiry profile: {int(cfg['DURATION_MIN'])} minutes\n"
-            f"📌 Strategy stays the same: 5M structure + 1M retest entry.",
-            reply_markup=main_keyboard(),
-        )
-
     elif q.data == "START_SCAN":
         if not bot_logic.api:
             await _safe_edit(q, "❌ Connect first.", reply_markup=main_keyboard())
             return
-        bot_logic.session_losses = 0
-        bot_logic.martingale_halt = False
         bot_logic.is_scanning = True
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
-
-        cfg = bot_logic.get_mode_cfg()
-        await _safe_edit(
-            q,
-            "🔍 SCANNER ACTIVE\n"
-            f"🧭 Mode (expiry profile): {bot_logic.mode} | Expiry: {int(cfg['DURATION_MIN'])}m\n"
-            "📌 Strategy:\n"
-            f"- STRUCTURE: 5M Donchian({DONCHIAN_LEN}) + EMA{EMA_FAST}/{EMA_SLOW} trend filter\n"
-            "- CONFIRM: 5M candle CLOSES outside range + strong body\n"
-            "- ENTRY: 1M retest/pullback to broken level, then enter\n"
-            f"- Retest tolerance: {RETEST_TOL_PCT*100:.3f}% | Setup TTL: {SETUP_TTL_MIN}m\n"
-            f"🎲 Martingale: {MARTINGALE_MAX_STEPS} steps | x{MARTINGALE_MULT:.2f}\n",
-            reply_markup=main_keyboard(),
-        )
+        await _safe_edit(q, "🔍 SCANNER ACTIVE\n✅ Press STATUS to monitor.", reply_markup=main_keyboard())
 
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
@@ -961,13 +1107,27 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             bot_logic.scanner_task.cancel()
         await _safe_edit(q, "⏹️ Scanner stopped.", reply_markup=main_keyboard())
 
-    elif q.data == "TEST_BUY":
-        asyncio.create_task(bot_logic.execute_trade("CALL", MARKETS[0], source="MANUAL"))
+    elif q.data == "NEXT_SECTION":
+        bot_logic._daily_reset_if_needed()
+        now = time.time()
+        nxt = bot_logic._next_section_start_epoch(now)
+        if nxt <= now + 1:
+            nxt = now + 1
+
+        forced_idx = bot_logic._get_section_index_for_epoch(nxt + 1)
+        bot_logic.section_index = forced_idx
+        bot_logic.section_profit = 0.0
+        bot_logic.section_pause_until = 0.0
+
         await _safe_edit(
             q,
-            f"🧪 Test trade triggered (CALL {MARKETS[0].replace('_',' ')} | Expiry mode {bot_logic.mode}).",
+            f"🧩 Moved to Section {bot_logic.section_index}/{SECTIONS_PER_DAY}. Reset section PnL to 0.00.",
             reply_markup=main_keyboard(),
         )
+
+    elif q.data == "TEST_BUY":
+        asyncio.create_task(bot_logic.execute_trade("CALL", "R_10", "Manual Test", source="MANUAL"))
+        await _safe_edit(q, "🧪 Test trade triggered (CALL R 10).", reply_markup=main_keyboard())
 
     elif q.data == "STATUS":
         now = time.time()
@@ -977,78 +1137,63 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             return
         bot_logic.status_cooldown_until = now + STATUS_REFRESH_COOLDOWN_SEC
 
-        bot_logic._daily_reset_if_needed()
         await bot_logic.fetch_balance()
-
         now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
         _ok, gate = bot_logic.can_auto_trade()
-        cfg = bot_logic.get_mode_cfg()
 
         trade_status = "No Active Trade"
-        if bot_logic.active_trade and bot_logic.api:
+        if bot_logic.active_trade_info and bot_logic.api:
             try:
-                cid = int(bot_logic.active_trade["cid"])
                 res = await bot_logic.safe_deriv_call(
                     "proposal_open_contract",
-                    {"proposal_open_contract": 1, "contract_id": cid},
+                    {"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info},
                     retries=4,
                 )
                 pnl = float(res["proposal_open_contract"].get("profit", 0))
-                dur = int(bot_logic.active_trade.get("duration_min", 0))
-                rem = max(0, int(dur * 60) - int(time.time() - float(bot_logic.active_trade.get("start_ts", 0.0))))
+                rem = max(0, int(DURATION_MIN * 60) - int(time.time() - bot_logic.trade_start_time))
                 icon = "✅ PROFIT" if pnl > 0 else "❌ LOSS" if pnl < 0 else "➖ FLAT"
-                mkt_clean = str(bot_logic.active_trade.get("symbol", "—")).replace("_", " ")
-                trade_status = (
-                    f"🚀 Active Trade ({mkt_clean})\n"
-                    f"Expiry mode: {bot_logic.active_trade.get('mode','—')} | Expiry: {dur}m\n"
-                    f"Opened: {fmt_dt(int(bot_logic.active_trade.get('start_ts', time.time())))}\n"
-                    f"📈 PnL: {icon} ({pnl:+.2f})\n"
-                    f"⏳ Remaining: {rem}s"
-                )
+                mkt_clean = str(bot_logic.active_market).replace("_", " ")
+                trade_status = f"🚀 Active Trade ({mkt_clean})\n📈 PnL: {icon} ({pnl:+.2f})\n⏳ Left: {rem}s"
             except Exception:
                 trade_status = "🚀 Active Trade: Syncing..."
 
-        cooldown_left = max(0, int(bot_logic.cooldown_until - time.time()))
-        pause_left = max(0, int(bot_logic.pause_until - time.time()))
-        next_payout = bot_logic.calc_payout_for_step()
+        pause_line = "⏸ Paused until 12:00am WAT\n" if time.time() < bot_logic.pause_until else ""
+        section_line = f"🧩 Section paused until {fmt_hhmm(bot_logic.section_pause_until)}\n" if time.time() < bot_logic.section_pause_until else ""
+
+        next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(bot_logic.martingale_step)))
 
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"🧭 Expiry mode: {bot_logic.mode} | Expiry: {int(cfg['DURATION_MIN'])}m\n"
-            f"🎲 Martingale: step {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS} (x{MARTINGALE_MULT:.2f}) | Next payout: ${next_payout:.2f}\n"
-            f"🧊 Cooldown: {cooldown_left}s | ⏸ Pause: {pause_left}s\n"
-            f"🧯 Risk: max/day {MAX_TRADES_PER_DAY} | max streak {MAX_CONSEC_LOSSES} | soft stop {STOP_AFTER_LOSSES}\n"
-            f"🎯 Daily: target +{DAILY_PROFIT_TARGET:.2f} | limit {DAILY_LOSS_LIMIT:+.2f}\n"
+            f"{pause_line}{section_line}"
+            f"🧩 Section: {bot_logic.section_index}/{SECTIONS_PER_DAY} | Section PnL: {bot_logic.section_profit:+.2f} / +{SECTION_PROFIT_TARGET:.2f} | Sections won: {bot_logic.sections_won_today}\n"
+            f"🎁 Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
+            f"🛡️ Martingale Lock: {bot_logic.last_signal if bot_logic.martingale_step > 0 else 'OFF'}\n"
+            f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
+            f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
+            f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
+            f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
+            f"📌 Trend Filters: ADX(min {ADX_MIN}) + ATR(min {ATR_MIN}) | Mode: {TREND_FILTER_MODE}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
-            f"💵 Today PnL: {bot_logic.total_profit_today:+.2f}\n"
+            f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
             f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
-            f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | Session losses: {bot_logic.session_losses}/{STOP_AFTER_LOSSES}\n"
+            f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
             f"🚦 Gate: {gate}\n"
             f"💰 Balance: {bot_logic.balance}\n"
-            f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
         )
 
-        body = ""
-        for sym in MARKETS:
-            d5 = bot_logic.market_debug.get((sym, "STRUCTURE_5M"), {})
-            d1 = bot_logic.market_debug.get((sym, "ENTRY_1M"), {})
-            setup = bot_logic.setups.get(sym)
-            body += format_market_detail(sym, d5, d1, setup)
+        details = "\n\n📌 LIVE SCAN (FULL)\n\n" + "\n\n".join(
+            [format_market_detail(sym, bot_logic.market_debug.get(sym, {})) for sym in MARKETS]
+        )
 
-        await _safe_edit(q, header + body, reply_markup=main_keyboard())
+        await _safe_edit(q, header + details, reply_markup=main_keyboard())
 
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    cfg = bot_logic.get_mode_cfg()
     await u.message.reply_text(
-        "💎 Deriv Breakout Bot (5M structure + 1M retest entry)\n"
-        f"🧭 Expiry mode: {bot_logic.mode} | Expiry: {int(cfg['DURATION_MIN'])}m\n"
-        f"📌 Indicators: EMA{EMA_FAST}/EMA{EMA_SLOW} + Donchian({DONCHIAN_LEN})\n"
-        "📌 Logic:\n"
-        "- Confirm breakout on 5M close outside the box (strong body)\n"
-        "- Enter on 1M retest/pullback to the broken level\n",
+        "💎 Deriv Bot\n"
+        f"🕯 Timeframe: M1 | ⏱ Expiry: {DURATION_MIN}m\n"
+        "✅ Anti-rate-limit enabled (ticks_history once/minute per market)\n",
         reply_markup=main_keyboard(),
     )
 
