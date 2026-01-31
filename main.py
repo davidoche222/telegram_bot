@@ -1,3 +1,4 @@
+
 # ⚠️ SECURITY NOTE:
 # Do NOT hardcode tokens in public code.
 # Paste tokens only on your local machine.
@@ -30,14 +31,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ========================= TWO MODES (MANUAL SWITCHING) =========================
-# M5 = 5-minute candles, 20-minute expiry (your original)
-# M1 = 1-minute candles, 5-minute expiry (your request)
+# M5 = 5-minute candles, 20-minute expiry
+# M1 = 1-minute candles, 5-minute expiry
 MODE_CONFIG = {
     "M5": {"TF_SEC": 300, "DURATION_MIN": 20},
     "M1": {"TF_SEC": 60,  "DURATION_MIN": 5},
 }
 DEFAULT_MODE = "M5"
-
 CANDLES_COUNT = 220
 
 # ========================= TRADE & RISK SETTINGS =========================
@@ -45,7 +45,7 @@ COOLDOWN_SEC = 180
 MAX_TRADES_PER_DAY = 20
 MAX_CONSEC_LOSSES = 6
 STOP_AFTER_LOSSES = 3
-DAILY_LOSS_LIMIT = -10
+DAILY_LOSS_LIMIT = -2.0
 DAILY_PROFIT_TARGET = 2.0
 
 # ========================= PAYOUT MODE =========================
@@ -54,43 +54,27 @@ PAYOUT_TARGET = 1.0
 MIN_PAYOUT = 0.35
 MAX_STAKE_ALLOWED = 10.00
 
-# ========================= MARTINGALE (✅ 3 steps, 1.8x) =========================
+# ========================= MARTINGALE (3 steps, 1.8x) =========================
 MARTINGALE_MULT = 1.80
-MARTINGALE_MAX_STEPS = 3          # steps after a loss: 1..3
-MARTINGALE_HALT_ON_MAX = True     # stop bot when step hits max and loses again
+MARTINGALE_MAX_STEPS = 3
+MARTINGALE_HALT_ON_MAX = True
 
-# ========================= INDICATORS =========================
-RSI_PERIOD = 14
-RSI_CALL_MIN, RSI_CALL_MAX = 50.0, 70.0
-RSI_PUT_MIN, RSI_PUT_MAX = 30.0, 50.0
-
-ADX_PERIOD = 14
+# ========================= CLEAN BREAKOUT SETTINGS =========================
+# Keep it simple:
+# - Donchian breakout using ATR buffer
+# - Spike filter (avoid huge candles)
+# - Optional EMA bias filter (kept ON by default)
 ATR_PERIOD = 14
-ADX_MIN = 25.0  # (kept, but for breakout we use ADX rising instead of >= ADX_MIN)
-
-# ========================= BREAKOUT (Donchian) =========================
 DONCHIAN_LEN = 20
-ATR_BREAKOUT_K = 0.15  # 0.05–0.30
+ATR_BREAKOUT_K = 0.15  # buffer = k * ATR
 
-# ========================= ATR-NORMALIZED FILTERS =========================
-EMA_DIFF_ATR_MIN = 0.25
-EMA_SLOPE_LOOKBACK = 10
-EMA_SLOPE_ATR_MIN = 0.10
+USE_EMA_BIAS = True    # If you want more trades, set False
+EMA_FAST = 20
+EMA_SLOW = 50
 
-# Candle / spike
-MIN_BODY_RATIO = 0.55
 MIN_CANDLE_RANGE = 1e-6
 SPIKE_RANGE_ATR = 2.5
 SPIKE_BODY_ATR = 1.8
-
-# ========================= TRADE QUALITY UPGRADES =========================
-ATR_COMPRESSION_LOOKBACK = 30       # candles
-ATR_COMPRESSION_MAX = 0.90          # ATR_now must be < ATR_mean * this
-
-DONCHIAN_WIDTH_ATR_MAX = 8.0        # (Donchian width / ATR) must be <= this
-
-FOLLOW_THROUGH_BODY_ATR_MIN = 0.60  # body/ATR in breakout direction must be >= this
-# ================================================================================
 
 # ========================= ANTI RATE-LIMIT =========================
 TICKS_GLOBAL_MIN_INTERVAL = 0.45
@@ -98,6 +82,7 @@ RATE_LIMIT_BACKOFF_BASE = 20
 
 # ========================= UI =========================
 STATUS_REFRESH_COOLDOWN_SEC = 8
+
 
 # ========================= INDICATOR MATH =========================
 def calculate_ema(values, period: int):
@@ -110,34 +95,6 @@ def calculate_ema(values, period: int):
     for i in range(1, len(values)):
         ema[i] = values[i] * k + ema[i - 1] * (1 - k)
     return ema
-
-
-def calculate_rsi(values, period=14):
-    values = np.array(values, dtype=float)
-    n = len(values)
-    if n < period + 2:
-        return np.array([])
-
-    deltas = np.diff(values)
-    gains = np.where(deltas > 0, deltas, 0.0)
-    losses = np.where(deltas < 0, -deltas, 0.0)
-
-    rsi = np.full(n, np.nan, dtype=float)
-
-    avg_gain = np.mean(gains[:period])
-    avg_loss = np.mean(losses[:period])
-    rs = avg_gain / (avg_loss + 1e-12)
-    rsi[period] = 100.0 - (100.0 / (1.0 + rs))
-
-    for i in range(period + 1, n):
-        gain = gains[i - 1]
-        loss = losses[i - 1]
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-        rs = avg_gain / (avg_loss + 1e-12)
-        rsi[i] = 100.0 - (100.0 / (1.0 + rs))
-
-    return rsi
 
 
 def calculate_atr(highs, lows, closes, period=14):
@@ -160,53 +117,6 @@ def calculate_atr(highs, lows, closes, period=14):
         atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
 
     return atr
-
-
-def calculate_adx(highs, lows, closes, period=14):
-    highs = np.array(highs, dtype=float)
-    lows = np.array(lows, dtype=float)
-    closes = np.array(closes, dtype=float)
-
-    n = len(closes)
-    if n < period * 2 + 2:
-        return np.array([])
-
-    up_move = highs[1:] - highs[:-1]
-    down_move = lows[:-1] - lows[1:]
-
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    prev_close = closes[:-1]
-    tr = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - prev_close), np.abs(lows[1:] - prev_close)))
-
-    tr_s = np.zeros_like(tr)
-    plus_s = np.zeros_like(plus_dm)
-    minus_s = np.zeros_like(minus_dm)
-
-    tr_s[period - 1] = np.sum(tr[:period])
-    plus_s[period - 1] = np.sum(plus_dm[:period])
-    minus_s[period - 1] = np.sum(minus_dm[:period])
-
-    for i in range(period, len(tr)):
-        tr_s[i] = tr_s[i - 1] - (tr_s[i - 1] / period) + tr[i]
-        plus_s[i] = plus_s[i - 1] - (plus_s[i - 1] / period) + plus_dm[i]
-        minus_s[i] = minus_s[i - 1] - (minus_s[i - 1] / period) + minus_dm[i]
-
-    plus_di = 100.0 * (plus_s / (tr_s + 1e-12))
-    minus_di = 100.0 * (minus_s / (tr_s + 1e-12))
-    dx = 100.0 * (np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12))
-
-    adx = np.full(n, np.nan, dtype=float)
-    dx_full = np.full(n, np.nan, dtype=float)
-    dx_full[1:] = dx
-
-    start = period * 2
-    adx[start] = np.nanmean(dx_full[period:start + 1])
-    for i in range(start + 1, n):
-        adx[i] = ((adx[i - 1] * (period - 1)) + dx_full[i]) / period
-
-    return adx
 
 
 def build_candles_from_deriv(candles_raw):
@@ -275,13 +185,13 @@ class DerivBreakoutBot:
 
         self.session_losses = 0
 
-        # ✅ martingale state
-        self.martingale_step = 0  # 0 = base, 1..MARTINGALE_MAX_STEPS = recovery levels
+        # martingale
+        self.martingale_step = 0
         self.martingale_halt = False
 
         self.trade_lock = asyncio.Lock()
 
-        # market debug & processing must be per (symbol, mode)
+        # debug per (symbol, mode)
         self.market_debug = {(m, md): {} for m in MARKETS for md in MODE_CONFIG.keys()}
         self.last_processed_closed_t0 = {(m, md): 0 for m in MARKETS for md in MODE_CONFIG.keys()}
 
@@ -508,35 +418,21 @@ class DerivBreakoutBot:
 
     def _missing_for_side(self, side: str, checks: dict) -> list[str]:
         if side == "CALL":
-            needed = [
-                "GATE_OK", "ATR_OK",
-                "ATR_COMPRESS_OK", "DONCHIAN_SQUEEZE_OK",
-                "ADX_OK", "BIAS_UP",
-                "EMA50_RISING", "EMA_DIFF_OK",
-                "STRONG_CANDLE", "SPIKE_OK",
-                "RSI_OK_CALL",
-                "BREAKOUT_CALL", "FOLLOW_THROUGH_CALL",
-            ]
+            needed = ["GATE_OK", "ATR_OK", "SPIKE_OK", "BREAKOUT_CALL"]
+            if USE_EMA_BIAS:
+                needed.append("BIAS_UP")
         else:
-            needed = [
-                "GATE_OK", "ATR_OK",
-                "ATR_COMPRESS_OK", "DONCHIAN_SQUEEZE_OK",
-                "ADX_OK", "BIAS_DOWN",
-                "EMA50_FALLING", "EMA_DIFF_OK",
-                "STRONG_CANDLE", "SPIKE_OK",
-                "RSI_OK_PUT",
-                "BREAKOUT_PUT", "FOLLOW_THROUGH_PUT",
-            ]
+            needed = ["GATE_OK", "ATR_OK", "SPIKE_OK", "BREAKOUT_PUT"]
+            if USE_EMA_BIAS:
+                needed.append("BIAS_DOWN")
         return [k for k in needed if not checks.get(k, False)]
 
     async def scan_market(self, symbol: str):
-        # scan BOTH modes in the same bot, but trades only trigger for CURRENT selected mode
         for md in MODE_CONFIG.keys():
             self._next_poll_epoch[(symbol, md)] = time.time() + random.random() * 0.6
 
         while self.is_scanning:
             try:
-                # run both modes each loop (lightweight); rate limiting already handled globally
                 for md, cfg in MODE_CONFIG.items():
                     tf_sec = int(cfg["TF_SEC"])
                     now = time.time()
@@ -547,13 +443,12 @@ class DerivBreakoutBot:
                     ok_gate, gate = self.can_auto_trade()
 
                     candles = await self.fetch_candles(symbol, tf_sec=tf_sec)
-                    if len(candles) < (DONCHIAN_LEN + 80):
+                    if len(candles) < (DONCHIAN_LEN + 10):
                         self.market_debug[(symbol, md)] = {
                             "time": time.time(),
                             "mode": md,
                             "tf_sec": tf_sec,
                             "gate": "Waiting",
-                            "why": [f"Need more candles (have {len(candles)})."],
                             "checks": {},
                             "missing_call": [],
                             "missing_put": [],
@@ -576,98 +471,39 @@ class DerivBreakoutBot:
                     highs = np.array([x["h"] for x in candles], dtype=float)
                     lows = np.array([x["l"] for x in candles], dtype=float)
 
-                    ema20 = calculate_ema(closes, 20)
-                    ema50 = calculate_ema(closes, 50)
-                    if len(ema20) < 70 or len(ema50) < 70:
-                        self.market_debug[(symbol, md)] = {
-                            "time": time.time(),
-                            "mode": md,
-                            "tf_sec": tf_sec,
-                            "gate": "Indicators",
-                            "why": ["EMA not ready."],
-                            "checks": {},
-                            "missing_call": [],
-                            "missing_put": [],
-                            "signal": None,
-                            "last_price": float("nan"),
-                            "next_close": next_closed_epoch,
-                        }
-                        self.last_processed_closed_t0[(symbol, md)] = confirm_t0
-                        continue
-
-                    ema20_now = float(ema20[-2])
-                    ema50_now = float(ema50[-2])
-                    bias_up = ema20_now > ema50_now
-                    bias_down = ema20_now < ema50_now
-
                     atr = calculate_atr(highs, lows, closes, ATR_PERIOD)
-                    adx = calculate_adx(highs, lows, closes, ADX_PERIOD)
                     atr_now = float(atr[-2]) if len(atr) and not np.isnan(atr[-2]) else float("nan")
-                    adx_now = float(adx[-2]) if len(adx) and not np.isnan(adx[-2]) else float("nan")
                     atr_ok = is_finite(atr_now) and atr_now > 1e-12
 
-                    # ===================== ADX (BREAKOUT) =====================
-                    # breakout: require ADX to be rising (momentum expansion), not necessarily already high
-                    adx_prev = float(adx[-3]) if len(adx) >= 4 and not np.isnan(adx[-3]) else float("nan")
-                    adx_ok = is_finite(adx_now) and is_finite(adx_prev) and (adx_now > adx_prev)
-                    # ==========================================================
+                    # optional EMA bias (trend direction)
+                    bias_up = bias_down = False
+                    ema_fast_now = ema_slow_now = float("nan")
+                    if USE_EMA_BIAS:
+                        ema_fast = calculate_ema(closes, EMA_FAST)
+                        ema_slow = calculate_ema(closes, EMA_SLOW)
+                        if len(ema_fast) and len(ema_slow):
+                            ema_fast_now = float(ema_fast[-2])
+                            ema_slow_now = float(ema_slow[-2])
+                            bias_up = ema_fast_now > ema_slow_now
+                            bias_down = ema_fast_now < ema_slow_now
 
-                    # ATR compression
-                    atr_mean = float("nan")
-                    atr_compress_ok = False
-                    if atr_ok and len(atr) >= (ATR_COMPRESSION_LOOKBACK + 5):
-                        recent = atr[-(ATR_COMPRESSION_LOOKBACK + 2):-2]
-                        try:
-                            atr_mean = float(np.nanmean(recent))
-                        except Exception:
-                            atr_mean = float("nan")
-                        if is_finite(atr_mean) and atr_mean > 0:
-                            atr_compress_ok = atr_now < (atr_mean * float(ATR_COMPRESSION_MAX))
-
-                    rsi = calculate_rsi(closes, RSI_PERIOD)
-                    rsi_now = float(rsi[-2]) if len(rsi) and not np.isnan(rsi[-2]) else float("nan")
-                    rsi_ok_call = is_finite(rsi_now) and (RSI_CALL_MIN <= rsi_now <= RSI_CALL_MAX)
-                    rsi_ok_put = is_finite(rsi_now) and (RSI_PUT_MIN <= rsi_now <= RSI_PUT_MAX)
-
-                    ema_diff = abs(ema20_now - ema50_now)
-                    ema_diff_atr = (ema_diff / atr_now) if (atr_ok and atr_now > 0) else float("nan")
-                    ema_diff_ok = is_finite(ema_diff_atr) and (ema_diff_atr >= float(EMA_DIFF_ATR_MIN))
-
-                    ema50_slope = float("nan")
-                    ema50_slope_atr = float("nan")
-                    slope_ok = False
-                    ema50_rising = False
-                    ema50_falling = False
-                    if len(ema50) >= (EMA_SLOPE_LOOKBACK + 3):
-                        ema50_prev2 = float(ema50[-(EMA_SLOPE_LOOKBACK + 2)])
-                        ema50_slope = float(ema50_now - ema50_prev2)
-                        if atr_ok and atr_now > 0:
-                            ema50_slope_atr = float(ema50_slope / atr_now)
-                        slope_ok = is_finite(ema50_slope_atr) and (abs(ema50_slope_atr) >= float(EMA_SLOPE_ATR_MIN))
-                        ema50_rising = slope_ok and (ema50_slope_atr >= float(EMA_SLOPE_ATR_MIN))
-                        ema50_falling = slope_ok and (ema50_slope_atr <= -float(EMA_SLOPE_ATR_MIN))
-
+                    # spike filter on confirm candle
                     c_open = float(confirm["o"])
                     c_close = float(confirm["c"])
                     c_high = float(confirm["h"])
                     c_low = float(confirm["l"])
                     c_range = max(MIN_CANDLE_RANGE, c_high - c_low)
                     body = abs(c_close - c_open)
-                    body_ratio = body / c_range
-                    strong_candle = body_ratio >= float(MIN_BODY_RATIO)
 
                     range_atr = (c_range / atr_now) if (atr_ok and atr_now > 0) else float("nan")
                     body_atr = (body / atr_now) if (atr_ok and atr_now > 0) else float("nan")
-                    spike_range_block = is_finite(range_atr) and (range_atr > float(SPIKE_RANGE_ATR))
-                    spike_body_block = is_finite(body_atr) and (body_atr > float(SPIKE_BODY_ATR))
-                    spike_block = spike_range_block or spike_body_block
+                    spike_block = (is_finite(range_atr) and range_atr > float(SPIKE_RANGE_ATR)) or (
+                        is_finite(body_atr) and body_atr > float(SPIKE_BODY_ATR)
+                    )
 
+                    # Donchian window excludes confirm candle
                     window_high = float(np.max(highs[-(DONCHIAN_LEN + 2):-2]))
                     window_low = float(np.min(lows[-(DONCHIAN_LEN + 2):-2]))
-
-                    donchian_width = float(window_high - window_low)
-                    donchian_width_atr = (donchian_width / atr_now) if (atr_ok and atr_now > 0) else float("nan")
-                    donchian_squeeze_ok = is_finite(donchian_width_atr) and (donchian_width_atr <= float(DONCHIAN_WIDTH_ATR_MAX))
 
                     buf = (float(ATR_BREAKOUT_K) * atr_now) if atr_ok else 0.0
                     call_break_level = window_high + buf
@@ -676,76 +512,25 @@ class DerivBreakoutBot:
                     breakout_call = c_close > call_break_level
                     breakout_put = c_close < put_break_level
 
-                    body_dir_call_atr = ((c_close - c_open) / atr_now) if (atr_ok and atr_now > 0) else float("nan")
-                    body_dir_put_atr = ((c_open - c_close) / atr_now) if (atr_ok and atr_now > 0) else float("nan")
-                    follow_through_call = is_finite(body_dir_call_atr) and (body_dir_call_atr >= float(FOLLOW_THROUGH_BODY_ATR_MIN))
-                    follow_through_put = is_finite(body_dir_put_atr) and (body_dir_put_atr >= float(FOLLOW_THROUGH_BODY_ATR_MIN))
-
                     last_price = await self.fetch_last_price(symbol)
 
                     checks = {
                         "GATE_OK": ok_gate,
                         "ATR_OK": atr_ok,
-                        "ATR_COMPRESS_OK": atr_compress_ok,
-                        "DONCHIAN_SQUEEZE_OK": donchian_squeeze_ok,
-                        "ADX_OK": adx_ok,
-                        "BIAS_UP": bias_up,
-                        "BIAS_DOWN": bias_down,
-                        "EMA_DIFF_OK": ema_diff_ok,
-                        "SLOPE_OK": slope_ok,
-                        "EMA50_RISING": ema50_rising,
-                        "EMA50_FALLING": ema50_falling,
-                        "STRONG_CANDLE": strong_candle,
                         "SPIKE_OK": (not spike_block),
-                        "RSI_OK_CALL": rsi_ok_call,
-                        "RSI_OK_PUT": rsi_ok_put,
                         "BREAKOUT_CALL": breakout_call,
                         "BREAKOUT_PUT": breakout_put,
-                        "FOLLOW_THROUGH_CALL": follow_through_call,
-                        "FOLLOW_THROUGH_PUT": follow_through_put,
+                        "BIAS_UP": bias_up,
+                        "BIAS_DOWN": bias_down,
                     }
 
-                    call_ready = (
-                        checks["GATE_OK"] and checks["ATR_OK"]
-                        and checks["ATR_COMPRESS_OK"] and checks["DONCHIAN_SQUEEZE_OK"]
-                        and checks["ADX_OK"] and checks["BIAS_UP"]
-                        and checks["EMA50_RISING"] and checks["EMA_DIFF_OK"]
-                        and checks["STRONG_CANDLE"] and checks["SPIKE_OK"]
-                        and checks["RSI_OK_CALL"] and checks["BREAKOUT_CALL"]
-                        and checks["FOLLOW_THROUGH_CALL"]
-                    )
-                    put_ready = (
-                        checks["GATE_OK"] and checks["ATR_OK"]
-                        and checks["ATR_COMPRESS_OK"] and checks["DONCHIAN_SQUEEZE_OK"]
-                        and checks["ADX_OK"] and checks["BIAS_DOWN"]
-                        and checks["EMA50_FALLING"] and checks["EMA_DIFF_OK"]
-                        and checks["STRONG_CANDLE"] and checks["SPIKE_OK"]
-                        and checks["RSI_OK_PUT"] and checks["BREAKOUT_PUT"]
-                        and checks["FOLLOW_THROUGH_PUT"]
-                    )
+                    call_ready = checks["GATE_OK"] and checks["ATR_OK"] and checks["SPIKE_OK"] and checks["BREAKOUT_CALL"]
+                    put_ready = checks["GATE_OK"] and checks["ATR_OK"] and checks["SPIKE_OK"] and checks["BREAKOUT_PUT"]
+                    if USE_EMA_BIAS:
+                        call_ready = call_ready and checks["BIAS_UP"]
+                        put_ready = put_ready and checks["BIAS_DOWN"]
 
                     signal = "CALL" if call_ready else "PUT" if put_ready else None
-
-                    missing_call = self._missing_for_side("CALL", checks)
-                    missing_put = self._missing_for_side("PUT", checks)
-
-                    why = []
-                    why.append(f"Mode: {md} | Gate: {gate}")
-                    why.append(f"Confirm close: {c_close:.5f} | Live price: {last_price:.5f}" if is_finite(last_price) else f"Confirm close: {c_close:.5f} | Live price: —")
-                    why.append(f"Next candle closes: {fmt_time_hhmmss(next_closed_epoch)} (WAT)")
-                    why.append(f"ADX {adx_now:.2f} (prev {adx_prev:.2f}) | ATR {atr_now:.5f}")
-                    if atr_ok:
-                        why.append(f"EMA diff/ATR {ema_diff_atr:.3f} (min {EMA_DIFF_ATR_MIN})")
-                        why.append(f"EMA50 slope/ATR {ema50_slope_atr:.3f} (min {EMA_SLOPE_ATR_MIN})")
-                        why.append(f"ATR compression: ATR_now {atr_now:.5f} | ATR_mean({ATR_COMPRESSION_LOOKBACK}) {atr_mean:.5f} | need < {ATR_COMPRESSION_MAX:.2f}x")
-                        why.append(f"Donchian width/ATR {donchian_width_atr:.2f} (max {DONCHIAN_WIDTH_ATR_MAX:.2f})")
-                        why.append(f"Follow-through: body_dir_call/ATR {body_dir_call_atr:.2f} | body_dir_put/ATR {body_dir_put_atr:.2f} (min {FOLLOW_THROUGH_BODY_ATR_MIN:.2f})")
-                    why.append(f"Donchian({DONCHIAN_LEN}) H/L {window_high:.5f}/{window_low:.5f} | buffer {buf:.5f}")
-                    why.append(f"CALL needs close > {call_break_level:.5f} | PUT needs close < {put_break_level:.5f}")
-                    why.append(f"Body ratio {body_ratio:.2f} (min {MIN_BODY_RATIO}) | Spike? range/ATR {range_atr:.2f} body/ATR {body_atr:.2f}")
-                    why.append(f"Martingale step: {self.martingale_step}/{MARTINGALE_MAX_STEPS} (x{MARTINGALE_MULT:.2f})")
-                    if signal:
-                        why.append(f"READY: {signal}")
 
                     self.market_debug[(symbol, md)] = {
                         "time": time.time(),
@@ -756,19 +541,23 @@ class DerivBreakoutBot:
                         "next_close": next_closed_epoch,
                         "signal": signal,
                         "checks": checks,
-                        "missing_call": missing_call,
-                        "missing_put": missing_put,
-                        "why": why[:20],
+                        "missing_call": self._missing_for_side("CALL", checks),
+                        "missing_put": self._missing_for_side("PUT", checks),
                         "confirm_close": c_close,
                         "last_price": last_price,
                         "call_break_level": call_break_level,
                         "put_break_level": put_break_level,
                         "next_poll_epoch": self._next_poll_epoch.get((symbol, md), 0.0),
+                        "atr_now": atr_now,
+                        "ema_fast": ema_fast_now,
+                        "ema_slow": ema_slow_now,
+                        "range_atr": range_atr,
+                        "body_atr": body_atr,
                     }
 
                     self.last_processed_closed_t0[(symbol, md)] = confirm_t0
 
-                    # ✅ Only place trades for the CURRENT selected mode (manual switching)
+                    # trade ONLY selected mode
                     if md == self.mode:
                         if call_ready:
                             await self.execute_trade("CALL", symbol, source="AUTO")
@@ -782,7 +571,6 @@ class DerivBreakoutBot:
             except Exception as e:
                 msg = str(e)
                 logger.error(f"Scanner Error ({symbol}): {msg}")
-                # apply backoff to BOTH modes for this symbol
                 for md in MODE_CONFIG.keys():
                     if self._is_rate_limit_error(msg):
                         self._rate_limit_strikes[(symbol, md)] = int(self._rate_limit_strikes.get((symbol, md), 0)) + 1
@@ -792,7 +580,7 @@ class DerivBreakoutBot:
                     else:
                         self._next_poll_epoch[(symbol, md)] = time.time() + (6 if self._is_gatewayish_error(msg) else 2)
 
-    # ---------- trading (✅ MARTINGALE payout scaling) ----------
+    # ---------- trading ----------
     def calc_payout_for_step(self) -> float:
         base = max(float(MIN_PAYOUT), float(PAYOUT_TARGET))
         payout = float(base) * (float(MARTINGALE_MULT) ** int(self.martingale_step))
@@ -948,6 +736,7 @@ class DerivBreakoutBot:
 # ========================= UI =========================
 bot_logic = DerivBreakoutBot()
 
+
 def main_keyboard():
     return InlineKeyboardMarkup(
         [
@@ -959,7 +748,7 @@ def main_keyboard():
                 InlineKeyboardButton(f"🧭 MODE: {bot_logic.mode} (SWITCH)", callback_data="SWITCH_MODE"),
             ],
             [
-                InlineKeyboardButton("📊 STATUS (DETAILED)", callback_data="STATUS"),
+                InlineKeyboardButton("📊 STATUS", callback_data="STATUS"),
                 InlineKeyboardButton("🔄 REFRESH", callback_data="STATUS"),
             ],
             [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY")],
@@ -970,104 +759,9 @@ def main_keyboard():
         ]
     )
 
-# ========================= STATUS DISPLAY =========================
+
 def _yn(v: bool) -> str:
     return "✅" if v else "❌"
-
-
-def _humanize_key(k: str) -> str:
-    mapping = {
-        "GATE_OK": "Gate (risk limits/cooldown)",
-        "ATR_OK": "ATR ready",
-        "ATR_COMPRESS_OK": "ATR compression (calm before breakout)",
-        "DONCHIAN_SQUEEZE_OK": "Donchian squeeze (tight range)",
-        "ADX_OK": "ADX momentum expanding (rising)",
-        "BIAS_UP": "Trend bias UP (EMA20 > EMA50)",
-        "BIAS_DOWN": "Trend bias DOWN (EMA20 < EMA50)",
-        "EMA50_RISING": "EMA50 rising strongly (slope filter)",
-        "EMA50_FALLING": "EMA50 falling strongly (slope filter)",
-        "EMA_DIFF_OK": "EMA separation OK (not flat)",
-        "STRONG_CANDLE": "Strong confirm candle (body ratio)",
-        "SPIKE_OK": "No spike candle",
-        "RSI_OK_CALL": "RSI ok for CALL",
-        "RSI_OK_PUT": "RSI ok for PUT",
-        "BREAKOUT_CALL": "Breakout above CALL level",
-        "BREAKOUT_PUT": "Breakout below PUT level",
-        "FOLLOW_THROUGH_CALL": "Follow-through CALL (body/ATR)",
-        "FOLLOW_THROUGH_PUT": "Follow-through PUT (body/ATR)",
-        "SLOPE_OK": "EMA50 slope strong enough",
-    }
-    return mapping.get(k, k)
-
-
-def _regime_from_checks(checks: dict) -> str:
-    adx_ok = bool(checks.get("ADX_OK", False))
-    sep_ok = bool(checks.get("EMA_DIFF_OK", False))
-    rising = bool(checks.get("EMA50_RISING", False))
-    falling = bool(checks.get("EMA50_FALLING", False))
-    if adx_ok and sep_ok and (rising or falling):
-        return "TREND"
-    return "RANGE"
-
-
-def _breakout_state(last_price: float, call_lvl: float, put_lvl: float, checks: dict) -> tuple[str, str]:
-    b_call = bool(checks.get("BREAKOUT_CALL", False))
-    b_put = bool(checks.get("BREAKOUT_PUT", False))
-
-    if b_call:
-        return ("BROKE OUT ✅ (CALL breakout confirmed)", "")
-    if b_put:
-        return ("BROKE OUT ✅ (PUT breakout confirmed)", "")
-
-    if not is_finite(last_price) or not is_finite(call_lvl) or not is_finite(put_lvl):
-        return ("NO BREAKOUT (no live price yet)", "")
-
-    near = abs(last_price) * 0.0015
-    dist_to_call = call_lvl - last_price
-    dist_to_put = last_price - put_lvl
-
-    approaching = []
-    if dist_to_call >= 0 and dist_to_call <= near:
-        approaching.append(f"Approaching CALL breakout (≈ {dist_to_call:.5f} away)")
-    if dist_to_put >= 0 and dist_to_put <= near:
-        approaching.append(f"Approaching PUT breakout (≈ {dist_to_put:.5f} away)")
-
-    if approaching:
-        return ("APPROACHING ⚠️ (near breakout level)", " | ".join(approaching))
-
-    return ("NO BREAKOUT (still inside range)", "")
-
-
-def _focus_side_from_checks(checks: dict) -> str:
-    if bool(checks.get("BIAS_UP", False)) and not bool(checks.get("BIAS_DOWN", False)):
-        return "CALL"
-    if bool(checks.get("BIAS_DOWN", False)) and not bool(checks.get("BIAS_UP", False)):
-        return "PUT"
-    return "BOTH"
-
-
-def _waiting_list_for_side(side: str, checks: dict) -> list[str]:
-    if side == "CALL":
-        needed = [
-            "GATE_OK", "ATR_OK",
-            "ATR_COMPRESS_OK", "DONCHIAN_SQUEEZE_OK",
-            "ADX_OK", "BIAS_UP",
-            "EMA50_RISING", "EMA_DIFF_OK",
-            "STRONG_CANDLE", "SPIKE_OK",
-            "RSI_OK_CALL", "BREAKOUT_CALL",
-            "FOLLOW_THROUGH_CALL",
-        ]
-    else:
-        needed = [
-            "GATE_OK", "ATR_OK",
-            "ATR_COMPRESS_OK", "DONCHIAN_SQUEEZE_OK",
-            "ADX_OK", "BIAS_DOWN",
-            "EMA50_FALLING", "EMA_DIFF_OK",
-            "STRONG_CANDLE", "SPIKE_OK",
-            "RSI_OK_PUT", "BREAKOUT_PUT",
-            "FOLLOW_THROUGH_PUT",
-        ]
-    return [k for k in needed if not bool(checks.get(k, False))]
 
 
 def format_market_detail(sym: str, d: dict) -> str:
@@ -1081,79 +775,45 @@ def format_market_detail(sym: str, d: dict) -> str:
     signal = d.get("signal") or "—"
     mode = d.get("mode", "—")
     tf_sec = int(d.get("tf_sec", 0) or 0)
-
     checks = d.get("checks", {}) or {}
 
     def f(x, fmt=".5f"):
         return "—" if (x is None or (isinstance(x, float) and not np.isfinite(x))) else format(float(x), fmt)
-
-    next_poll_epoch = float(d.get("next_poll_epoch", 0.0))
-    next_poll_in = max(0, int(next_poll_epoch - time.time())) if next_poll_epoch else 0
 
     confirm_close = d.get("confirm_close", float("nan"))
     last_price = d.get("last_price", float("nan"))
     call_lvl = d.get("call_break_level", float("nan"))
     put_lvl = d.get("put_break_level", float("nan"))
 
-    regime = _regime_from_checks(checks)
-    bo_state, bo_approach = _breakout_state(last_price, call_lvl, put_lvl, checks)
-    focus = _focus_side_from_checks(checks)
-
-    missing_call = _waiting_list_for_side("CALL", checks)
-    missing_put = _waiting_list_for_side("PUT", checks)
-
-    if focus == "CALL":
-        waiting_keys = missing_call
-        focus_line = "Focus: CALL (bias UP)"
-    elif focus == "PUT":
-        waiting_keys = missing_put
-        focus_line = "Focus: PUT (bias DOWN)"
-    else:
-        focus_side = "CALL" if len(missing_call) <= len(missing_put) else "PUT"
-        waiting_keys = missing_call if focus_side == "CALL" else missing_put
-        focus_line = f"Focus: BOTH (mixed bias) | Nearest: {focus_side}"
-
-    waiting_pretty = ", ".join([_humanize_key(k) for k in waiting_keys]) if waiting_keys else "NONE ✅ (trade should trigger)"
-
-    summary = [f"Regime: {regime}", f"Breakout: {bo_state}"]
-    if bo_approach:
-        summary.append(bo_approach)
-
-    key_checks = [
-        ("Gate", "GATE_OK"),
-        ("ADX", "ADX_OK"),
-        ("Compress", "ATR_COMPRESS_OK"),
-        ("Squeeze", "DONCHIAN_SQUEEZE_OK"),
-        ("EMA sep", "EMA_DIFF_OK"),
-        ("Slope up", "EMA50_RISING"),
-        ("Slope dn", "EMA50_FALLING"),
-        ("Candle", "STRONG_CANDLE"),
-        ("FollowC", "FOLLOW_THROUGH_CALL"),
-        ("FollowP", "FOLLOW_THROUGH_PUT"),
-        ("Spike", "SPIKE_OK"),
-        ("RSI call", "RSI_OK_CALL"),
-        ("RSI put", "RSI_OK_PUT"),
-        ("BO call", "BREAKOUT_CALL"),
-        ("BO put", "BREAKOUT_PUT"),
-    ]
-    checks_line = " | ".join([f"{name}:{_yn(bool(checks.get(k, False)))}" for name, k in key_checks])
-
     tf_txt = f"{tf_sec//60}m" if tf_sec else "—"
+
+    # Keep status clean: show only the checks that matter
+    keys = ["GATE_OK", "ATR_OK", "SPIKE_OK", "BREAKOUT_CALL", "BREAKOUT_PUT"]
+    if USE_EMA_BIAS:
+        keys += ["BIAS_UP", "BIAS_DOWN"]
+
+    pretty = {
+        "GATE_OK": "Gate",
+        "ATR_OK": "ATR",
+        "SPIKE_OK": "SpikeOK",
+        "BREAKOUT_CALL": "BO Call",
+        "BREAKOUT_PUT": "BO Put",
+        "BIAS_UP": "BiasUp",
+        "BIAS_DOWN": "BiasDn",
+    }
+
+    checks_line = " | ".join([f"{pretty[k]}:{_yn(bool(checks.get(k, False)))}" for k in keys])
 
     return (
         f"📍 {sym.replace('_',' ')} | 🧭 {mode} | 🕯 {tf_txt} ({age}s)\n"
-        f"Gate: {gate} | Next scan in: {next_poll_in}s\n"
+        f"Gate: {gate}\n"
         f"Last closed: {fmt_time_hhmmss(last_closed)} | Next close: {fmt_time_hhmmss(next_close)}\n"
         f"Live: {f(last_price)} | Confirm close: {f(confirm_close)}\n"
         f"Break levels → CALL: {f(call_lvl)} | PUT: {f(put_lvl)}\n"
         f"Signal: {signal}\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"{' | '.join(summary)}\n"
-        f"{focus_line}\n"
-        f"WAITING FOR: {waiting_pretty}\n"
         f"Checks: {checks_line}\n"
     )
-# ========================= END STATUS DISPLAY =========================
+
 
 async def _safe_answer(q, text: str | None = None, show_alert: bool = False):
     try:
@@ -1161,11 +821,13 @@ async def _safe_answer(q, text: str | None = None, show_alert: bool = False):
     except Exception as e:
         logger.warning(f"Callback answer ignored: {e}")
 
+
 async def _safe_edit(q, text: str, reply_markup=None):
     try:
         await q.edit_message_text(text, reply_markup=reply_markup)
     except Exception as e:
         logger.warning(f"Edit failed: {e}")
+
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
@@ -1189,7 +851,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             q,
             f"✅ Mode switched to {bot_logic.mode}\n"
             f"🕯 Candles: {int(cfg['TF_SEC'])//60}m | ⏱ Expiry: {int(cfg['DURATION_MIN'])}m\n"
-            f"Trades will trigger ONLY for the selected mode.",
+            f"Trades trigger ONLY for selected mode.",
             reply_markup=main_keyboard(),
         )
 
@@ -1206,11 +868,12 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await _safe_edit(
             q,
             f"🔍 SCANNER ACTIVE\n"
-            f"🧭 Selected mode: {bot_logic.mode} (manual switch)\n"
-            f"✅ Donchian({DONCHIAN_LEN}) breakout + ATR buffer(k={ATR_BREAKOUT_K})\n"
+            f"🧭 Selected mode: {bot_logic.mode}\n"
+            f"📌 Strategy: Donchian breakout + ATR buffer + spike filter"
+            + (f" + EMA({EMA_FAST}/{EMA_SLOW}) bias" if USE_EMA_BIAS else "") + "\n"
             f"🕯 {int(cfg['TF_SEC'])//60}m candles | ⏱ {int(cfg['DURATION_MIN'])}m expiry\n"
             f"🎲 Martingale: {MARTINGALE_MAX_STEPS} steps | x{MARTINGALE_MULT:.2f}\n"
-            f"📌 Note: Bot scans BOTH M1 & M5, but only trades the selected mode.",
+            f"Note: Bot scans BOTH M1 & M5, but trades selected mode only.",
             reply_markup=main_keyboard(),
         )
 
@@ -1291,8 +954,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
         )
 
-        # show BOTH mode scans so you can compare quickly
-        details = "\n\n📌 LIVE SCAN (M1 + M5 • BREAKOUT • WAITING-FOR)\n\n"
+        details = "\n\n📌 LIVE SCAN (M1 + M5)\n\n"
         blocks = []
         for md in ("M1", "M5"):
             blocks.append(f"===== {md} =====")
@@ -1302,16 +964,19 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         await _safe_edit(q, header + details, reply_markup=main_keyboard())
 
+
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     cfg = bot_logic.get_mode_cfg()
     await u.message.reply_text(
-        "💎 Deriv Breakout Bot (M1 + M5)\n"
+        "💎 Deriv Breakout Bot (CLEAN)\n"
         f"🧭 Mode: {bot_logic.mode} (use MODE button to switch)\n"
         f"🕯 Timeframe: {int(cfg['TF_SEC'])//60}m | ⏱ Expiry: {int(cfg['DURATION_MIN'])}m\n"
-        f"📌 Donchian({DONCHIAN_LEN}) breakout + ATR buffer + RSI + ADX(rising)\n"
+        f"📌 Strategy: Donchian breakout + ATR buffer + spike filter"
+        + (f" + EMA({EMA_FAST}/{EMA_SLOW}) bias" if USE_EMA_BIAS else "") + "\n"
         f"🎲 Martingale: {MARTINGALE_MAX_STEPS} steps | x{MARTINGALE_MULT:.2f}\n",
         reply_markup=main_keyboard(),
     )
+
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
