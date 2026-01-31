@@ -1,14 +1,22 @@
-# ✅ UPDATED VERSION (kept your 2-minute expiry untouched)
-# Changes made:
-# ✅ 1) EMA20_SLOPE_MIN reduced (more trades, less strict)
-# ✅ 2) Martingale lock fixed: NO resetting martingale_step inside scanner
-#    - If martingale_step > 0, bot will ONLY allow trades in last_signal direction
-#    - Opposite signals are simply blocked (no step reset)
-# Everything else unchanged.
+# ✅ BOLLINGER BAND VERSION (2-minute expiry untouched)
+# Strategy:
+# Trend Filter:
+#   - EMA20 > EMA50 => CALL only
+#   - EMA20 < EMA50 => PUT only
+#   - EMA50 slope must be strong in trade direction
+# Entry:
+#   - Touch BB in trend direction (touch candle)
+#   - Next candle closes back inside BB (confirmation candle)
+#   - Rejection candle body >= 55%
+#   - Bollinger Bands expanding (bandwidth rising)
+# Execution:
+#   - 1M chart, 2-minute expiry (UNCHANGED)
+# Risk:
+#   - Martingale lock (same direction only during martingale steps)
+#   - Max 1 trade per BB-touch structure (prevents overtrading)
 
 # ⚠️ SECURITY NOTE:
-# Do NOT post your Deriv / Telegram tokens publicly.
-# Paste them only on your local machine.
+# DO NOT paste tokens publicly. Rotate any tokens you already shared.
 
 import asyncio
 import logging
@@ -27,7 +35,7 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "ZkOFWOlPtwnjqTS"
 APP_ID = 1089
 
-MARKETS = ["R_10", "R_25"]  # add more if you want
+MARKETS = ["R_10", "R_25"]
 
 COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 60
@@ -43,13 +51,24 @@ logger = logging.getLogger(__name__)
 TF_SEC = 60  # M1 candles
 CANDLES_COUNT = 120
 
-RSI_PERIOD = 14
 DURATION_MIN = 2  # ✅ keep 2-minute expiry (DO NOT TOUCH)
 
-# ========================= EMA50 SLOPE + DAILY TARGET =========================
+# Trend filter
 EMA_SLOPE_LOOKBACK = 10
-EMA_SLOPE_MIN = 0.2
-DAILY_PROFIT_TARGET = 2.0
+EMA_SLOPE_MIN = 0.20  # strong slope threshold
+
+# Bollinger Bands
+BB_PERIOD = 20
+BB_STD = 2.0
+BB_EXPAND_LOOKBACK = 3          # compare bandwidth now vs bandwidth N bars ago
+BB_EXPAND_MIN_RATIO = 1.02      # bandwidth_now >= bandwidth_prev * 1.02 (2% expansion)
+BB_TOUCH_EPS = 0.0              # optional extra buffer on touch (0.0 = exact)
+
+# Rejection candle rules
+MIN_BODY_RATIO = 0.55           # body >= 55% of candle range
+MIN_CANDLE_RANGE = 1e-6
+BULL_CLOSE_POS_MIN = 0.65       # bullish candle should close in top 35%
+BEAR_CLOSE_POS_MAX = 0.35       # bearish candle should close in bottom 35%
 
 # ========================= SECTIONS =========================
 SECTIONS_PER_DAY = 4
@@ -67,40 +86,12 @@ MARTINGALE_MULT = 1.8
 MARTINGALE_MAX_STEPS = 4
 MARTINGALE_MAX_STAKE = 16.0
 
-# ========================= CANDLE STRENGTH FILTER =========================
-MIN_BODY_RATIO = 0.45
-MIN_CANDLE_RANGE = 1e-6
-
 # ========================= ANTI RATE-LIMIT =========================
-TICKS_GLOBAL_MIN_INTERVAL = 0.35  # seconds between ANY ticks_history calls
-RATE_LIMIT_BACKOFF_BASE = 20      # seconds (will grow if rate limit repeats)
+TICKS_GLOBAL_MIN_INTERVAL = 0.35
+RATE_LIMIT_BACKOFF_BASE = 20
 
 # ========================= UI: REFRESH COOLDOWN =========================
 STATUS_REFRESH_COOLDOWN_SEC = 10
-
-# ========================= ADX + ATR FILTERS =========================
-ADX_PERIOD = 14
-ATR_PERIOD = 14
-
-ADX_MIN = 22.0       # trend strength threshold
-ATR_MIN = 0.0        # 0.0 = show ATR but don't block trades by ATR
-
-TREND_FILTER_MODE = "BOTH"  # "BOTH" requires ADX✅ and ATR✅, "EITHER" allows ADX✅ OR ATR✅
-
-# ========================= ✅ IMPROVEMENT SETTINGS =========================
-# 1) ATR-buffered breakout
-BREAKOUT_BUFFER_ATR = 0.15  # 15% of ATR
-
-# 2) EMA20 slope confirmation
-EMA20_SLOPE_LOOKBACK = 5
-EMA20_SLOPE_MIN = 0.08  # ✅ CHANGED from 0.15 -> 0.08 (more realistic on R10/R25 M1)
-
-# 3) Trend-adaptive RSI threshold pivot
-ADX_STRONG_TREND = 30.0
-
-# 4) Candle close-position filter
-BULL_CLOSE_POS_MIN = 0.70
-BEAR_CLOSE_POS_MAX = 0.30
 
 
 # ========================= INDICATOR MATH =========================
@@ -116,101 +107,28 @@ def calculate_ema(values, period: int):
     return ema
 
 
-def calculate_rsi(values, period=14):
-    values = np.array(values, dtype=float)
-    n = len(values)
-    if n < period + 2:
-        return np.array([])
+def calculate_bollinger(values, period=20, std=2.0):
+    """
+    Returns: mid, upper, lower arrays (same length as values) with NaNs until ready
+    """
+    v = np.array(values, dtype=float)
+    n = len(v)
+    if n < period:
+        return np.array([]), np.array([]), np.array([])
 
-    deltas = np.diff(values)
-    gains = np.where(deltas > 0, deltas, 0.0)
-    losses = np.where(deltas < 0, -deltas, 0.0)
+    mid = np.full(n, np.nan, dtype=float)
+    upper = np.full(n, np.nan, dtype=float)
+    lower = np.full(n, np.nan, dtype=float)
 
-    rsi = np.full(n, np.nan, dtype=float)
+    for i in range(period - 1, n):
+        window = v[i - period + 1 : i + 1]
+        m = float(np.mean(window))
+        s = float(np.std(window, ddof=0))
+        mid[i] = m
+        upper[i] = m + std * s
+        lower[i] = m - std * s
 
-    avg_gain = np.mean(gains[:period])
-    avg_loss = np.mean(losses[:period])
-    rs = avg_gain / (avg_loss + 1e-12)
-    rsi[period] = 100.0 - (100.0 / (1.0 + rs))
-
-    for i in range(period + 1, n):
-        gain = gains[i - 1]
-        loss = losses[i - 1]
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-        rs = avg_gain / (avg_loss + 1e-12)
-        rsi[i] = 100.0 - (100.0 / (1.0 + rs))
-
-    return rsi
-
-
-def calculate_atr(highs, lows, closes, period=14):
-    highs = np.array(highs, dtype=float)
-    lows = np.array(lows, dtype=float)
-    closes = np.array(closes, dtype=float)
-
-    n = len(closes)
-    if n < period + 2:
-        return np.array([])
-
-    prev_close = np.roll(closes, 1)
-    prev_close[0] = closes[0]
-
-    tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_close), np.abs(lows - prev_close)))
-
-    atr = np.full(n, np.nan, dtype=float)
-    atr[period] = np.mean(tr[1:period + 1])
-    for i in range(period + 1, n):
-        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
-
-    return atr
-
-
-def calculate_adx(highs, lows, closes, period=14):
-    highs = np.array(highs, dtype=float)
-    lows = np.array(lows, dtype=float)
-    closes = np.array(closes, dtype=float)
-
-    n = len(closes)
-    if n < period * 2 + 2:
-        return np.array([])
-
-    up_move = highs[1:] - highs[:-1]
-    down_move = lows[:-1] - lows[1:]
-
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    prev_close = closes[:-1]
-    tr = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - prev_close), np.abs(lows[1:] - prev_close)))
-
-    tr_s = np.zeros_like(tr)
-    plus_s = np.zeros_like(plus_dm)
-    minus_s = np.zeros_like(minus_dm)
-
-    tr_s[period - 1] = np.sum(tr[:period])
-    plus_s[period - 1] = np.sum(plus_dm[:period])
-    minus_s[period - 1] = np.sum(minus_dm[:period])
-
-    for i in range(period, len(tr)):
-        tr_s[i] = tr_s[i - 1] - (tr_s[i - 1] / period) + tr[i]
-        plus_s[i] = plus_s[i - 1] - (plus_s[i - 1] / period) + plus_dm[i]
-        minus_s[i] = minus_s[i - 1] - (minus_s[i - 1] / period) + minus_dm[i]
-
-    plus_di = 100.0 * (plus_s / (tr_s + 1e-12))
-    minus_di = 100.0 * (minus_s / (tr_s + 1e-12))
-    dx = 100.0 * (np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12))
-
-    adx = np.full(n, np.nan, dtype=float)
-    dx_full = np.full(n, np.nan, dtype=float)
-    dx_full[1:] = dx
-
-    start = period * 2
-    adx[start] = np.nanmean(dx_full[period:start + 1])
-    for i in range(start + 1, n):
-        adx[i] = ((adx[i - 1] * (period - 1)) + dx_full[i]) / period
-
-    return adx
+    return mid, upper, lower
 
 
 def build_candles_from_deriv(candles_raw):
@@ -274,7 +192,7 @@ class DerivSniperBot:
         self.martingale_step = 0
         self.martingale_halt = False
 
-        # ✅ store last trade direction for martingale lock
+        # Martingale lock direction (only lock when step > 0)
         self.last_signal = None  # "CALL" or "PUT"
 
         # sections
@@ -287,6 +205,10 @@ class DerivSniperBot:
 
         self.market_debug = {m: {} for m in MARKETS}
         self.last_processed_closed_t0 = {m: 0 for m in MARKETS}
+
+        # ✅ Max 1 trade per BB structure:
+        # store last structure key per symbol: (touch_t0, direction)
+        self.last_structure_key = {m: None for m in MARKETS}
 
         self.tz = ZoneInfo("Africa/Lagos")
         self.current_day = datetime.now(self.tz).date()
@@ -463,6 +385,9 @@ class DerivSniperBot:
             self.section_index = self._get_section_index_for_epoch(time.time())
             self.section_pause_until = 0.0
 
+            # reset structure keys daily
+            self.last_structure_key = {m: None for m in MARKETS}
+
         self._sync_section_if_needed()
 
     def can_auto_trade(self) -> tuple[bool, str]:
@@ -479,7 +404,7 @@ class DerivSniperBot:
             left = int(self.pause_until - time.time())
             return False, f"Paused until 12:00am WAT ({left}s)"
 
-        if self.total_profit_today >= DAILY_PROFIT_TARGET:
+        if self.total_profit_today >= 2.0:
             self.pause_until = self._next_midnight_epoch()
             return False, f"Daily target reached (+${self.total_profit_today:.2f})"
 
@@ -543,16 +468,19 @@ class DerivSniperBot:
                 ok_gate, gate = self.can_auto_trade()
 
                 candles = await self.fetch_real_m1_candles(symbol)
-                if len(candles) < 70:
+                if len(candles) < 80:
                     self.market_debug[symbol] = {
                         "time": time.time(),
                         "gate": "Waiting for more candles",
-                        "why": [f"Not enough candle history yet (need ~70, have {len(candles)})."],
+                        "why": [f"Need more history (have {len(candles)}, need ~80)."],
                     }
                     self._next_poll_epoch[symbol] = time.time() + 10
                     continue
 
-                pullback = candles[-3]
+                # Use:
+                #   touch candle = candles[-3]
+                #   confirm candle (closed) = candles[-2]
+                touch = candles[-3]
                 confirm = candles[-2]
                 confirm_t0 = int(confirm["t0"])
 
@@ -563,9 +491,8 @@ class DerivSniperBot:
                     continue
 
                 closes = [x["c"] for x in candles]
-                highs = [x["h"] for x in candles]
-                lows = [x["l"] for x in candles]
 
+                # EMAs
                 ema20_arr = calculate_ema(closes, 20)
                 ema50_arr = calculate_ema(closes, 50)
                 if len(ema20_arr) < 60 or len(ema50_arr) < 60:
@@ -577,10 +504,10 @@ class DerivSniperBot:
                     self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
 
-                ema20_pullback = float(ema20_arr[-3])
                 ema20_confirm = float(ema20_arr[-2])
                 ema50_confirm = float(ema50_arr[-2])
 
+                # EMA50 slope (strength)
                 slope_ok = False
                 ema50_slope = 0.0
                 ema50_rising = False
@@ -592,167 +519,123 @@ class DerivSniperBot:
                     ema50_falling = ema50_slope < -EMA_SLOPE_MIN
                     slope_ok = True
 
-                # EMA20 slope confirmation
-                ema20_slope_ok = False
-                ema20_slope = 0.0
-                ema20_rising = False
-                ema20_falling = False
-                if len(ema20_arr) >= (EMA20_SLOPE_LOOKBACK + 3):
-                    ema20_prev = float(ema20_arr[-(EMA20_SLOPE_LOOKBACK + 2)])
-                    ema20_slope = ema20_confirm - ema20_prev
-                    ema20_rising = ema20_slope > EMA20_SLOPE_MIN
-                    ema20_falling = ema20_slope < -EMA20_SLOPE_MIN
-                    ema20_slope_ok = True
-
-                rsi_arr = calculate_rsi(closes, RSI_PERIOD)
-                if len(rsi_arr) < 60 or np.isnan(rsi_arr[-2]):
+                # Bollinger Bands (use closes)
+                bb_mid, bb_upper, bb_lower = calculate_bollinger(closes, BB_PERIOD, BB_STD)
+                if len(bb_mid) < 60 or np.isnan(bb_mid[-2]) or np.isnan(bb_lower[-2]) or np.isnan(bb_upper[-2]):
                     self.market_debug[symbol] = {
                         "time": time.time(),
                         "gate": "Indicators",
-                        "why": ["RSI not ready yet."],
+                        "why": ["Bollinger Bands not ready yet."],
                     }
                     self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
-                rsi_now = float(rsi_arr[-2])
 
-                # ADX + ATR
-                atr_arr = calculate_atr(highs, lows, closes, ATR_PERIOD)
-                adx_arr = calculate_adx(highs, lows, closes, ADX_PERIOD)
+                lower_touch = float(bb_lower[-3])
+                upper_touch = float(bb_upper[-3])
+                lower_confirm = float(bb_lower[-2])
+                upper_confirm = float(bb_upper[-2])
 
-                atr_now = float(atr_arr[-2]) if len(atr_arr) and not np.isnan(atr_arr[-2]) else float("nan")
-                adx_now = float(adx_arr[-2]) if len(adx_arr) and not np.isnan(adx_arr[-2]) else float("nan")
+                # BB expanding (bandwidth rising)
+                bw_now = float(bb_upper[-2] - bb_lower[-2])
+                bw_prev_idx = max(0, len(bb_upper) - 2 - BB_EXPAND_LOOKBACK)
+                bw_prev = float(bb_upper[bw_prev_idx] - bb_lower[bw_prev_idx]) if not np.isnan(bb_upper[bw_prev_idx]) else bw_now
+                bb_expanding = (bw_now >= (bw_prev * BB_EXPAND_MIN_RATIO))
 
-                atr_ok = (not np.isnan(atr_now)) and (atr_now >= float(ATR_MIN))
-                adx_ok = (not np.isnan(adx_now)) and (adx_now >= float(ADX_MIN))
-
-                if TREND_FILTER_MODE.upper() == "EITHER":
-                    trend_filter_ok = adx_ok or atr_ok
-                else:
-                    trend_filter_ok = adx_ok and atr_ok
-
-                pb_high = float(pullback["h"])
-                pb_low = float(pullback["l"])
-                touched_ema20 = (pb_low <= ema20_pullback <= pb_high)
-
-                c_open = float(confirm["o"])
-                c_close = float(confirm["c"])
-                bull_confirm = c_close > c_open
-                bear_confirm = c_close < c_open
-
-                close_above_ema20 = c_close > ema20_confirm
-                close_below_ema20 = c_close < ema20_confirm
-
-                bodies = [abs(float(candles[i]["c"]) - float(candles[i]["o"])) for i in range(-22, -2)]
-                avg_body = float(np.mean(bodies)) if len(bodies) >= 10 else float(
-                    np.mean([abs(float(c["c"]) - float(c["o"])) for c in candles[-60:-2]])
-                )
-                last_body = abs(c_close - c_open)
-
-                c_high = float(confirm["h"])
-                c_low = float(confirm["l"])
-                c_range = max(MIN_CANDLE_RANGE, c_high - c_low)
-                body_ratio = last_body / c_range
-                strong_candle = body_ratio >= float(MIN_BODY_RATIO)
-
-                # Candle close-position filter
-                close_position = (c_close - c_low) / (c_range + 1e-12)
-                bull_close_strong = close_position >= float(BULL_CLOSE_POS_MIN)
-                bear_close_strong = close_position <= float(BEAR_CLOSE_POS_MAX)
-
-                spike_mult = 1.5
-                ema_diff_min = 0.40
-
-                spike_block = (avg_body > 0 and last_body > spike_mult * avg_body)
-                ema_diff = abs(ema20_confirm - ema50_confirm)
-                flat_block = ema_diff < ema_diff_min
-
+                # Trend direction
                 uptrend = ema20_confirm > ema50_confirm
                 downtrend = ema20_confirm < ema50_confirm
 
-                # Trend-adaptive RSI
-                if (not np.isnan(adx_now)) and (adx_now >= float(ADX_STRONG_TREND)):
-                    call_rsi_ok = (50.0 <= rsi_now <= 70.0)
-                    put_rsi_ok = (30.0 <= rsi_now <= 50.0)
-                else:
-                    call_rsi_ok = (45.0 <= rsi_now <= 60.0)
-                    put_rsi_ok = (40.0 <= rsi_now <= 55.0)
+                # Candle stats for confirm candle (rejection candle)
+                c_open = float(confirm["o"])
+                c_close = float(confirm["c"])
+                c_high = float(confirm["h"])
+                c_low = float(confirm["l"])
+                c_range = max(MIN_CANDLE_RANGE, c_high - c_low)
+                body = abs(c_close - c_open)
+                body_ratio = body / c_range
+                strong_reject = body_ratio >= float(MIN_BODY_RATIO)
 
-                # ATR-buffered breakout
-                atr_for_breakout = atr_now if (not np.isnan(atr_now)) else 0.0
-                breakout_call = c_close > (pb_high + float(BREAKOUT_BUFFER_ATR) * atr_for_breakout)
-                breakout_put = c_close < (pb_low  - float(BREAKOUT_BUFFER_ATR) * atr_for_breakout)
+                close_pos = (c_close - c_low) / (c_range + 1e-12)
+                bull_close_strong = close_pos >= float(BULL_CLOSE_POS_MIN)
+                bear_close_strong = close_pos <= float(BEAR_CLOSE_POS_MAX)
 
+                bull_confirm = c_close > c_open
+                bear_confirm = c_close < c_open
+
+                # Touch candle touches band in trend direction
+                t_low = float(touch["l"])
+                t_high = float(touch["h"])
+                touch_lower = t_low <= (lower_touch + BB_TOUCH_EPS)
+                touch_upper = t_high >= (upper_touch - BB_TOUCH_EPS)
+
+                # Confirm closes back inside
+                back_inside_long = c_close > lower_confirm
+                back_inside_short = c_close < upper_confirm
+
+                # ✅ Setup keys: "one trade per structure"
+                # A "structure" is defined by the touch candle timestamp + direction.
+                call_structure_key = (int(touch["t0"]), "CALL")
+                put_structure_key = (int(touch["t0"]), "PUT")
+
+                # Entry rules
                 call_ready = (
                     uptrend
                     and slope_ok and ema50_rising
-                    and ema20_slope_ok and ema20_rising
-                    and touched_ema20 and bull_confirm
-                    and strong_candle and bull_close_strong
-                    and close_above_ema20 and call_rsi_ok
-                    and not spike_block and not flat_block
-                    and breakout_call
-                    and trend_filter_ok
+                    and bb_expanding
+                    and touch_lower
+                    and back_inside_long
+                    and bull_confirm
+                    and strong_reject and bull_close_strong
+                    and (self.last_structure_key[symbol] != call_structure_key)
                 )
+
                 put_ready = (
                     downtrend
                     and slope_ok and ema50_falling
-                    and ema20_slope_ok and ema20_falling
-                    and touched_ema20 and bear_confirm
-                    and strong_candle and bear_close_strong
-                    and close_below_ema20 and put_rsi_ok
-                    and not spike_block and not flat_block
-                    and breakout_put
-                    and trend_filter_ok
+                    and bb_expanding
+                    and touch_upper
+                    and back_inside_short
+                    and bear_confirm
+                    and strong_reject and bear_close_strong
+                    and (self.last_structure_key[symbol] != put_structure_key)
                 )
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
 
-                # ✅ FIXED: Martingale re-validation lock
-                # If martingale_step > 0, ONLY allow SAME direction as last_signal.
-                # Do NOT reset martingale_step here.
+                # ✅ Martingale direction lock:
+                # if martingale_step > 0, only allow trades in last_signal direction
                 if self.martingale_step > 0 and self.last_signal:
                     if signal is None:
                         call_ready = False
                         put_ready = False
                     elif signal != self.last_signal:
-                        # block opposite-direction setups during martingale
                         call_ready = False
                         put_ready = False
 
+                # Debug labels
                 trend_label = "UPTREND" if uptrend else "DOWNTREND" if downtrend else "SIDEWAYS"
-                ema_label = "EMA20 ABOVE EMA50" if uptrend else "EMA20 BELOW EMA50" if downtrend else "EMA20 = EMA50"
-                trend_strength = "STRONG" if not flat_block else "WEAK"
-                pullback_label = "PULLBACK TOUCHED ✅" if touched_ema20 else "WAITING PULLBACK…"
-                confirm_close_label = (
-                    "CONFIRM CLOSE > EMA20 ✅" if close_above_ema20 else
-                    "CONFIRM CLOSE < EMA20 ✅" if close_below_ema20 else
-                    "CONFIRM CLOSE ON EMA20"
-                )
                 slope_label = "EMA50 SLOPE ↑" if ema50_rising else "EMA50 SLOPE ↓" if ema50_falling else "EMA50 SLOPE FLAT"
+                bb_label = f"BB Expanding: {'✅' if bb_expanding else '❌'} (bw {bw_now:.5f} vs {bw_prev:.5f})"
 
-                block_label_parts = []
-                if spike_block:
-                    block_label_parts.append("SPIKE BLOCK")
-                if flat_block:
-                    block_label_parts.append("WEAK/FLAT TREND")
+                block_parts = []
                 if not slope_ok:
-                    block_label_parts.append("SLOPE N/A")
-                if not ema20_slope_ok:
-                    block_label_parts.append("EMA20 SLOPE N/A")
-                if not strong_candle:
-                    block_label_parts.append("WEAK CANDLE")
-                if not adx_ok:
-                    block_label_parts.append("ADX LOW")
-                if not atr_ok:
-                    block_label_parts.append("ATR LOW")
-                if not trend_filter_ok:
-                    block_label_parts.append("TREND FILTER FAIL")
-
-                # show martingale lock status
+                    block_parts.append("SLOPE N/A")
+                if uptrend and not ema50_rising:
+                    block_parts.append("EMA50 NOT RISING")
+                if downtrend and not ema50_falling:
+                    block_parts.append("EMA50 NOT FALLING")
+                if not bb_expanding:
+                    block_parts.append("BB NOT EXPANDING")
+                if uptrend and not touch_lower:
+                    block_parts.append("NO LOWER BB TOUCH")
+                if downtrend and not touch_upper:
+                    block_parts.append("NO UPPER BB TOUCH")
+                if signal is None:
+                    block_parts.append("NO SIGNAL")
                 if self.martingale_step > 0 and self.last_signal:
-                    block_label_parts.append(f"MARTI LOCK: {self.last_signal}")
+                    block_parts.append(f"MARTI LOCK: {self.last_signal}")
 
-                block_label = " | ".join(block_label_parts) if block_label_parts else "OK"
+                block_label = " | ".join(block_parts) if block_parts else "OK"
 
                 why = []
                 if not ok_gate:
@@ -769,25 +652,11 @@ class DerivSniperBot:
                     "gate": gate,
                     "last_closed": confirm_t0,
                     "signal": signal,
-
                     "trend_label": trend_label,
-                    "ema_label": ema_label,
-                    "trend_strength": trend_strength,
-                    "pullback_label": pullback_label,
-                    "confirm_close_label": confirm_close_label,
                     "slope_label": slope_label,
-                    "block_label": block_label,
-
-                    "ema50_slope": ema50_slope,
-                    "rsi_now": rsi_now,
+                    "bb_label": bb_label,
                     "body_ratio": body_ratio,
-
-                    "adx_now": adx_now,
-                    "atr_now": atr_now,
-                    "adx_ok": adx_ok,
-                    "atr_ok": atr_ok,
-                    "trend_filter_ok": trend_filter_ok,
-
+                    "block_label": block_label,
                     "why": why[:10],
                 }
 
@@ -797,9 +666,11 @@ class DerivSniperBot:
                     continue
 
                 if call_ready:
-                    await self.execute_trade("CALL", symbol, source="AUTO", rsi_now=rsi_now, ema50_slope=ema50_slope)
+                    self.last_structure_key[symbol] = call_structure_key
+                    await self.execute_trade("CALL", symbol, source="AUTO")
                 elif put_ready:
-                    await self.execute_trade("PUT", symbol, source="AUTO", rsi_now=rsi_now, ema50_slope=ema50_slope)
+                    self.last_structure_key[symbol] = put_structure_key
+                    await self.execute_trade("PUT", symbol, source="AUTO")
 
             except asyncio.CancelledError:
                 break
@@ -818,8 +689,7 @@ class DerivSniperBot:
             await asyncio.sleep(0.05)
 
     # ========================= PAYOUT MODE + MARTINGALE =========================
-    async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL",
-                            rsi_now: float = 0.0, ema50_slope: float = 0.0):
+    async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL"):
         if not self.api or self.active_trade_info:
             return
 
@@ -847,7 +717,7 @@ class DerivSniperBot:
                     "basis": "payout",
                     "contract_type": side,
                     "currency": "USD",
-                    "duration": int(DURATION_MIN),
+                    "duration": int(DURATION_MIN),     # ✅ UNCHANGED
                     "duration_unit": "m",
                     "symbol": symbol,
                 }
@@ -887,11 +757,12 @@ class DerivSniperBot:
 
                 if source == "AUTO":
                     self.trades_today += 1
-                    self.last_signal = side  # ✅ remember direction during martingale sequence
+                    # remember direction for martingale lock
+                    self.last_signal = side
 
                 safe_symbol = str(symbol).replace("_", " ")
                 msg = (
-                    f"🚀 {side} TRADE OPENED\n"
+                    f"🚀 {side} TRADE OPENED (BB Strategy)\n"
                     f"🛒 Market: {safe_symbol}\n"
                     f"⏱ Expiry: {DURATION_MIN}m\n"
                     f"🎁 Payout: ${payout:.2f}\n"
@@ -899,18 +770,18 @@ class DerivSniperBot:
                     f"💵 Stake (Deriv): ${ask_price:.2f}\n"
                     f"🤖 Source: {source}\n"
                     f"🛡️ Martingale Lock: {self.last_signal if self.martingale_step > 0 else 'OFF'}\n"
-                    f"🎯 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}"
+                    f"🎯 Today PnL: {self.total_profit_today:+.2f}"
                 )
                 await self.safe_send_tg(msg)
 
-                asyncio.create_task(self.check_result(self.active_trade_info, source, side, rsi_now, ema50_slope))
+                asyncio.create_task(self.check_result(self.active_trade_info, source))
 
             except Exception as e:
                 logger.error(f"Trade error: {e}")
                 await self.safe_send_tg(f"⚠️ Trade error:\n{e}")
 
-    async def check_result(self, cid: int, source: str, side: str, rsi_now: float, ema50_slope: float):
-        await asyncio.sleep(int(DURATION_MIN) * 60 + 5)
+    async def check_result(self, cid: int, source: str):
+        await asyncio.sleep(int(DURATION_MIN) * 60 + 5)  # ✅ UNCHANGED
         try:
             res = await self.safe_deriv_call(
                 "proposal_open_contract",
@@ -941,9 +812,9 @@ class DerivSniperBot:
                     self.consecutive_losses = 0
                     self.martingale_step = 0
                     self.martingale_halt = False
-                    self.last_signal = None  # ✅ clear direction after win
+                    self.last_signal = None  # clear after win
 
-                if self.total_profit_today >= DAILY_PROFIT_TARGET:
+                if self.total_profit_today >= 2.0:
                     self.pause_until = self._next_midnight_epoch()
 
             await self.fetch_balance()
@@ -963,7 +834,7 @@ class DerivSniperBot:
                     f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n"
                     f"🧩 Section: {self.section_index}/{SECTIONS_PER_DAY} | Section PnL: {self.section_profit:+.2f} | Sections won: {self.sections_won_today}\n"
                     f"📊 Today: {self.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {self.total_losses_today} | Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
-                    f"💵 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
+                    f"💵 Today PnL: {self.total_profit_today:+.2f}\n"
                     f"🎁 Next payout: ${next_payout:.2f} (step {self.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
                     f"🛡️ Martingale Lock: {self.last_signal if self.martingale_step > 0 else 'OFF'}\n"
                     f"💰 Balance: {self.balance}"
@@ -1010,34 +881,12 @@ def format_market_detail(sym: str, d: dict) -> str:
     signal = d.get("signal") or "—"
 
     trend_label = d.get("trend_label", "—")
-    ema_label = d.get("ema_label", "—")
-    trend_strength = d.get("trend_strength", "—")
-    pullback_label = d.get("pullback_label", "—")
-    confirm_close_label = d.get("confirm_close_label", "—")
     slope_label = d.get("slope_label", "—")
+    bb_label = d.get("bb_label", "—")
+    body_ratio = d.get("body_ratio", None)
     block_label = d.get("block_label", "—")
 
-    rsi_now = d.get("rsi_now", None)
-    ema50_slope = d.get("ema50_slope", None)
-    body_ratio = d.get("body_ratio", None)
-
-    adx_now = d.get("adx_now", None)
-    atr_now = d.get("atr_now", None)
-    adx_ok = d.get("adx_ok", False)
-    atr_ok = d.get("atr_ok", False)
-
-    adx_line = "ADX: —"
-    atr_line = "ATR: —"
-    if isinstance(adx_now, (int, float)) and not np.isnan(adx_now):
-        adx_line = f"ADX: {adx_now:.2f} {'✅' if adx_ok else '❌'} (min {ADX_MIN})"
-    if isinstance(atr_now, (int, float)) and not np.isnan(atr_now):
-        atr_line = f"ATR: {atr_now:.5f} {'✅' if atr_ok else '❌'} (min {ATR_MIN})"
-
     extra = []
-    if isinstance(rsi_now, (int, float)) and not np.isnan(rsi_now):
-        extra.append(f"RSI: {rsi_now:.2f}")
-    if isinstance(ema50_slope, (int, float)) and not np.isnan(ema50_slope):
-        extra.append(f"EMA50 slope: {ema50_slope:.3f}")
     if isinstance(body_ratio, (int, float)) and not np.isnan(body_ratio):
         extra.append(f"Body ratio: {body_ratio:.2f}")
     extra_line = " | ".join(extra) if extra else "—"
@@ -1050,13 +899,9 @@ def format_market_detail(sym: str, d: dict) -> str:
         f"Gate: {gate}\n"
         f"Last closed: {fmt_time_hhmmss(last_closed)}\n"
         f"────────────────\n"
-        f"Trend: {trend_label} ({trend_strength})\n"
-        f"{ema_label}\n"
+        f"Trend: {trend_label}\n"
         f"{slope_label}\n"
-        f"{pullback_label}\n"
-        f"{confirm_close_label}\n"
-        f"{adx_line}\n"
-        f"{atr_line}\n"
+        f"{bb_label}\n"
         f"Stats: {extra_line}\n"
         f"Filters: {block_label}\n"
         f"Signal: {signal}\n"
@@ -1099,7 +944,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             return
         bot_logic.is_scanning = True
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
-        await _safe_edit(q, "🔍 SCANNER ACTIVE\n✅ Press STATUS to monitor.", reply_markup=main_keyboard())
+        await _safe_edit(q, "🔍 SCANNER ACTIVE (BB Strategy)\n✅ Press STATUS to monitor.", reply_markup=main_keyboard())
 
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
@@ -1171,9 +1016,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"🛡️ Martingale Lock: {bot_logic.last_signal if bot_logic.martingale_step > 0 else 'OFF'}\n"
             f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
-            f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
-            f"📌 Trend Filters: ADX(min {ADX_MIN}) + ATR(min {ATR_MIN}) | Mode: {TREND_FILTER_MODE}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
             f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
             f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
@@ -1191,9 +1034,8 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        "💎 Deriv Bot\n"
-        f"🕯 Timeframe: M1 | ⏱ Expiry: {DURATION_MIN}m\n"
-        "✅ Anti-rate-limit enabled (ticks_history once/minute per market)\n",
+        "💎 Deriv Bot (Bollinger Strategy)\n"
+        f"🕯 Timeframe: M1 | ⏱ Expiry: {DURATION_MIN}m\n",
         reply_markup=main_keyboard(),
     )
 
