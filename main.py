@@ -89,16 +89,6 @@ DONCHIAN_WIDTH_ATR_MAX = 8.0        # (Donchian width / ATR) must be <= this
 FOLLOW_THROUGH_BODY_ATR_MIN = 0.60  # body/ATR in breakout direction must be >= this
 # ================================================================================
 
-# ========================= 2 BREAKOUT MODES (ADDED ONLY) =========================
-# Manual switching between:
-# - M1 breakout: 1-minute candles, 5-minute expiry
-# - M5 breakout: 5-minute candles, 20-minute expiry
-TIMEFRAME_CONFIG = {
-    "M1": {"TF_SEC": 60, "DURATION_MIN": 5, "CANDLES_COUNT": 300},
-    "M5": {"TF_SEC": 300, "DURATION_MIN": 20, "CANDLES_COUNT": 220},
-}
-# ================================================================================
-
 # ========================= ANTI RATE-LIMIT =========================
 TICKS_GLOBAL_MIN_INTERVAL = 0.45
 RATE_LIMIT_BACKOFF_BASE = 20
@@ -269,7 +259,6 @@ class DerivBreakoutBot:
         self.active_trade_info = None
         self.active_market = "None"
         self.trade_start_time = 0.0
-        self.active_trade_duration_sec = 0  # (ADDED ONLY) keeps correct expiry even if mode switches
 
         self.cooldown_until = 0.0
         self.trades_today = 0
@@ -299,24 +288,6 @@ class DerivBreakoutBot:
         self._rate_limit_strikes = {m: 0 for m in MARKETS}
 
         self.status_cooldown_until = 0.0
-
-        # (ADDED ONLY) current breakout mode
-        self.tf_mode = "M5"
-
-    # (ADDED ONLY)
-    def _cfg(self) -> dict:
-        return TIMEFRAME_CONFIG.get(self.tf_mode, {"TF_SEC": TF_SEC, "DURATION_MIN": DURATION_MIN, "CANDLES_COUNT": CANDLES_COUNT})
-
-    # (ADDED ONLY)
-    def set_mode(self, mode: str):
-        if mode not in TIMEFRAME_CONFIG:
-            return
-        self.tf_mode = mode
-        # force re-scan on next loop with the new granularity
-        for m in MARKETS:
-            self.last_processed_closed_t0[m] = 0
-            self._next_poll_epoch[m] = 0.0
-            self.market_debug[m] = {}
 
     @staticmethod
     def _is_gatewayish_error(msg: str) -> bool:
@@ -478,13 +449,12 @@ class DerivBreakoutBot:
 
     # ---------- market data ----------
     async def fetch_candles(self, symbol: str):
-        cfg = self._cfg()
         payload = {
             "ticks_history": symbol,
             "end": "latest",
-            "count": int(cfg["CANDLES_COUNT"]),
+            "count": CANDLES_COUNT,
             "style": "candles",
-            "granularity": int(cfg["TF_SEC"]),
+            "granularity": TF_SEC,
         }
         data = await self.safe_ticks_history(payload, retries=4)
         return build_candles_from_deriv(data.get("candles", []))
@@ -505,10 +475,8 @@ class DerivBreakoutBot:
         self.market_tasks = {sym: asyncio.create_task(self.scan_market(sym)) for sym in MARKETS}
         try:
             while self.is_scanning:
-                if self.active_trade_info:
-                    dur = int(self.active_trade_duration_sec or (self._cfg()["DURATION_MIN"] * 60))
-                    if (time.time() - self.trade_start_time > (dur + 180)):
-                        self.active_trade_info = None
+                if self.active_trade_info and (time.time() - self.trade_start_time > (DURATION_MIN * 60 + 180)):
+                    self.active_trade_info = None
                 await asyncio.sleep(1)
         finally:
             for t in self.market_tasks.values():
@@ -551,9 +519,6 @@ class DerivBreakoutBot:
 
                 ok_gate, gate = self.can_auto_trade()
 
-                cfg = self._cfg()
-                tf_sec = int(cfg["TF_SEC"])
-
                 candles = await self.fetch_candles(symbol)
                 if len(candles) < (DONCHIAN_LEN + 80):
                     self.market_debug[symbol] = {
@@ -572,7 +537,7 @@ class DerivBreakoutBot:
 
                 confirm = candles[-2]
                 confirm_t0 = int(confirm["t0"])
-                next_closed_epoch = confirm_t0 + tf_sec
+                next_closed_epoch = confirm_t0 + TF_SEC
                 self._next_poll_epoch[symbol] = float(next_closed_epoch + 0.30)
 
                 if self.last_processed_closed_t0[symbol] == confirm_t0:
@@ -609,7 +574,13 @@ class DerivBreakoutBot:
                 atr_now = float(atr[-2]) if len(atr) and not np.isnan(atr[-2]) else float("nan")
                 adx_now = float(adx[-2]) if len(adx) and not np.isnan(adx[-2]) else float("nan")
                 atr_ok = is_finite(atr_now) and atr_now > 1e-12
-                adx_ok = is_finite(adx_now) and adx_now >= float(ADX_MIN)
+
+                # ===================== ADX CHANGE (BREAKOUT, NOT PULLBACK) =====================
+                # Instead of requiring ADX >= ADX_MIN (trend already in motion),
+                # we only require ADX to be RISING (momentum expansion starting).
+                adx_prev = float(adx[-3]) if len(adx) >= 4 and not np.isnan(adx[-3]) else float("nan")
+                adx_ok = is_finite(adx_now) and is_finite(adx_prev) and (adx_now > adx_prev)
+                # ==============================================================================
 
                 # ====== Trade-quality Upgrade A: ATR compression (added only) ======
                 atr_mean = float("nan")
@@ -734,11 +705,10 @@ class DerivBreakoutBot:
                 missing_put = self._missing_for_side("PUT", checks)
 
                 why = []
-                why.append(f"Mode: {self.tf_mode} | TF: {tf_sec//60}m | Exp: {int(cfg['DURATION_MIN'])}m")
                 why.append(f"Gate: {gate}")
                 why.append(f"Confirm close: {c_close:.5f} | Live price: {last_price:.5f}" if is_finite(last_price) else f"Confirm close: {c_close:.5f} | Live price: —")
                 why.append(f"Next candle closes: {fmt_time_hhmmss(next_closed_epoch)} (WAT)")
-                why.append(f"ADX {adx_now:.2f} (min {ADX_MIN}) | ATR {atr_now:.5f}")
+                why.append(f"ADX {adx_now:.2f} (prev {adx_prev:.2f}) | ATR {atr_now:.5f}")
                 if atr_ok:
                     why.append(f"EMA diff/ATR {ema_diff_atr:.3f} (min {EMA_DIFF_ATR_MIN})")
                     why.append(f"EMA50 slope/ATR {ema50_slope_atr:.3f} (min {EMA_SLOPE_ATR_MIN})")
@@ -810,10 +780,6 @@ class DerivBreakoutBot:
             try:
                 import math
 
-                cfg = self._cfg()
-                duration_min = int(cfg["DURATION_MIN"])
-                tf_sec = int(cfg["TF_SEC"])
-
                 payout = self.calc_payout_for_step()
 
                 proposal_req = {
@@ -822,7 +788,7 @@ class DerivBreakoutBot:
                     "basis": "payout",
                     "contract_type": side,
                     "currency": "USD",
-                    "duration": int(duration_min),
+                    "duration": int(DURATION_MIN),
                     "duration_unit": "m",
                     "symbol": symbol,
                 }
@@ -862,7 +828,6 @@ class DerivBreakoutBot:
                 self.active_trade_info = int(buy["buy"]["contract_id"])
                 self.active_market = symbol
                 self.trade_start_time = time.time()
-                self.active_trade_duration_sec = int(duration_min * 60)
 
                 if source == "AUTO":
                     self.trades_today += 1
@@ -871,7 +836,7 @@ class DerivBreakoutBot:
                 await self.safe_send_tg(
                     f"🚀 {side} TRADE OPENED\n"
                     f"🛒 Market: {safe_symbol}\n"
-                    f"🧭 Mode: {self.tf_mode} | 🕯 {tf_sec//60}m candles | ⏱ Expiry: {duration_min}m\n"
+                    f"🕯 {TF_SEC//60}m candles | ⏱ Expiry: {DURATION_MIN}m\n"
                     f"🎲 Martingale: step {self.martingale_step}/{MARTINGALE_MAX_STEPS} (x{MARTINGALE_MULT:.2f})\n"
                     f"🎁 Payout: ${payout:.2f}\n"
                     f"💵 Stake (Deriv): ${ask_price:.2f}\n"
@@ -887,8 +852,7 @@ class DerivBreakoutBot:
                 await self.safe_send_tg(f"⚠️ Trade error:\n{e}")
 
     async def check_result(self, cid: int, source: str):
-        wait_sec = int(self.active_trade_duration_sec or (self._cfg()["DURATION_MIN"] * 60)) + 8
-        await asyncio.sleep(wait_sec)
+        await asyncio.sleep(int(DURATION_MIN) * 60 + 8)
         try:
             res = await self.safe_deriv_call(
                 "proposal_open_contract",
@@ -939,7 +903,6 @@ class DerivBreakoutBot:
             )
         finally:
             self.active_trade_info = None
-            self.active_trade_duration_sec = 0
             self.cooldown_until = time.time() + COOLDOWN_SEC
 
 
@@ -952,10 +915,6 @@ def main_keyboard():
             [
                 InlineKeyboardButton("▶️ START", callback_data="START_SCAN"),
                 InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN"),
-            ],
-            [
-                InlineKeyboardButton("🕯 1M BREAKOUT (5m exp)", callback_data="SET_M1"),
-                InlineKeyboardButton("🕯 5M BREAKOUT (20m exp)", callback_data="SET_M5"),
             ],
             [
                 InlineKeyboardButton("📊 STATUS (DETAILED)", callback_data="STATUS"),
@@ -980,7 +939,7 @@ def _humanize_key(k: str) -> str:
         "ATR_OK": "ATR ready",
         "ATR_COMPRESS_OK": "ATR compression (calm before breakout)",
         "DONCHIAN_SQUEEZE_OK": "Donchian squeeze (tight range)",
-        "ADX_OK": "ADX trend strength (trend vs range)",
+        "ADX_OK": "ADX momentum expanding (rising)",
         "BIAS_UP": "Trend bias UP (EMA20 > EMA50)",
         "BIAS_DOWN": "Trend bias DOWN (EMA20 < EMA50)",
         "EMA50_RISING": "EMA50 rising strongly (slope filter)",
@@ -1183,14 +1142,6 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         ok = await bot_logic.connect()
         await _safe_edit(q, "✅ LIVE CONNECTED" if ok else "❌ LIVE Failed", reply_markup=main_keyboard())
 
-    elif q.data == "SET_M1":
-        bot_logic.set_mode("M1")
-        await _safe_edit(q, "✅ Switched to 1M Breakout (1m candles • 5m expiry)", reply_markup=main_keyboard())
-
-    elif q.data == "SET_M5":
-        bot_logic.set_mode("M5")
-        await _safe_edit(q, "✅ Switched to 5M Breakout (5m candles • 20m expiry)", reply_markup=main_keyboard())
-
     elif q.data == "START_SCAN":
         if not bot_logic.api:
             await _safe_edit(q, "❌ Connect first.", reply_markup=main_keyboard())
@@ -1199,14 +1150,11 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic.martingale_halt = False
         bot_logic.is_scanning = True
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
-
-        cfg = bot_logic._cfg()
         await _safe_edit(
             q,
             f"🔍 SCANNER ACTIVE\n"
-            f"🧭 Mode: {bot_logic.tf_mode}\n"
             f"✅ Donchian({DONCHIAN_LEN}) breakout + ATR buffer(k={ATR_BREAKOUT_K})\n"
-            f"🕯 {int(cfg['TF_SEC'])//60}m candles | ⏱ {int(cfg['DURATION_MIN'])}m expiry\n"
+            f"🕯 {TF_SEC//60}m candles | ⏱ {DURATION_MIN}m expiry\n"
             f"🎲 Martingale: {MARTINGALE_MAX_STEPS} steps | x{MARTINGALE_MULT:.2f}",
             reply_markup=main_keyboard(),
         )
@@ -1232,10 +1180,6 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_logic._daily_reset_if_needed()
         await bot_logic.fetch_balance()
 
-        cfg = bot_logic._cfg()
-        tf_sec = int(cfg["TF_SEC"])
-        duration_min = int(cfg["DURATION_MIN"])
-
         now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
         _ok, gate = bot_logic.can_auto_trade()
 
@@ -1248,8 +1192,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                     retries=4,
                 )
                 pnl = float(res["proposal_open_contract"].get("profit", 0))
-                dur = int(bot_logic.active_trade_duration_sec or (duration_min * 60))
-                rem = max(0, dur - int(time.time() - bot_logic.trade_start_time))
+                rem = max(0, int(DURATION_MIN * 60) - int(time.time() - bot_logic.trade_start_time))
                 icon = "✅ PROFIT" if pnl > 0 else "❌ LOSS" if pnl < 0 else "➖ FLAT"
                 mkt_clean = str(bot_logic.active_market).replace("_", " ")
                 trade_status = (
@@ -1269,8 +1212,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"🧭 Mode: {bot_logic.tf_mode}\n"
-            f"🕯 Candles: {tf_sec//60}m | ⏱ Expiry: {duration_min}m\n"
+            f"🕯 Candles: {TF_SEC//60}m | ⏱ Expiry: {DURATION_MIN}m\n"
             f"🎲 Martingale: step {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS} (x{MARTINGALE_MULT:.2f}) | Next payout: ${next_payout:.2f}\n"
             f"🧊 Cooldown: {cooldown_left}s left (base {COOLDOWN_SEC}s)\n"
             f"⏸ Pause: {pause_left}s left\n"
@@ -1292,11 +1234,9 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await _safe_edit(q, header + details, reply_markup=main_keyboard())
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    cfg = bot_logic._cfg()
     await u.message.reply_text(
         "💎 Deriv Breakout Bot\n"
-        f"🧭 Mode: {bot_logic.tf_mode}\n"
-        f"🕯 Timeframe: {int(cfg['TF_SEC'])//60}m | ⏱ Expiry: {int(cfg['DURATION_MIN'])}m\n"
+        f"🕯 Timeframe: {TF_SEC//60}m | ⏱ Expiry: {DURATION_MIN}m\n"
         f"📌 Donchian({DONCHIAN_LEN}) breakout + ATR buffer + ADX/RSI\n"
         f"🎲 Martingale: {MARTINGALE_MAX_STEPS} steps | x{MARTINGALE_MULT:.2f}\n",
         reply_markup=main_keyboard(),
