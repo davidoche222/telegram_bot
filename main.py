@@ -49,7 +49,7 @@ DAILY_PROFIT_TARGET = 2.0
 
 # ========================= PAYOUT MODE =========================
 USE_PAYOUT_MODE = True
-PAYOUT_TARGET = 500
+PAYOUT_TARGET = 1
 MIN_PAYOUT = 0.35
 MAX_STAKE_ALLOWED = 10.00
 
