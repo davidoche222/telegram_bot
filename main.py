@@ -21,7 +21,7 @@ REAL_TOKEN = "ZkOFWOlPtwnjqTS"
 APP_ID = 1089
 
 # ✅ markets
-MARKETS = ["R_10", "R_25"]
+MARKETS = ["R_10", "R_25"]  # you can add "R_50" later if you want
 
 TELEGRAM_TOKEN = "8253450930:AAHUhPk9TML-8kZlA9UaHZZvTUGdurN9MVY"
 TELEGRAM_CHAT_ID = "7634818949"
@@ -30,13 +30,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ========================= TWO MODES (MANUAL SWITCHING) =========================
-# M5 = 5-minute candles, 20-minute expiry
-# M1 = 1-minute candles, 5-minute expiry
+# NOTE: Strategy logic uses:
+# - 5M for STRUCTURE + breakout confirmation
+# - 1M for ENTRY (retest/pullback)
+# Mode ONLY controls expiry duration (M1=5m, M5=20m).
 MODE_CONFIG = {
     "M5": {"TF_SEC": 300, "DURATION_MIN": 20},
     "M1": {"TF_SEC": 60,  "DURATION_MIN": 5},
 }
-DEFAULT_MODE = "M5"
+DEFAULT_MODE = "M1"  # recommended with this approach
 CANDLES_COUNT = 220
 
 # ========================= TRADE & RISK SETTINGS =========================
@@ -58,22 +60,23 @@ MARTINGALE_MULT = 1.80
 MARTINGALE_MAX_STEPS = 3
 MARTINGALE_HALT_ON_MAX = True
 
-# ========================= CLEAN BREAKOUT SETTINGS =========================
-# Keep it simple:
-# - Donchian breakout using ATR buffer
-# - Spike filter (avoid huge candles)
-# - Optional EMA bias filter (kept ON by default)
-ATR_PERIOD = 14
-DONCHIAN_LEN = 20
-ATR_BREAKOUT_K = 0.15  # buffer = k * ATR
-
-USE_EMA_BIAS = True    # If you want more trades, set False
+# ========================= CLEAN BREAKOUT (5M structure + 1M entry) =========================
+# Indicators used:
+# - EMA20 / EMA50 on 5M (trend filter)
+# - Donchian range on 5M (support/resistance box)
 EMA_FAST = 20
 EMA_SLOW = 50
+DONCHIAN_LEN = 20
 
-MIN_CANDLE_RANGE = 1e-6
-SPIKE_RANGE_ATR = 2.5
-SPIKE_BODY_ATR = 1.8
+USE_EMA_BIAS = True  # recommended: BUY only if EMA20>EMA50, SELL only if EMA20<EMA50
+
+# Breakout confirmation on 5M (clean candle body vs recent)
+BODY_LOOKBACK = 10
+BODY_STRONG_MULT = 1.10  # breakout candle body must be >= median_body * this
+
+# 1M retest entry tolerance
+RETEST_TOL_PCT = 0.0003  # 0.03% of price (e.g., 5000 -> 1.5 points)
+SETUP_TTL_MIN = 25       # expire setup if no retest within this time window
 
 # ========================= ANTI RATE-LIMIT =========================
 TICKS_GLOBAL_MIN_INTERVAL = 0.45
@@ -94,28 +97,6 @@ def calculate_ema(values, period: int):
     for i in range(1, len(values)):
         ema[i] = values[i] * k + ema[i - 1] * (1 - k)
     return ema
-
-
-def calculate_atr(highs, lows, closes, period=14):
-    highs = np.array(highs, dtype=float)
-    lows = np.array(lows, dtype=float)
-    closes = np.array(closes, dtype=float)
-
-    n = len(closes)
-    if n < period + 2:
-        return np.array([])
-
-    prev_close = np.roll(closes, 1)
-    prev_close[0] = closes[0]
-
-    tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_close), np.abs(lows - prev_close)))
-
-    atr = np.full(n, np.nan, dtype=float)
-    atr[period] = np.mean(tr[1:period + 1])
-    for i in range(period + 1, n):
-        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
-
-    return atr
 
 
 def build_candles_from_deriv(candles_raw):
@@ -156,6 +137,10 @@ def is_finite(x) -> bool:
     return isinstance(x, (int, float)) and np.isfinite(x)
 
 
+def _yn(v: bool) -> str:
+    return "YES ✅" if v else "NO ❌"
+
+
 # ========================= BOT CORE =========================
 class DerivBreakoutBot:
     def __init__(self):
@@ -164,14 +149,13 @@ class DerivBreakoutBot:
         self.active_token = None
         self.account_type = "None"
 
-        # ✅ manual switching mode
+        # manual switching: affects expiry only
         self.mode = DEFAULT_MODE  # "M5" or "M1"
 
         self.is_scanning = False
         self.scanner_task = None
         self.market_tasks = {}
 
-        # Active trade stored as dict so mode switch won't break remaining calc
         # {"cid": int, "symbol": str, "start_ts": float, "duration_min": int, "tf_sec": int, "mode": str}
         self.active_trade = None
 
@@ -181,7 +165,6 @@ class DerivBreakoutBot:
         self.consecutive_losses = 0
         self.total_profit_today = 0.0
         self.balance = "0.00"
-
         self.session_losses = 0
 
         # martingale
@@ -190,9 +173,21 @@ class DerivBreakoutBot:
 
         self.trade_lock = asyncio.Lock()
 
-        # debug per (symbol, mode)
-        self.market_debug = {(m, md): {} for m in MARKETS for md in MODE_CONFIG.keys()}
-        self.last_processed_closed_t0 = {(m, md): 0 for m in MARKETS for md in MODE_CONFIG.keys()}
+        # debug per (symbol, tf_name)
+        # tf_name in {"ENTRY_1M", "STRUCTURE_5M"}
+        self.market_debug = {(m, tf): {} for m in MARKETS for tf in ("ENTRY_1M", "STRUCTURE_5M")}
+        self.last_processed_closed_t0 = {(m, tf): 0 for m in MARKETS for tf in ("ENTRY_1M", "STRUCTURE_5M")}
+
+        # breakout setups created from 5M, entered from 1M
+        # self.setups[symbol] = {
+        #   "dir": "CALL"/"PUT",
+        #   "level": float,          # broken resistance/support
+        #   "created_t0": int,       # breakout confirm candle epoch
+        #   "expires_at": float,     # epoch
+        #   "ema_fast": float, "ema_slow": float,
+        #   "waiting": str,          # text
+        # }
+        self.setups = {}
 
         self.tz = ZoneInfo("Africa/Lagos")
         self.current_day = datetime.now(self.tz).date()
@@ -200,8 +195,8 @@ class DerivBreakoutBot:
 
         self._ticks_lock = asyncio.Lock()
         self._last_ticks_ts = 0.0
-        self._next_poll_epoch = {(m, md): 0.0 for m in MARKETS for md in MODE_CONFIG.keys()}
-        self._rate_limit_strikes = {(m, md): 0 for m in MARKETS for md in MODE_CONFIG.keys()}
+        self._next_poll_epoch = {(m, tf): 0.0 for m in MARKETS for tf in ("ENTRY_1M", "STRUCTURE_5M")}
+        self._rate_limit_strikes = {(m, tf): 0 for m in MARKETS for tf in ("ENTRY_1M", "STRUCTURE_5M")}
 
         self.status_cooldown_until = 0.0
 
@@ -273,6 +268,7 @@ class DerivBreakoutBot:
             self.session_losses = 0
             self.martingale_step = 0
             self.martingale_halt = False
+            self.setups = {}
 
     def can_auto_trade(self) -> tuple[bool, str]:
         self._daily_reset_if_needed()
@@ -409,159 +405,220 @@ class DerivBreakoutBot:
                     dur = int(self.active_trade.get("duration_min", 0))
                     if time.time() - float(self.active_trade.get("start_ts", 0.0)) > (dur * 60 + 180):
                         self.active_trade = None
+
+                # expire old setups
+                now = time.time()
+                for sym in list(self.setups.keys()):
+                    if now >= float(self.setups[sym].get("expires_at", 0)):
+                        self.setups[sym]["waiting"] = "Setup expired (no retest)"
+                        # keep it a little while for status visibility, then delete next loop
+                        if now - float(self.setups[sym].get("expires_at", 0)) > 60:
+                            del self.setups[sym]
+
                 await asyncio.sleep(1)
         finally:
             for t in self.market_tasks.values():
                 t.cancel()
             self.market_tasks.clear()
 
-    def _missing_for_side(self, side: str, checks: dict) -> list[str]:
-        if side == "CALL":
-            needed = ["GATE_OK", "ATR_OK", "SPIKE_OK", "BREAKOUT_CALL"]
-            if USE_EMA_BIAS:
-                needed.append("BIAS_UP")
-        else:
-            needed = ["GATE_OK", "ATR_OK", "SPIKE_OK", "BREAKOUT_PUT"]
-            if USE_EMA_BIAS:
-                needed.append("BIAS_DOWN")
-        return [k for k in needed if not checks.get(k, False)]
+    def _bias_ok(self, direction: str, ema_fast_now: float, ema_slow_now: float) -> bool:
+        if not USE_EMA_BIAS:
+            return True
+        if not (is_finite(ema_fast_now) and is_finite(ema_slow_now)):
+            return False
+        if direction == "CALL":
+            return ema_fast_now > ema_slow_now
+        return ema_fast_now < ema_slow_now
+
+    @staticmethod
+    def _near_threshold(price: float) -> float:
+        # "approaching" threshold: 0.15% of price (same idea you saw before)
+        return abs(price) * 0.0015
 
     async def scan_market(self, symbol: str):
-        for md in MODE_CONFIG.keys():
-            self._next_poll_epoch[(symbol, md)] = time.time() + random.random() * 0.6
+        # schedule both loops (5M + 1M) without extra websockets
+        self._next_poll_epoch[(symbol, "STRUCTURE_5M")] = time.time() + random.random() * 0.6
+        self._next_poll_epoch[(symbol, "ENTRY_1M")] = time.time() + random.random() * 0.6
 
         while self.is_scanning:
             try:
-                for md, cfg in MODE_CONFIG.items():
-                    tf_sec = int(cfg["TF_SEC"])
-                    now = time.time()
-                    nxt = float(self._next_poll_epoch.get((symbol, md), 0.0))
-                    if now < nxt:
-                        continue
-
+                # -------------------- 5M STRUCTURE --------------------
+                now = time.time()
+                nxt5 = float(self._next_poll_epoch.get((symbol, "STRUCTURE_5M"), 0.0))
+                if now >= nxt5:
                     ok_gate, gate = self.can_auto_trade()
 
-                    candles = await self.fetch_candles(symbol, tf_sec=tf_sec)
-                    if len(candles) < (DONCHIAN_LEN + 10):
-                        self.market_debug[(symbol, md)] = {
-                            "time": time.time(),
-                            "mode": md,
-                            "tf_sec": tf_sec,
-                            "gate": "Waiting",
-                            "checks": {},
-                            "missing_call": [],
-                            "missing_put": [],
-                            "signal": None,
-                            "last_price": float("nan"),
-                            "next_close": 0,
-                        }
-                        self._next_poll_epoch[(symbol, md)] = time.time() + 10
-                        continue
+                    candles_5m = await self.fetch_candles(symbol, tf_sec=300)
+                    if len(candles_5m) >= (DONCHIAN_LEN + 60):
+                        confirm = candles_5m[-2]
+                        confirm_t0 = int(confirm["t0"])
+                        next_close = confirm_t0 + 300
+                        self._next_poll_epoch[(symbol, "STRUCTURE_5M")] = float(next_close + 0.30)
 
-                    confirm = candles[-2]
-                    confirm_t0 = int(confirm["t0"])
-                    next_closed_epoch = confirm_t0 + tf_sec
-                    self._next_poll_epoch[(symbol, md)] = float(next_closed_epoch + 0.30)
+                        if self.last_processed_closed_t0[(symbol, "STRUCTURE_5M")] != confirm_t0:
+                            closes = np.array([x["c"] for x in candles_5m], dtype=float)
+                            highs = np.array([x["h"] for x in candles_5m], dtype=float)
+                            lows = np.array([x["l"] for x in candles_5m], dtype=float)
 
-                    if self.last_processed_closed_t0[(symbol, md)] == confirm_t0:
-                        continue
+                            ema_fast = calculate_ema(closes, EMA_FAST)
+                            ema_slow = calculate_ema(closes, EMA_SLOW)
+                            ema_fast_now = float(ema_fast[-2]) if len(ema_fast) else float("nan")
+                            ema_slow_now = float(ema_slow[-2]) if len(ema_slow) else float("nan")
 
-                    closes = np.array([x["c"] for x in candles], dtype=float)
-                    highs = np.array([x["h"] for x in candles], dtype=float)
-                    lows = np.array([x["l"] for x in candles], dtype=float)
+                            bias_up = is_finite(ema_fast_now) and is_finite(ema_slow_now) and (ema_fast_now > ema_slow_now)
+                            bias_down = is_finite(ema_fast_now) and is_finite(ema_slow_now) and (ema_fast_now < ema_slow_now)
 
-                    atr = calculate_atr(highs, lows, closes, ATR_PERIOD)
-                    atr_now = float(atr[-2]) if len(atr) and not np.isnan(atr[-2]) else float("nan")
-                    atr_ok = is_finite(atr_now) and atr_now > 1e-12
+                            # Donchian window excludes confirm candle
+                            window_high = float(np.max(highs[-(DONCHIAN_LEN + 2):-2]))
+                            window_low = float(np.min(lows[-(DONCHIAN_LEN + 2):-2]))
 
-                    # optional EMA bias (trend direction)
-                    bias_up = bias_down = False
-                    ema_fast_now = ema_slow_now = float("nan")
-                    if USE_EMA_BIAS:
-                        ema_fast = calculate_ema(closes, EMA_FAST)
-                        ema_slow = calculate_ema(closes, EMA_SLOW)
-                        if len(ema_fast) and len(ema_slow):
-                            ema_fast_now = float(ema_fast[-2])
-                            ema_slow_now = float(ema_slow[-2])
-                            bias_up = ema_fast_now > ema_slow_now
-                            bias_down = ema_fast_now < ema_slow_now
+                            c_open = float(confirm["o"])
+                            c_close = float(confirm["c"])
+                            c_high = float(confirm["h"])
+                            c_low = float(confirm["l"])
+                            body = abs(c_close - c_open)
 
-                    # spike filter on confirm candle
-                    c_open = float(confirm["o"])
-                    c_close = float(confirm["c"])
-                    c_high = float(confirm["h"])
-                    c_low = float(confirm["l"])
-                    c_range = max(MIN_CANDLE_RANGE, c_high - c_low)
-                    body = abs(c_close - c_open)
+                            # "strong body" vs recent median body
+                            bodies = np.array([abs(float(x["c"]) - float(x["o"])) for x in candles_5m[-(BODY_LOOKBACK + 2):-2]], dtype=float)
+                            med_body = float(np.median(bodies)) if len(bodies) else float("nan")
+                            strong_body = is_finite(med_body) and med_body > 0 and (body >= med_body * float(BODY_STRONG_MULT))
 
-                    range_atr = (c_range / atr_now) if (atr_ok and atr_now > 0) else float("nan")
-                    body_atr = (body / atr_now) if (atr_ok and atr_now > 0) else float("nan")
-                    spike_block = (is_finite(range_atr) and range_atr > float(SPIKE_RANGE_ATR)) or (
-                        is_finite(body_atr) and body_atr > float(SPIKE_BODY_ATR)
-                    )
+                            breakout_call = (c_close > window_high)
+                            breakout_put = (c_close < window_low)
 
-                    # Donchian window excludes confirm candle
-                    window_high = float(np.max(highs[-(DONCHIAN_LEN + 2):-2]))
-                    window_low = float(np.min(lows[-(DONCHIAN_LEN + 2):-2]))
+                            # apply EMA bias filter for confirmation
+                            bo_confirm_call = breakout_call and strong_body and self._bias_ok("CALL", ema_fast_now, ema_slow_now)
+                            bo_confirm_put = breakout_put and strong_body and self._bias_ok("PUT", ema_fast_now, ema_slow_now)
 
-                    buf = (float(ATR_BREAKOUT_K) * atr_now) if atr_ok else 0.0
-                    call_break_level = window_high + buf
-                    put_break_level = window_low - buf
+                            last_price = await self.fetch_last_price(symbol)
 
-                    breakout_call = c_close > call_break_level
-                    breakout_put = c_close < put_break_level
+                            # approaching?
+                            near = self._near_threshold(last_price) if is_finite(last_price) else float("nan")
+                            approaching_call = is_finite(last_price) and is_finite(window_high) and (0 <= (window_high - last_price) <= near)
+                            approaching_put = is_finite(last_price) and is_finite(window_low) and (0 <= (last_price - window_low) <= near)
 
-                    last_price = await self.fetch_last_price(symbol)
+                            confirmed = bo_confirm_call or bo_confirm_put
+                            confirmed_dir = "CALL" if bo_confirm_call else "PUT" if bo_confirm_put else None
+                            broken_level = window_high if bo_confirm_call else window_low if bo_confirm_put else float("nan")
 
-                    checks = {
-                        "GATE_OK": ok_gate,
-                        "ATR_OK": atr_ok,
-                        "SPIKE_OK": (not spike_block),
-                        "BREAKOUT_CALL": breakout_call,
-                        "BREAKOUT_PUT": breakout_put,
-                        "BIAS_UP": bias_up,
-                        "BIAS_DOWN": bias_down,
-                    }
+                            waiting = "—"
+                            if confirmed:
+                                waiting = "Waiting for 1M retest/pullback to broken level"
+                                # create/replace setup
+                                self.setups[symbol] = {
+                                    "dir": confirmed_dir,
+                                    "level": float(broken_level),
+                                    "created_t0": int(confirm_t0),
+                                    "expires_at": float(time.time() + SETUP_TTL_MIN * 60),
+                                    "ema_fast": float(ema_fast_now),
+                                    "ema_slow": float(ema_slow_now),
+                                    "waiting": waiting,
+                                    "gate": gate,
+                                }
+                            else:
+                                # if no breakout confirmed, keep setup only if still valid; otherwise remove
+                                if symbol in self.setups:
+                                    # keep it until TTL, but update waiting text
+                                    self.setups[symbol]["waiting"] = "Waiting for 5M breakout confirmation"
 
-                    call_ready = checks["GATE_OK"] and checks["ATR_OK"] and checks["SPIKE_OK"] and checks["BREAKOUT_CALL"]
-                    put_ready = checks["GATE_OK"] and checks["ATR_OK"] and checks["SPIKE_OK"] and checks["BREAKOUT_PUT"]
-                    if USE_EMA_BIAS:
-                        call_ready = call_ready and checks["BIAS_UP"]
-                        put_ready = put_ready and checks["BIAS_DOWN"]
+                            self.market_debug[(symbol, "STRUCTURE_5M")] = {
+                                "time": time.time(),
+                                "gate": gate,
+                                "ok_gate": ok_gate,
+                                "last_closed": confirm_t0,
+                                "next_close": next_close,
+                                "window_high": window_high,
+                                "window_low": window_low,
+                                "confirm_close": c_close,
+                                "last_price": last_price,
+                                "ema_fast": ema_fast_now,
+                                "ema_slow": ema_slow_now,
+                                "bias_up": bias_up,
+                                "bias_down": bias_down,
+                                "body": body,
+                                "med_body": med_body,
+                                "strong_body": strong_body,
+                                "breakout_confirmed": bool(confirmed),
+                                "breakout_dir": confirmed_dir,
+                                "broken_level": broken_level if confirmed else float("nan"),
+                                "approaching_call": bool(approaching_call),
+                                "approaching_put": bool(approaching_put),
+                            }
+                            self.last_processed_closed_t0[(symbol, "STRUCTURE_5M")] = confirm_t0
+                    else:
+                        self._next_poll_epoch[(symbol, "STRUCTURE_5M")] = time.time() + 10
 
-                    signal = "CALL" if call_ready else "PUT" if put_ready else None
+                # -------------------- 1M ENTRY (RETEST) --------------------
+                now = time.time()
+                nxt1 = float(self._next_poll_epoch.get((symbol, "ENTRY_1M"), 0.0))
+                if now >= nxt1:
+                    ok_gate, gate = self.can_auto_trade()
 
-                    self.market_debug[(symbol, md)] = {
-                        "time": time.time(),
-                        "mode": md,
-                        "tf_sec": tf_sec,
-                        "gate": gate,
-                        "last_closed": confirm_t0,
-                        "next_close": next_closed_epoch,
-                        "signal": signal,
-                        "checks": checks,
-                        "missing_call": self._missing_for_side("CALL", checks),
-                        "missing_put": self._missing_for_side("PUT", checks),
-                        "confirm_close": c_close,
-                        "last_price": last_price,
-                        "call_break_level": call_break_level,
-                        "put_break_level": put_break_level,
-                        "next_poll_epoch": self._next_poll_epoch.get((symbol, md), 0.0),
-                        "atr_now": atr_now,
-                        "ema_fast": ema_fast_now,
-                        "ema_slow": ema_slow_now,
-                        "range_atr": range_atr,
-                        "body_atr": body_atr,
-                    }
+                    candles_1m = await self.fetch_candles(symbol, tf_sec=60)
+                    if len(candles_1m) >= 40:
+                        confirm = candles_1m[-2]
+                        confirm_t0 = int(confirm["t0"])
+                        next_close = confirm_t0 + 60
+                        self._next_poll_epoch[(symbol, "ENTRY_1M")] = float(next_close + 0.25)
 
-                    self.last_processed_closed_t0[(symbol, md)] = confirm_t0
+                        if self.last_processed_closed_t0[(symbol, "ENTRY_1M")] != confirm_t0:
+                            last_price = await self.fetch_last_price(symbol)
+                            c_open = float(confirm["o"])
+                            c_close = float(confirm["c"])
+                            c_high = float(confirm["h"])
+                            c_low = float(confirm["l"])
 
-                    # trade ONLY selected mode
-                    if md == self.mode:
-                        if call_ready:
-                            await self.execute_trade("CALL", symbol, source="AUTO")
-                        elif put_ready:
-                            await self.execute_trade("PUT", symbol, source="AUTO")
+                            setup = self.setups.get(symbol)
+                            retest_ok = False
+                            retest_dir = None
+                            level = float("nan")
+                            tol = float("nan")
+                            waiting = "No 5M setup yet"
+
+                            if setup and time.time() < float(setup.get("expires_at", 0)):
+                                retest_dir = str(setup.get("dir"))
+                                level = float(setup.get("level", float("nan")))
+                                tol = max(0.0, abs(level) * float(RETEST_TOL_PCT)) if is_finite(level) else float("nan")
+
+                                # retest rules:
+                                # CALL: 1M candle touches level (low <= level+tol) and closes back ABOVE level
+                                # PUT:  1M candle touches level (high >= level-tol) and closes back BELOW level
+                                if retest_dir == "CALL":
+                                    retest_ok = is_finite(level) and is_finite(tol) and (c_low <= (level + tol)) and (c_close > level)
+                                elif retest_dir == "PUT":
+                                    retest_ok = is_finite(level) and is_finite(tol) and (c_high >= (level - tol)) and (c_close < level)
+
+                                waiting = setup.get("waiting", "Waiting for 1M retest")
+                                if retest_ok:
+                                    waiting = "Retest confirmed ✅ (entry allowed)"
+
+                            # record debug
+                            self.market_debug[(symbol, "ENTRY_1M")] = {
+                                "time": time.time(),
+                                "gate": gate,
+                                "ok_gate": ok_gate,
+                                "last_closed": confirm_t0,
+                                "next_close": next_close,
+                                "last_price": last_price,
+                                "confirm_close": c_close,
+                                "setup_active": bool(setup and time.time() < float(setup.get("expires_at", 0))),
+                                "setup_dir": retest_dir,
+                                "setup_level": level,
+                                "tol": tol,
+                                "retest_ok": bool(retest_ok),
+                                "waiting": waiting,
+                            }
+                            self.last_processed_closed_t0[(symbol, "ENTRY_1M")] = confirm_t0
+
+                            # if retest ok, place trade (expiry depends on MODE)
+                            if retest_ok and ok_gate:
+                                await self.execute_trade(retest_dir, symbol, source="AUTO")
+                                # clear setup after entry to avoid duplicate entries
+                                if symbol in self.setups:
+                                    self.setups[symbol]["waiting"] = "Trade opened (setup consumed)"
+                                    del self.setups[symbol]
+                    else:
+                        self._next_poll_epoch[(symbol, "ENTRY_1M")] = time.time() + 6
 
                 await asyncio.sleep(0.05)
 
@@ -570,14 +627,14 @@ class DerivBreakoutBot:
             except Exception as e:
                 msg = str(e)
                 logger.error(f"Scanner Error ({symbol}): {msg}")
-                for md in MODE_CONFIG.keys():
+                for tf in ("STRUCTURE_5M", "ENTRY_1M"):
                     if self._is_rate_limit_error(msg):
-                        self._rate_limit_strikes[(symbol, md)] = int(self._rate_limit_strikes.get((symbol, md), 0)) + 1
-                        backoff = RATE_LIMIT_BACKOFF_BASE * self._rate_limit_strikes[(symbol, md)]
+                        self._rate_limit_strikes[(symbol, tf)] = int(self._rate_limit_strikes.get((symbol, tf), 0)) + 1
+                        backoff = RATE_LIMIT_BACKOFF_BASE * self._rate_limit_strikes[(symbol, tf)]
                         backoff = min(240, backoff)
-                        self._next_poll_epoch[(symbol, md)] = time.time() + backoff
+                        self._next_poll_epoch[(symbol, tf)] = time.time() + backoff
                     else:
-                        self._next_poll_epoch[(symbol, md)] = time.time() + (6 if self._is_gatewayish_error(msg) else 2)
+                        self._next_poll_epoch[(symbol, tf)] = time.time() + (6 if self._is_gatewayish_error(msg) else 2)
 
     # ---------- trading ----------
     def calc_payout_for_step(self) -> float:
@@ -598,6 +655,8 @@ class DerivBreakoutBot:
                 import math
 
                 payout = self.calc_payout_for_step()
+
+                # expiry controlled by MODE
                 tf_sec = self.tf_sec()
                 dur_min = self.duration_min()
                 mode = self.mode
@@ -661,9 +720,9 @@ class DerivBreakoutBot:
                 safe_symbol = str(symbol).replace("_", " ")
                 await self.safe_send_tg(
                     f"🚀 {side} TRADE OPENED\n"
-                    f"🧭 Mode: {mode}\n"
+                    f"🧭 Mode (expiry profile): {mode}\n"
                     f"🛒 Market: {safe_symbol}\n"
-                    f"🕯 {int(tf_sec)//60}m candles | ⏱ Expiry: {int(dur_min)}m\n"
+                    f"⏱ Expiry: {int(dur_min)}m\n"
                     f"🎲 Martingale: step {self.martingale_step}/{MARTINGALE_MAX_STEPS} (x{MARTINGALE_MULT:.2f})\n"
                     f"🎁 Payout: ${payout:.2f}\n"
                     f"💵 Stake (Deriv): ${ask_price:.2f}\n"
@@ -759,58 +818,77 @@ def main_keyboard():
     )
 
 
-def _yn(v: bool) -> str:
-    return "✅" if v else "❌"
+def _fnum(x, fmt=".5f"):
+    try:
+        if x is None:
+            return "—"
+        if isinstance(x, float) and not np.isfinite(x):
+            return "—"
+        return format(float(x), fmt)
+    except Exception:
+        return "—"
 
 
-def format_market_detail(sym: str, d: dict) -> str:
-    if not d:
-        return f"📍 {sym.replace('_',' ')}\n⏳ No scan data yet\n"
+def format_market_detail(sym: str, d5: dict, d1: dict, setup: dict | None) -> str:
+    # Very informative but still structured + readable
+    sym_clean = sym.replace("_", " ")
 
-    age = int(time.time() - d.get("time", time.time()))
-    gate = d.get("gate", "—")
-    last_closed = int(d.get("last_closed", 0))
-    next_close = int(d.get("next_close", 0))
-    signal = d.get("signal") or "—"
-    mode = d.get("mode", "—")
-    tf_sec = int(d.get("tf_sec", 0) or 0)
-    checks = d.get("checks", {}) or {}
+    # 5M structure
+    if not d5:
+        s5 = f"STRUCTURE(5M): no data yet"
+    else:
+        bo_conf = bool(d5.get("breakout_confirmed", False))
+        bo_dir = d5.get("breakout_dir", None)
+        app_call = bool(d5.get("approaching_call", False))
+        app_put = bool(d5.get("approaching_put", False))
+        approaching = "CALL" if app_call else "PUT" if app_put else "NO"
+        bias = "UP" if bool(d5.get("bias_up", False)) else "DOWN" if bool(d5.get("bias_down", False)) else "MIXED/NA"
+        s5 = (
+            f"STRUCTURE(5M)\n"
+            f"- Breakout confirmed? {_yn(bo_conf)}"
+            + (f" ({bo_dir})" if bo_conf and bo_dir else "") + "\n"
+            f"- Approaching breakout? {_yn(approaching != 'NO')} ({approaching})\n"
+            f"- Range High/Low: {_fnum(d5.get('window_high'))} / {_fnum(d5.get('window_low'))}\n"
+            f"- EMA{EMA_FAST}/{EMA_SLOW} bias: {bias} | EMA20={_fnum(d5.get('ema_fast'))} EMA50={_fnum(d5.get('ema_slow'))}\n"
+            f"- Breakout candle: close={_fnum(d5.get('confirm_close'))} body={_fnum(d5.get('body'), '.2f')} (median={_fnum(d5.get('med_body'), '.2f')}) strong={_yn(bool(d5.get('strong_body', False)))}\n"
+            f"- Last closed: {fmt_time_hhmmss(int(d5.get('last_closed', 0)))} | Next close: {fmt_time_hhmmss(int(d5.get('next_close', 0)))}\n"
+        )
 
-    def f(x, fmt=".5f"):
-        return "—" if (x is None or (isinstance(x, float) and not np.isfinite(x))) else format(float(x), fmt)
+    # 1M entry
+    if not d1:
+        s1 = f"ENTRY(1M): no data yet"
+    else:
+        active = bool(d1.get("setup_active", False))
+        retest_ok = bool(d1.get("retest_ok", False))
+        s1 = (
+            f"ENTRY(1M)\n"
+            f"- Setup active? {_yn(active)}"
+            + (f" ({d1.get('setup_dir')})" if active and d1.get("setup_dir") else "") + "\n"
+            f"- Retest confirmed? {_yn(retest_ok)}\n"
+            f"- Level / tol: {_fnum(d1.get('setup_level'))} ± {_fnum(d1.get('tol'), '.5f')}\n"
+            f"- Confirm close: {_fnum(d1.get('confirm_close'))} | Live: {_fnum(d1.get('last_price'))}\n"
+            f"- Waiting: {d1.get('waiting', '—')}\n"
+            f"- Last closed: {fmt_time_hhmmss(int(d1.get('last_closed', 0)))} | Next close: {fmt_time_hhmmss(int(d1.get('next_close', 0)))}\n"
+        )
 
-    confirm_close = d.get("confirm_close", float("nan"))
-    last_price = d.get("last_price", float("nan"))
-    call_lvl = d.get("call_break_level", float("nan"))
-    put_lvl = d.get("put_break_level", float("nan"))
-
-    tf_txt = f"{tf_sec//60}m" if tf_sec else "—"
-
-    # Keep status clean: show only the checks that matter
-    keys = ["GATE_OK", "ATR_OK", "SPIKE_OK", "BREAKOUT_CALL", "BREAKOUT_PUT"]
-    if USE_EMA_BIAS:
-        keys += ["BIAS_UP", "BIAS_DOWN"]
-
-    pretty = {
-        "GATE_OK": "Gate",
-        "ATR_OK": "ATR",
-        "SPIKE_OK": "SpikeOK",
-        "BREAKOUT_CALL": "BO Call",
-        "BREAKOUT_PUT": "BO Put",
-        "BIAS_UP": "BiasUp",
-        "BIAS_DOWN": "BiasDn",
-    }
-
-    checks_line = " | ".join([f"{pretty[k]}:{_yn(bool(checks.get(k, False)))}" for k in keys])
+    # setup summary
+    if setup:
+        ttl = max(0, int(float(setup.get("expires_at", 0)) - time.time()))
+        ssetup = (
+            f"SETUP TRACKER\n"
+            f"- Dir: {setup.get('dir','—')} | Broken level: {_fnum(setup.get('level'))}\n"
+            f"- Created: {fmt_time_hhmmss(int(setup.get('created_t0', 0)))} | Expires in: {ttl}s\n"
+            f"- Waiting: {setup.get('waiting','—')}\n"
+        )
+    else:
+        ssetup = "SETUP TRACKER\n- No active setup\n"
 
     return (
-        f"📍 {sym.replace('_',' ')} | 🧭 {mode} | 🕯 {tf_txt} ({age}s)\n"
-        f"Gate: {gate}\n"
-        f"Last closed: {fmt_time_hhmmss(last_closed)} | Next close: {fmt_time_hhmmss(next_close)}\n"
-        f"Live: {f(last_price)} | Confirm close: {f(confirm_close)}\n"
-        f"Break levels → CALL: {f(call_lvl)} | PUT: {f(put_lvl)}\n"
-        f"Signal: {signal}\n"
-        f"Checks: {checks_line}\n"
+        f"📍 {sym_clean}\n"
+        f"{s5}"
+        f"{ssetup}"
+        f"{s1}"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
     )
 
 
@@ -849,8 +927,8 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await _safe_edit(
             q,
             f"✅ Mode switched to {bot_logic.mode}\n"
-            f"🕯 Candles: {int(cfg['TF_SEC'])//60}m | ⏱ Expiry: {int(cfg['DURATION_MIN'])}m\n"
-            f"Trades trigger ONLY for selected mode.",
+            f"⏱ Expiry profile: {int(cfg['DURATION_MIN'])} minutes\n"
+            f"📌 Strategy stays the same: 5M structure + 1M retest entry.",
             reply_markup=main_keyboard(),
         )
 
@@ -866,13 +944,14 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cfg = bot_logic.get_mode_cfg()
         await _safe_edit(
             q,
-            f"🔍 SCANNER ACTIVE\n"
-            f"🧭 Selected mode: {bot_logic.mode}\n"
-            f"📌 Strategy: Donchian breakout + ATR buffer + spike filter"
-            + (f" + EMA({EMA_FAST}/{EMA_SLOW}) bias" if USE_EMA_BIAS else "") + "\n"
-            f"🕯 {int(cfg['TF_SEC'])//60}m candles | ⏱ {int(cfg['DURATION_MIN'])}m expiry\n"
-            f"🎲 Martingale: {MARTINGALE_MAX_STEPS} steps | x{MARTINGALE_MULT:.2f}\n"
-            f"Note: Bot scans BOTH M1 & M5, but trades selected mode only.",
+            "🔍 SCANNER ACTIVE\n"
+            f"🧭 Mode (expiry profile): {bot_logic.mode} | Expiry: {int(cfg['DURATION_MIN'])}m\n"
+            "📌 Strategy:\n"
+            f"- STRUCTURE: 5M Donchian({DONCHIAN_LEN}) + EMA{EMA_FAST}/{EMA_SLOW} trend filter\n"
+            "- CONFIRM: 5M candle CLOSES outside range + strong body\n"
+            "- ENTRY: 1M retest/pullback to broken level, then enter\n"
+            f"- Retest tolerance: {RETEST_TOL_PCT*100:.3f}% | Setup TTL: {SETUP_TTL_MIN}m\n"
+            f"🎲 Martingale: {MARTINGALE_MAX_STEPS} steps | x{MARTINGALE_MULT:.2f}\n",
             reply_markup=main_keyboard(),
         )
 
@@ -886,7 +965,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(bot_logic.execute_trade("CALL", MARKETS[0], source="MANUAL"))
         await _safe_edit(
             q,
-            f"🧪 Test trade triggered (CALL {MARKETS[0].replace('_',' ')} | Mode {bot_logic.mode}).",
+            f"🧪 Test trade triggered (CALL {MARKETS[0].replace('_',' ')} | Expiry mode {bot_logic.mode}).",
             reply_markup=main_keyboard(),
         )
 
@@ -903,7 +982,6 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
         _ok, gate = bot_logic.can_auto_trade()
-
         cfg = bot_logic.get_mode_cfg()
 
         trade_status = "No Active Trade"
@@ -922,7 +1000,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 mkt_clean = str(bot_logic.active_trade.get("symbol", "—")).replace("_", " ")
                 trade_status = (
                     f"🚀 Active Trade ({mkt_clean})\n"
-                    f"Mode: {bot_logic.active_trade.get('mode','—')} | Candles: {int(bot_logic.active_trade.get('tf_sec',0))//60}m | Expiry: {dur}m\n"
+                    f"Expiry mode: {bot_logic.active_trade.get('mode','—')} | Expiry: {dur}m\n"
                     f"Opened: {fmt_dt(int(bot_logic.active_trade.get('start_ts', time.time())))}\n"
                     f"📈 PnL: {icon} ({pnl:+.2f})\n"
                     f"⏳ Remaining: {rem}s"
@@ -937,11 +1015,9 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"🧭 Mode: {bot_logic.mode}\n"
-            f"🕯 Candles: {int(cfg['TF_SEC'])//60}m | ⏱ Expiry: {int(cfg['DURATION_MIN'])}m\n"
+            f"🧭 Expiry mode: {bot_logic.mode} | Expiry: {int(cfg['DURATION_MIN'])}m\n"
             f"🎲 Martingale: step {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS} (x{MARTINGALE_MULT:.2f}) | Next payout: ${next_payout:.2f}\n"
-            f"🧊 Cooldown: {cooldown_left}s left (base {COOLDOWN_SEC}s)\n"
-            f"⏸ Pause: {pause_left}s left\n"
+            f"🧊 Cooldown: {cooldown_left}s | ⏸ Pause: {pause_left}s\n"
             f"🧯 Risk: max/day {MAX_TRADES_PER_DAY} | max streak {MAX_CONSEC_LOSSES} | soft stop {STOP_AFTER_LOSSES}\n"
             f"🎯 Daily: target +{DAILY_PROFIT_TARGET:.2f} | limit {DAILY_LOSS_LIMIT:+.2f}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
@@ -951,28 +1027,28 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"🚦 Gate: {gate}\n"
             f"💰 Balance: {bot_logic.balance}\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
         )
 
-        details = "\n\n📌 LIVE SCAN (M1 + M5)\n\n"
-        blocks = []
-        for md in ("M1", "M5"):
-            blocks.append(f"===== {md} =====")
-            for sym in MARKETS:
-                blocks.append(format_market_detail(sym, bot_logic.market_debug.get((sym, md), {})))
-        details += "\n\n".join(blocks)
+        body = ""
+        for sym in MARKETS:
+            d5 = bot_logic.market_debug.get((sym, "STRUCTURE_5M"), {})
+            d1 = bot_logic.market_debug.get((sym, "ENTRY_1M"), {})
+            setup = bot_logic.setups.get(sym)
+            body += format_market_detail(sym, d5, d1, setup)
 
-        await _safe_edit(q, header + details, reply_markup=main_keyboard())
+        await _safe_edit(q, header + body, reply_markup=main_keyboard())
 
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     cfg = bot_logic.get_mode_cfg()
     await u.message.reply_text(
-        "💎 Deriv Breakout Bot (CLEAN)\n"
-        f"🧭 Mode: {bot_logic.mode} (use MODE button to switch)\n"
-        f"🕯 Timeframe: {int(cfg['TF_SEC'])//60}m | ⏱ Expiry: {int(cfg['DURATION_MIN'])}m\n"
-        f"📌 Strategy: Donchian breakout + ATR buffer + spike filter"
-        + (f" + EMA({EMA_FAST}/{EMA_SLOW}) bias" if USE_EMA_BIAS else "") + "\n"
-        f"🎲 Martingale: {MARTINGALE_MAX_STEPS} steps | x{MARTINGALE_MULT:.2f}\n",
+        "💎 Deriv Breakout Bot (5M structure + 1M retest entry)\n"
+        f"🧭 Expiry mode: {bot_logic.mode} | Expiry: {int(cfg['DURATION_MIN'])}m\n"
+        f"📌 Indicators: EMA{EMA_FAST}/EMA{EMA_SLOW} + Donchian({DONCHIAN_LEN})\n"
+        "📌 Logic:\n"
+        "- Confirm breakout on 5M close outside the box (strong body)\n"
+        "- Enter on 1M retest/pullback to the broken level\n",
         reply_markup=main_keyboard(),
     )
 
