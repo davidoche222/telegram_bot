@@ -865,8 +865,97 @@ def main_keyboard():
         ]
     )
 
+# ========================= STATUS DISPLAY (UPDATED ONLY) =========================
 def _yn(v: bool) -> str:
     return "✅" if v else "❌"
+
+
+def _humanize_key(k: str) -> str:
+    mapping = {
+        "GATE_OK": "Gate (risk limits/cooldown)",
+        "ATR_OK": "ATR ready",
+        "ADX_OK": "ADX trend strength (trend vs range)",
+        "BIAS_UP": "Trend bias UP (EMA20 > EMA50)",
+        "BIAS_DOWN": "Trend bias DOWN (EMA20 < EMA50)",
+        "EMA50_RISING": "EMA50 rising strongly (slope filter)",
+        "EMA50_FALLING": "EMA50 falling strongly (slope filter)",
+        "EMA_DIFF_OK": "EMA separation OK (not flat)",
+        "STRONG_CANDLE": "Strong confirm candle (body ratio)",
+        "SPIKE_OK": "No spike candle",
+        "RSI_OK_CALL": "RSI ok for CALL",
+        "RSI_OK_PUT": "RSI ok for PUT",
+        "BREAKOUT_CALL": "Breakout above CALL level",
+        "BREAKOUT_PUT": "Breakout below PUT level",
+        "SLOPE_OK": "EMA50 slope strong enough",
+    }
+    return mapping.get(k, k)
+
+
+def _regime_from_checks(checks: dict) -> str:
+    adx_ok = bool(checks.get("ADX_OK", False))
+    sep_ok = bool(checks.get("EMA_DIFF_OK", False))
+    rising = bool(checks.get("EMA50_RISING", False))
+    falling = bool(checks.get("EMA50_FALLING", False))
+    if adx_ok and sep_ok and (rising or falling):
+        return "TREND"
+    return "RANGE"
+
+
+def _breakout_state(last_price: float, call_lvl: float, put_lvl: float, checks: dict) -> tuple[str, str]:
+    b_call = bool(checks.get("BREAKOUT_CALL", False))
+    b_put = bool(checks.get("BREAKOUT_PUT", False))
+
+    if b_call:
+        return ("BROKE OUT ✅ (CALL breakout confirmed)", "")
+    if b_put:
+        return ("BROKE OUT ✅ (PUT breakout confirmed)", "")
+
+    if not is_finite(last_price) or not is_finite(call_lvl) or not is_finite(put_lvl):
+        return ("NO BREAKOUT (no live price yet)", "")
+
+    # approaching threshold: 0.15% of price
+    near = abs(last_price) * 0.0015
+
+    dist_to_call = call_lvl - last_price
+    dist_to_put = last_price - put_lvl
+
+    approaching = []
+    if dist_to_call >= 0 and dist_to_call <= near:
+        approaching.append(f"Approaching CALL breakout (≈ {dist_to_call:.5f} away)")
+    if dist_to_put >= 0 and dist_to_put <= near:
+        approaching.append(f"Approaching PUT breakout (≈ {dist_to_put:.5f} away)")
+
+    if approaching:
+        return ("APPROACHING ⚠️ (near breakout level)", " | ".join(approaching))
+
+    return ("NO BREAKOUT (still inside range)", "")
+
+
+def _focus_side_from_checks(checks: dict) -> str:
+    if bool(checks.get("BIAS_UP", False)) and not bool(checks.get("BIAS_DOWN", False)):
+        return "CALL"
+    if bool(checks.get("BIAS_DOWN", False)) and not bool(checks.get("BIAS_UP", False)):
+        return "PUT"
+    return "BOTH"
+
+
+def _waiting_list_for_side(side: str, checks: dict) -> list[str]:
+    if side == "CALL":
+        needed = [
+            "GATE_OK", "ATR_OK", "ADX_OK", "BIAS_UP",
+            "EMA50_RISING", "EMA_DIFF_OK",
+            "STRONG_CANDLE", "SPIKE_OK",
+            "RSI_OK_CALL", "BREAKOUT_CALL",
+        ]
+    else:
+        needed = [
+            "GATE_OK", "ATR_OK", "ADX_OK", "BIAS_DOWN",
+            "EMA50_FALLING", "EMA_DIFF_OK",
+            "STRONG_CANDLE", "SPIKE_OK",
+            "RSI_OK_PUT", "BREAKOUT_PUT",
+        ]
+    return [k for k in needed if not bool(checks.get(k, False))]
+
 
 def format_market_detail(sym: str, d: dict) -> str:
     if not d:
@@ -879,10 +968,8 @@ def format_market_detail(sym: str, d: dict) -> str:
     signal = d.get("signal") or "—"
 
     checks = d.get("checks", {}) or {}
-    missing_call = d.get("missing_call", []) or []
-    missing_put = d.get("missing_put", []) or []
 
-    def f(x, fmt=".3f"):
+    def f(x, fmt=".5f"):
         return "—" if (x is None or (isinstance(x, float) and not np.isfinite(x))) else format(float(x), fmt)
 
     next_poll_epoch = float(d.get("next_poll_epoch", 0.0))
@@ -893,37 +980,63 @@ def format_market_detail(sym: str, d: dict) -> str:
     call_lvl = d.get("call_break_level", float("nan"))
     put_lvl = d.get("put_break_level", float("nan"))
 
-    dist_to_call = (call_lvl - last_price) if (is_finite(call_lvl) and is_finite(last_price)) else float("nan")
-    dist_to_put = (last_price - put_lvl) if (is_finite(put_lvl) and is_finite(last_price)) else float("nan")
+    # Regime + breakout status
+    regime = _regime_from_checks(checks)
+    bo_state, bo_approach = _breakout_state(last_price, call_lvl, put_lvl, checks)
 
-    why = d.get("why", []) or []
-    why_block = "\n".join([f"• {x}" for x in why[:10]]) if why else "• —"
+    # Which side is being favored + waiting list
+    focus = _focus_side_from_checks(checks)
 
-    keys = [
-        "GATE_OK", "ATR_OK", "ADX_OK",
-        "BIAS_UP", "BIAS_DOWN",
-        "EMA50_RISING", "EMA50_FALLING",
-        "EMA_DIFF_OK",
-        "STRONG_CANDLE", "SPIKE_OK",
-        "RSI_OK_CALL", "RSI_OK_PUT",
-        "BREAKOUT_CALL", "BREAKOUT_PUT",
+    missing_call = _waiting_list_for_side("CALL", checks)
+    missing_put = _waiting_list_for_side("PUT", checks)
+
+    if focus == "CALL":
+        waiting_keys = missing_call
+        focus_line = "Focus: CALL (bias UP)"
+    elif focus == "PUT":
+        waiting_keys = missing_put
+        focus_line = "Focus: PUT (bias DOWN)"
+    else:
+        focus_side = "CALL" if len(missing_call) <= len(missing_put) else "PUT"
+        waiting_keys = missing_call if focus_side == "CALL" else missing_put
+        focus_line = f"Focus: BOTH (mixed bias) | Nearest: {focus_side}"
+
+    waiting_pretty = ", ".join([_humanize_key(k) for k in waiting_keys]) if waiting_keys else "NONE ✅ (trade should trigger)"
+
+    summary = [f"Regime: {regime}", f"Breakout: {bo_state}"]
+    if bo_approach:
+        summary.append(bo_approach)
+
+    # Compact checks (not a wall)
+    key_checks = [
+        ("Gate", "GATE_OK"),
+        ("ADX", "ADX_OK"),
+        ("EMA sep", "EMA_DIFF_OK"),
+        ("Slope up", "EMA50_RISING"),
+        ("Slope dn", "EMA50_FALLING"),
+        ("Candle", "STRONG_CANDLE"),
+        ("Spike", "SPIKE_OK"),
+        ("RSI call", "RSI_OK_CALL"),
+        ("RSI put", "RSI_OK_PUT"),
+        ("BO call", "BREAKOUT_CALL"),
+        ("BO put", "BREAKOUT_PUT"),
     ]
-    checks_line = " | ".join([f"{k}:{_yn(bool(checks.get(k, False)))}" for k in keys if k in checks]) or "—"
+    checks_line = " | ".join([f"{name}:{_yn(bool(checks.get(k, False)))}" for name, k in key_checks])
 
     return (
-        f"📍 {sym.replace('_',' ')}  ({age}s)\n"
-        f"Gate: {gate}\n"
+        f"📍 {sym.replace('_',' ')} ({age}s)\n"
+        f"Gate: {gate} | Next scan in: {next_poll_in}s\n"
         f"Last closed: {fmt_time_hhmmss(last_closed)} | Next close: {fmt_time_hhmmss(next_close)}\n"
-        f"Next scan in: {next_poll_in}s\n"
+        f"Live: {f(last_price)} | Confirm close: {f(confirm_close)}\n"
+        f"Break levels → CALL: {f(call_lvl)} | PUT: {f(put_lvl)}\n"
         f"Signal: {signal}\n"
-        f"Live price: {f(last_price, '.5f')} | Confirm close: {f(confirm_close, '.5f')}\n"
-        f"CALL lvl: {f(call_lvl, '.5f')} | Δ to CALL: {f(dist_to_call, '.5f')}\n"
-        f"PUT  lvl: {f(put_lvl, '.5f')} | Δ to PUT : {f(dist_to_put, '.5f')}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"{' | '.join(summary)}\n"
+        f"{focus_line}\n"
+        f"WAITING FOR: {waiting_pretty}\n"
         f"Checks: {checks_line}\n"
-        f"Missing(CALL): {', '.join(missing_call) if missing_call else 'NONE'}\n"
-        f"Missing(PUT):  {', '.join(missing_put) if missing_put else 'NONE'}\n"
-        f"── Why / Notes ──\n{why_block}\n"
     )
+# ========================= END STATUS DISPLAY (UPDATED ONLY) =========================
 
 async def _safe_answer(q, text: str | None = None, show_alert: bool = False):
     try:
@@ -1037,7 +1150,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
         )
 
-        details = "\n\n📌 LIVE SCAN (WHAT’S REALLY HAPPENING)\n\n" + "\n\n".join(
+        details = "\n\n📌 LIVE SCAN (RANGE/TREND • BREAKOUT • WAITING-FOR)\n\n" + "\n\n".join(
             [format_market_detail(sym, bot_logic.market_debug.get(sym, {})) for sym in MARKETS]
         )
 
