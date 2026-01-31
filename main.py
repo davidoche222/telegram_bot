@@ -39,7 +39,7 @@ COOLDOWN_SEC = 180
 MAX_TRADES_PER_DAY = 20
 MAX_CONSEC_LOSSES = 6
 STOP_AFTER_LOSSES = 3
-DAILY_LOSS_LIMIT = -2.0
+DAILY_LOSS_LIMIT = -10
 DAILY_PROFIT_TARGET = 2.0
 
 # ========================= PAYOUT MODE =========================
@@ -76,6 +76,18 @@ MIN_BODY_RATIO = 0.55
 MIN_CANDLE_RANGE = 1e-6
 SPIKE_RANGE_ATR = 2.5
 SPIKE_BODY_ATR = 1.8
+
+# ========================= TRADE QUALITY UPGRADES (ADDED ONLY) =========================
+# A) ATR Compression filter (want calm -> expansion)
+ATR_COMPRESSION_LOOKBACK = 30       # candles
+ATR_COMPRESSION_MAX = 0.95          # ATR_now must be < ATR_mean * this
+
+# B) Donchian squeeze (range tight before breakout)
+DONCHIAN_WIDTH_ATR_MAX = 1.0        # (Donchian width / ATR) must be <= this
+
+# C) Breakout follow-through (avoid tiny poke breakouts)
+FOLLOW_THROUGH_BODY_ATR_MIN = 0.60  # body/ATR in breakout direction must be >= this
+# ================================================================================
 
 # ========================= ANTI RATE-LIMIT =========================
 TICKS_GLOBAL_MIN_INTERVAL = 0.45
@@ -474,17 +486,23 @@ class DerivBreakoutBot:
     def _missing_for_side(self, side: str, checks: dict) -> list[str]:
         if side == "CALL":
             needed = [
-                "GATE_OK", "ATR_OK", "ADX_OK", "BIAS_UP",
+                "GATE_OK", "ATR_OK",
+                "ATR_COMPRESS_OK", "DONCHIAN_SQUEEZE_OK",
+                "ADX_OK", "BIAS_UP",
                 "EMA50_RISING", "EMA_DIFF_OK",
                 "STRONG_CANDLE", "SPIKE_OK",
-                "RSI_OK_CALL", "BREAKOUT_CALL",
+                "RSI_OK_CALL",
+                "BREAKOUT_CALL", "FOLLOW_THROUGH_CALL",
             ]
         else:
             needed = [
-                "GATE_OK", "ATR_OK", "ADX_OK", "BIAS_DOWN",
+                "GATE_OK", "ATR_OK",
+                "ATR_COMPRESS_OK", "DONCHIAN_SQUEEZE_OK",
+                "ADX_OK", "BIAS_DOWN",
                 "EMA50_FALLING", "EMA_DIFF_OK",
                 "STRONG_CANDLE", "SPIKE_OK",
-                "RSI_OK_PUT", "BREAKOUT_PUT",
+                "RSI_OK_PUT",
+                "BREAKOUT_PUT", "FOLLOW_THROUGH_PUT",
             ]
         return [k for k in needed if not checks.get(k, False)]
 
@@ -558,6 +576,19 @@ class DerivBreakoutBot:
                 atr_ok = is_finite(atr_now) and atr_now > 1e-12
                 adx_ok = is_finite(adx_now) and adx_now >= float(ADX_MIN)
 
+                # ====== Trade-quality Upgrade A: ATR compression (added only) ======
+                atr_mean = float("nan")
+                atr_compress_ok = False
+                if atr_ok and len(atr) >= (ATR_COMPRESSION_LOOKBACK + 5):
+                    recent = atr[-(ATR_COMPRESSION_LOOKBACK + 2):-2]  # exclude current forming and confirm candle itself
+                    try:
+                        atr_mean = float(np.nanmean(recent))
+                    except Exception:
+                        atr_mean = float("nan")
+                    if is_finite(atr_mean) and atr_mean > 0:
+                        atr_compress_ok = atr_now < (atr_mean * float(ATR_COMPRESSION_MAX))
+                # =================================================================
+
                 rsi = calculate_rsi(closes, RSI_PERIOD)
                 rsi_now = float(rsi[-2]) if len(rsi) and not np.isnan(rsi[-2]) else float("nan")
                 rsi_ok_call = is_finite(rsi_now) and (RSI_CALL_MIN <= rsi_now <= RSI_CALL_MAX)
@@ -599,6 +630,12 @@ class DerivBreakoutBot:
                 window_high = float(np.max(highs[-(DONCHIAN_LEN + 2):-2]))
                 window_low = float(np.min(lows[-(DONCHIAN_LEN + 2):-2]))
 
+                # ====== Trade-quality Upgrade B: Donchian squeeze (added only) ======
+                donchian_width = float(window_high - window_low)
+                donchian_width_atr = (donchian_width / atr_now) if (atr_ok and atr_now > 0) else float("nan")
+                donchian_squeeze_ok = is_finite(donchian_width_atr) and (donchian_width_atr <= float(DONCHIAN_WIDTH_ATR_MAX))
+                # ====================================================================
+
                 buf = (float(ATR_BREAKOUT_K) * atr_now) if atr_ok else 0.0
                 call_break_level = window_high + buf
                 put_break_level = window_low - buf
@@ -606,11 +643,20 @@ class DerivBreakoutBot:
                 breakout_call = c_close > call_break_level
                 breakout_put = c_close < put_break_level
 
+                # ====== Trade-quality Upgrade C: follow-through (added only) ======
+                body_dir_call_atr = ((c_close - c_open) / atr_now) if (atr_ok and atr_now > 0) else float("nan")
+                body_dir_put_atr = ((c_open - c_close) / atr_now) if (atr_ok and atr_now > 0) else float("nan")
+                follow_through_call = is_finite(body_dir_call_atr) and (body_dir_call_atr >= float(FOLLOW_THROUGH_BODY_ATR_MIN))
+                follow_through_put = is_finite(body_dir_put_atr) and (body_dir_put_atr >= float(FOLLOW_THROUGH_BODY_ATR_MIN))
+                # ==================================================================
+
                 last_price = await self.fetch_last_price(symbol)
 
                 checks = {
                     "GATE_OK": ok_gate,
                     "ATR_OK": atr_ok,
+                    "ATR_COMPRESS_OK": atr_compress_ok,
+                    "DONCHIAN_SQUEEZE_OK": donchian_squeeze_ok,
                     "ADX_OK": adx_ok,
                     "BIAS_UP": bias_up,
                     "BIAS_DOWN": bias_down,
@@ -624,19 +670,27 @@ class DerivBreakoutBot:
                     "RSI_OK_PUT": rsi_ok_put,
                     "BREAKOUT_CALL": breakout_call,
                     "BREAKOUT_PUT": breakout_put,
+                    "FOLLOW_THROUGH_CALL": follow_through_call,
+                    "FOLLOW_THROUGH_PUT": follow_through_put,
                 }
 
                 call_ready = (
-                    checks["GATE_OK"] and checks["ATR_OK"] and checks["ADX_OK"] and checks["BIAS_UP"]
+                    checks["GATE_OK"] and checks["ATR_OK"]
+                    and checks["ATR_COMPRESS_OK"] and checks["DONCHIAN_SQUEEZE_OK"]
+                    and checks["ADX_OK"] and checks["BIAS_UP"]
                     and checks["EMA50_RISING"] and checks["EMA_DIFF_OK"]
                     and checks["STRONG_CANDLE"] and checks["SPIKE_OK"]
                     and checks["RSI_OK_CALL"] and checks["BREAKOUT_CALL"]
+                    and checks["FOLLOW_THROUGH_CALL"]
                 )
                 put_ready = (
-                    checks["GATE_OK"] and checks["ATR_OK"] and checks["ADX_OK"] and checks["BIAS_DOWN"]
+                    checks["GATE_OK"] and checks["ATR_OK"]
+                    and checks["ATR_COMPRESS_OK"] and checks["DONCHIAN_SQUEEZE_OK"]
+                    and checks["ADX_OK"] and checks["BIAS_DOWN"]
                     and checks["EMA50_FALLING"] and checks["EMA_DIFF_OK"]
                     and checks["STRONG_CANDLE"] and checks["SPIKE_OK"]
                     and checks["RSI_OK_PUT"] and checks["BREAKOUT_PUT"]
+                    and checks["FOLLOW_THROUGH_PUT"]
                 )
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
@@ -652,6 +706,9 @@ class DerivBreakoutBot:
                 if atr_ok:
                     why.append(f"EMA diff/ATR {ema_diff_atr:.3f} (min {EMA_DIFF_ATR_MIN})")
                     why.append(f"EMA50 slope/ATR {ema50_slope_atr:.3f} (min {EMA_SLOPE_ATR_MIN})")
+                    why.append(f"ATR compression: ATR_now {atr_now:.5f} | ATR_mean({ATR_COMPRESSION_LOOKBACK}) {atr_mean:.5f} | need < {ATR_COMPRESSION_MAX:.2f}x")
+                    why.append(f"Donchian width/ATR {donchian_width_atr:.2f} (max {DONCHIAN_WIDTH_ATR_MAX:.2f})")
+                    why.append(f"Follow-through: body_dir_call/ATR {body_dir_call_atr:.2f} | body_dir_put/ATR {body_dir_put_atr:.2f} (min {FOLLOW_THROUGH_BODY_ATR_MIN:.2f})")
                 why.append(f"Donchian({DONCHIAN_LEN}) H/L {window_high:.5f}/{window_low:.5f} | buffer {buf:.5f}")
                 why.append(f"CALL needs close > {call_break_level:.5f} | PUT needs close < {put_break_level:.5f}")
                 why.append(f"Body ratio {body_ratio:.2f} (min {MIN_BODY_RATIO}) | Spike? range/ATR {range_atr:.2f} body/ATR {body_atr:.2f}")
@@ -874,6 +931,8 @@ def _humanize_key(k: str) -> str:
     mapping = {
         "GATE_OK": "Gate (risk limits/cooldown)",
         "ATR_OK": "ATR ready",
+        "ATR_COMPRESS_OK": "ATR compression (calm before breakout)",
+        "DONCHIAN_SQUEEZE_OK": "Donchian squeeze (tight range)",
         "ADX_OK": "ADX trend strength (trend vs range)",
         "BIAS_UP": "Trend bias UP (EMA20 > EMA50)",
         "BIAS_DOWN": "Trend bias DOWN (EMA20 < EMA50)",
@@ -886,6 +945,8 @@ def _humanize_key(k: str) -> str:
         "RSI_OK_PUT": "RSI ok for PUT",
         "BREAKOUT_CALL": "Breakout above CALL level",
         "BREAKOUT_PUT": "Breakout below PUT level",
+        "FOLLOW_THROUGH_CALL": "Follow-through CALL (body/ATR)",
+        "FOLLOW_THROUGH_PUT": "Follow-through PUT (body/ATR)",
         "SLOPE_OK": "EMA50 slope strong enough",
     }
     return mapping.get(k, k)
@@ -942,17 +1003,23 @@ def _focus_side_from_checks(checks: dict) -> str:
 def _waiting_list_for_side(side: str, checks: dict) -> list[str]:
     if side == "CALL":
         needed = [
-            "GATE_OK", "ATR_OK", "ADX_OK", "BIAS_UP",
+            "GATE_OK", "ATR_OK",
+            "ATR_COMPRESS_OK", "DONCHIAN_SQUEEZE_OK",
+            "ADX_OK", "BIAS_UP",
             "EMA50_RISING", "EMA_DIFF_OK",
             "STRONG_CANDLE", "SPIKE_OK",
             "RSI_OK_CALL", "BREAKOUT_CALL",
+            "FOLLOW_THROUGH_CALL",
         ]
     else:
         needed = [
-            "GATE_OK", "ATR_OK", "ADX_OK", "BIAS_DOWN",
+            "GATE_OK", "ATR_OK",
+            "ATR_COMPRESS_OK", "DONCHIAN_SQUEEZE_OK",
+            "ADX_OK", "BIAS_DOWN",
             "EMA50_FALLING", "EMA_DIFF_OK",
             "STRONG_CANDLE", "SPIKE_OK",
             "RSI_OK_PUT", "BREAKOUT_PUT",
+            "FOLLOW_THROUGH_PUT",
         ]
     return [k for k in needed if not bool(checks.get(k, False))]
 
@@ -1011,10 +1078,14 @@ def format_market_detail(sym: str, d: dict) -> str:
     key_checks = [
         ("Gate", "GATE_OK"),
         ("ADX", "ADX_OK"),
+        ("Compress", "ATR_COMPRESS_OK"),
+        ("Squeeze", "DONCHIAN_SQUEEZE_OK"),
         ("EMA sep", "EMA_DIFF_OK"),
         ("Slope up", "EMA50_RISING"),
         ("Slope dn", "EMA50_FALLING"),
         ("Candle", "STRONG_CANDLE"),
+        ("FollowC", "FOLLOW_THROUGH_CALL"),
+        ("FollowP", "FOLLOW_THROUGH_PUT"),
         ("Spike", "SPIKE_OK"),
         ("RSI call", "RSI_OK_CALL"),
         ("RSI put", "RSI_OK_PUT"),
