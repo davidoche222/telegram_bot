@@ -83,7 +83,7 @@ ATR_COMPRESSION_LOOKBACK = 30       # candles
 ATR_COMPRESSION_MAX = 0.95          # ATR_now must be < ATR_mean * this
 
 # B) Donchian squeeze (range tight before breakout)
-DONCHIAN_WIDTH_ATR_MAX = 1.0        # (Donchian width / ATR) must be <= this
+DONCHIAN_WIDTH_ATR_MAX = 10.0        # (Donchian width / ATR) must be <= this
 
 # C) Breakout follow-through (avoid tiny poke breakouts)
 FOLLOW_THROUGH_BODY_ATR_MIN = 0.60  # body/ATR in breakout direction must be >= this
