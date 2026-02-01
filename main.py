@@ -1,19 +1,16 @@
-# ✅ BOLLINGER BAND VERSION (2-minute expiry untouched)
+# ✅ DONCHIAN BREAKOUT VERSION (2-minute expiry untouched)
 # Strategy:
-# Trend Filter:
-#   - EMA20 > EMA50 => CALL only
-#   - EMA20 < EMA50 => PUT only
-#   - EMA50 slope must be strong in trade direction
-# Entry:
-#   - Touch BB in trend direction (touch candle)
-#   - Next candle closes back inside BB (confirmation candle)
-#   - Rejection candle body >= 55%
-#   - Bollinger Bands expanding (bandwidth rising)
+# Breakout:
+#   - CALL when confirm candle CLOSES above Donchian Upper (period N)
+#   - PUT when confirm candle CLOSES below Donchian Lower (period N)
+# Filters:
+#   - EMA50 slope must be strong in trade direction (avoids chop)
+#   - Donchian width must be "expanded" vs recent average (avoids tight ranges)
 # Execution:
 #   - 1M chart, 2-minute expiry (UNCHANGED)
 # Risk:
 #   - Martingale lock (same direction only during martingale steps)
-#   - Max 1 trade per BB-touch structure (prevents overtrading)
+#   - Max 1 trade per breakout structure (prevents overtrading same breakout)
 
 # ⚠️ SECURITY NOTE:
 # DO NOT paste tokens publicly. Rotate any tokens you already shared.
@@ -49,26 +46,27 @@ logger = logging.getLogger(__name__)
 
 # ========================= STRATEGY SETTINGS =========================
 TF_SEC = 60  # M1 candles
-CANDLES_COUNT = 120
+CANDLES_COUNT = 200  # a bit more history helps Donchian + filters
 
-DURATION_MIN = 2  # ✅ keep 2-minute expiry (DO NOT TOUCH)
+DURATION_MIN = 4 # ✅ keep 2-minute expiry (DO NOT TOUCH)
 
-# Trend filter
+# ---- Donchian breakout ----
+DONCHIAN_PERIOD = 20          # classic
+BREAKOUT_BUFFER = 0.0         # set to small value if you want: e.g. 0.05 (points)
+USE_HIGH_LOW_BANDS = True     # True = highest high/lowest low; False = uses closes
+
+# ---- Trend / chop filters ----
 EMA_SLOPE_LOOKBACK = 10
-EMA_SLOPE_MIN = 0.20  # strong slope threshold
+EMA_SLOPE_MIN = 0.20          # "strong slope" threshold (tune per index)
 
-# Bollinger Bands
-BB_PERIOD = 20
-BB_STD = 2.0
-BB_EXPAND_LOOKBACK = 3          # compare bandwidth now vs bandwidth N bars ago
-BB_EXPAND_MIN_RATIO = 1.02      # bandwidth_now >= bandwidth_prev * 1.02 (2% expansion)
-BB_TOUCH_EPS = 0.0              # optional extra buffer on touch (0.0 = exact)
+# Donchian width filter (avoid tight ranges / fakeouts)
+WIDTH_AVG_LOOKBACK = 30       # compare current width to avg width of last N
+WIDTH_MIN_RATIO = 1.10        # width_now must be >= avg_width * 1.10 (10% wider)
+MIN_WIDTH_ABS = 0.0           # optional absolute minimum width; keep 0.0 if unsure
 
-# Rejection candle rules
-MIN_BODY_RATIO = 0.55           # body >= 55% of candle range
+# Rejection / candle strength (optional but useful on M1)
+MIN_BODY_RATIO = 0.45
 MIN_CANDLE_RANGE = 1e-6
-BULL_CLOSE_POS_MIN = 0.65       # bullish candle should close in top 35%
-BEAR_CLOSE_POS_MAX = 0.35       # bearish candle should close in bottom 35%
 
 # ========================= SECTIONS =========================
 SECTIONS_PER_DAY = 4
@@ -107,28 +105,36 @@ def calculate_ema(values, period: int):
     return ema
 
 
-def calculate_bollinger(values, period=20, std=2.0):
+def calculate_donchian(highs, lows, closes, period=20, use_high_low=True):
     """
-    Returns: mid, upper, lower arrays (same length as values) with NaNs until ready
+    Returns arrays: upper, lower, mid (same length), NaNs until ready.
+    If use_high_low True: upper=max(high), lower=min(low).
+    Else: upper=max(close), lower=min(close).
     """
-    v = np.array(values, dtype=float)
-    n = len(v)
+    highs = np.array(highs, dtype=float)
+    lows = np.array(lows, dtype=float)
+    closes = np.array(closes, dtype=float)
+
+    n = len(closes)
     if n < period:
         return np.array([]), np.array([]), np.array([])
 
-    mid = np.full(n, np.nan, dtype=float)
     upper = np.full(n, np.nan, dtype=float)
     lower = np.full(n, np.nan, dtype=float)
+    mid = np.full(n, np.nan, dtype=float)
 
     for i in range(period - 1, n):
-        window = v[i - period + 1 : i + 1]
-        m = float(np.mean(window))
-        s = float(np.std(window, ddof=0))
-        mid[i] = m
-        upper[i] = m + std * s
-        lower[i] = m - std * s
+        if use_high_low:
+            hh = float(np.max(highs[i - period + 1 : i + 1]))
+            ll = float(np.min(lows[i - period + 1 : i + 1]))
+        else:
+            hh = float(np.max(closes[i - period + 1 : i + 1]))
+            ll = float(np.min(closes[i - period + 1 : i + 1]))
+        upper[i] = hh
+        lower[i] = ll
+        mid[i] = (hh + ll) / 2.0
 
-    return mid, upper, lower
+    return upper, lower, mid
 
 
 def build_candles_from_deriv(candles_raw):
@@ -206,8 +212,8 @@ class DerivSniperBot:
         self.market_debug = {m: {} for m in MARKETS}
         self.last_processed_closed_t0 = {m: 0 for m in MARKETS}
 
-        # ✅ Max 1 trade per BB structure:
-        # store last structure key per symbol: (touch_t0, direction)
+        # ✅ Max 1 trade per breakout structure:
+        # store last breakout key per symbol: (confirm_t0, direction, band_value_rounded)
         self.last_structure_key = {m: None for m in MARKETS}
 
         self.tz = ZoneInfo("Africa/Lagos")
@@ -223,7 +229,6 @@ class DerivSniperBot:
         # refresh cooldown
         self.status_cooldown_until = 0.0
 
-    # ---------- helpers ----------
     @staticmethod
     def _is_gatewayish_error(msg: str) -> bool:
         m = (msg or "").lower()
@@ -385,7 +390,6 @@ class DerivSniperBot:
             self.section_index = self._get_section_index_for_epoch(time.time())
             self.section_pause_until = 0.0
 
-            # reset structure keys daily
             self.last_structure_key = {m: None for m in MARKETS}
 
         self._sync_section_if_needed()
@@ -468,19 +472,16 @@ class DerivSniperBot:
                 ok_gate, gate = self.can_auto_trade()
 
                 candles = await self.fetch_real_m1_candles(symbol)
-                if len(candles) < 80:
+                if len(candles) < 120:
                     self.market_debug[symbol] = {
                         "time": time.time(),
                         "gate": "Waiting for more candles",
-                        "why": [f"Need more history (have {len(candles)}, need ~80)."],
+                        "why": [f"Need more history (have {len(candles)}, need ~120)."],
                     }
                     self._next_poll_epoch[symbol] = time.time() + 10
                     continue
 
-                # Use:
-                #   touch candle = candles[-3]
-                #   confirm candle (closed) = candles[-2]
-                touch = candles[-3]
+                # confirm candle = candles[-2] (closed)
                 confirm = candles[-2]
                 confirm_t0 = int(confirm["t0"])
 
@@ -491,119 +492,97 @@ class DerivSniperBot:
                     continue
 
                 closes = [x["c"] for x in candles]
+                highs = [x["h"] for x in candles]
+                lows = [x["l"] for x in candles]
 
-                # EMAs
-                ema20_arr = calculate_ema(closes, 20)
+                # EMA50 slope filter
                 ema50_arr = calculate_ema(closes, 50)
-                if len(ema20_arr) < 60 or len(ema50_arr) < 60:
+                if len(ema50_arr) < 80:
                     self.market_debug[symbol] = {
                         "time": time.time(),
                         "gate": "Indicators",
-                        "why": ["EMA20/EMA50 not ready yet."],
+                        "why": ["EMA50 not ready yet."],
                     }
                     self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
 
-                ema20_confirm = float(ema20_arr[-2])
-                ema50_confirm = float(ema50_arr[-2])
-
-                # EMA50 slope (strength)
+                ema50_now = float(ema50_arr[-2])
                 slope_ok = False
                 ema50_slope = 0.0
                 ema50_rising = False
                 ema50_falling = False
                 if len(ema50_arr) >= (EMA_SLOPE_LOOKBACK + 3):
                     ema50_prev = float(ema50_arr[-(EMA_SLOPE_LOOKBACK + 2)])
-                    ema50_slope = ema50_confirm - ema50_prev
+                    ema50_slope = ema50_now - ema50_prev
                     ema50_rising = ema50_slope > EMA_SLOPE_MIN
                     ema50_falling = ema50_slope < -EMA_SLOPE_MIN
                     slope_ok = True
 
-                # Bollinger Bands (use closes)
-                bb_mid, bb_upper, bb_lower = calculate_bollinger(closes, BB_PERIOD, BB_STD)
-                if len(bb_mid) < 60 or np.isnan(bb_mid[-2]) or np.isnan(bb_lower[-2]) or np.isnan(bb_upper[-2]):
+                # Donchian bands
+                dc_upper, dc_lower, dc_mid = calculate_donchian(
+                    highs, lows, closes,
+                    period=DONCHIAN_PERIOD,
+                    use_high_low=USE_HIGH_LOW_BANDS
+                )
+                if len(dc_upper) < 80 or np.isnan(dc_upper[-2]) or np.isnan(dc_lower[-2]):
                     self.market_debug[symbol] = {
                         "time": time.time(),
                         "gate": "Indicators",
-                        "why": ["Bollinger Bands not ready yet."],
+                        "why": ["Donchian not ready yet."],
                     }
                     self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
 
-                lower_touch = float(bb_lower[-3])
-                upper_touch = float(bb_upper[-3])
-                lower_confirm = float(bb_lower[-2])
-                upper_confirm = float(bb_upper[-2])
+                upper_now = float(dc_upper[-2])
+                lower_now = float(dc_lower[-2])
+                width_now = max(0.0, upper_now - lower_now)
 
-                # BB expanding (bandwidth rising)
-                bw_now = float(bb_upper[-2] - bb_lower[-2])
-                bw_prev_idx = max(0, len(bb_upper) - 2 - BB_EXPAND_LOOKBACK)
-                bw_prev = float(bb_upper[bw_prev_idx] - bb_lower[bw_prev_idx]) if not np.isnan(bb_upper[bw_prev_idx]) else bw_now
-                bb_expanding = (bw_now >= (bw_prev * BB_EXPAND_MIN_RATIO))
+                # width avg filter
+                start_idx = max(0, len(dc_upper) - 2 - WIDTH_AVG_LOOKBACK)
+                widths = []
+                for i in range(start_idx, len(dc_upper) - 1):
+                    if not np.isnan(dc_upper[i]) and not np.isnan(dc_lower[i]):
+                        widths.append(float(dc_upper[i] - dc_lower[i]))
+                width_avg = float(np.mean(widths)) if widths else width_now
+                width_ok = (width_now >= width_avg * WIDTH_MIN_RATIO) and (width_now >= MIN_WIDTH_ABS)
 
-                # Trend direction
-                uptrend = ema20_confirm > ema50_confirm
-                downtrend = ema20_confirm < ema50_confirm
-
-                # Candle stats for confirm candle (rejection candle)
+                # confirm candle stats (optional strength)
                 c_open = float(confirm["o"])
                 c_close = float(confirm["c"])
                 c_high = float(confirm["h"])
                 c_low = float(confirm["l"])
                 c_range = max(MIN_CANDLE_RANGE, c_high - c_low)
-                body = abs(c_close - c_open)
-                body_ratio = body / c_range
-                strong_reject = body_ratio >= float(MIN_BODY_RATIO)
+                body_ratio = abs(c_close - c_open) / c_range
+                strong_candle = body_ratio >= float(MIN_BODY_RATIO)
 
-                close_pos = (c_close - c_low) / (c_range + 1e-12)
-                bull_close_strong = close_pos >= float(BULL_CLOSE_POS_MIN)
-                bear_close_strong = close_pos <= float(BEAR_CLOSE_POS_MAX)
+                # breakout conditions (close above/below band + optional buffer)
+                breakout_call = c_close > (upper_now + float(BREAKOUT_BUFFER))
+                breakout_put = c_close < (lower_now - float(BREAKOUT_BUFFER))
 
-                bull_confirm = c_close > c_open
-                bear_confirm = c_close < c_open
+                # structure key so we don't trade same breakout repeatedly
+                # (band rounded reduces duplicate spam)
+                call_key = (confirm_t0, "CALL", round(upper_now, 5))
+                put_key = (confirm_t0, "PUT", round(lower_now, 5))
 
-                # Touch candle touches band in trend direction
-                t_low = float(touch["l"])
-                t_high = float(touch["h"])
-                touch_lower = t_low <= (lower_touch + BB_TOUCH_EPS)
-                touch_upper = t_high >= (upper_touch - BB_TOUCH_EPS)
-
-                # Confirm closes back inside
-                back_inside_long = c_close > lower_confirm
-                back_inside_short = c_close < upper_confirm
-
-                # ✅ Setup keys: "one trade per structure"
-                # A "structure" is defined by the touch candle timestamp + direction.
-                call_structure_key = (int(touch["t0"]), "CALL")
-                put_structure_key = (int(touch["t0"]), "PUT")
-
-                # Entry rules
                 call_ready = (
-                    uptrend
-                    and slope_ok and ema50_rising
-                    and bb_expanding
-                    and touch_lower
-                    and back_inside_long
-                    and bull_confirm
-                    and strong_reject and bull_close_strong
-                    and (self.last_structure_key[symbol] != call_structure_key)
+                    slope_ok and ema50_rising
+                    and width_ok
+                    and strong_candle
+                    and breakout_call
+                    and (self.last_structure_key[symbol] != call_key)
                 )
 
                 put_ready = (
-                    downtrend
-                    and slope_ok and ema50_falling
-                    and bb_expanding
-                    and touch_upper
-                    and back_inside_short
-                    and bear_confirm
-                    and strong_reject and bear_close_strong
-                    and (self.last_structure_key[symbol] != put_structure_key)
+                    slope_ok and ema50_falling
+                    and width_ok
+                    and strong_candle
+                    and breakout_put
+                    and (self.last_structure_key[symbol] != put_key)
                 )
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
 
-                # ✅ Martingale direction lock:
-                # if martingale_step > 0, only allow trades in last_signal direction
+                # ✅ Martingale direction lock
                 if self.martingale_step > 0 and self.last_signal:
                     if signal is None:
                         call_ready = False
@@ -612,24 +591,20 @@ class DerivSniperBot:
                         call_ready = False
                         put_ready = False
 
-                # Debug labels
-                trend_label = "UPTREND" if uptrend else "DOWNTREND" if downtrend else "SIDEWAYS"
+                # Debug
                 slope_label = "EMA50 SLOPE ↑" if ema50_rising else "EMA50 SLOPE ↓" if ema50_falling else "EMA50 SLOPE FLAT"
-                bb_label = f"BB Expanding: {'✅' if bb_expanding else '❌'} (bw {bw_now:.5f} vs {bw_prev:.5f})"
+                dc_label = f"Donchian({DONCHIAN_PERIOD}) U:{upper_now:.5f} L:{lower_now:.5f} W:{width_now:.5f}"
+                width_label = f"Width OK: {'✅' if width_ok else '❌'} (now {width_now:.5f} vs avg {width_avg:.5f})"
 
                 block_parts = []
                 if not slope_ok:
                     block_parts.append("SLOPE N/A")
-                if uptrend and not ema50_rising:
-                    block_parts.append("EMA50 NOT RISING")
-                if downtrend and not ema50_falling:
-                    block_parts.append("EMA50 NOT FALLING")
-                if not bb_expanding:
-                    block_parts.append("BB NOT EXPANDING")
-                if uptrend and not touch_lower:
-                    block_parts.append("NO LOWER BB TOUCH")
-                if downtrend and not touch_upper:
-                    block_parts.append("NO UPPER BB TOUCH")
+                if not ema50_rising and not ema50_falling:
+                    block_parts.append("EMA50 FLAT")
+                if not width_ok:
+                    block_parts.append("RANGE TOO TIGHT")
+                if not strong_candle:
+                    block_parts.append("WEAK CANDLE")
                 if signal is None:
                     block_parts.append("NO SIGNAL")
                 if self.martingale_step > 0 and self.last_signal:
@@ -652,9 +627,9 @@ class DerivSniperBot:
                     "gate": gate,
                     "last_closed": confirm_t0,
                     "signal": signal,
-                    "trend_label": trend_label,
                     "slope_label": slope_label,
-                    "bb_label": bb_label,
+                    "dc_label": dc_label,
+                    "width_label": width_label,
                     "body_ratio": body_ratio,
                     "block_label": block_label,
                     "why": why[:10],
@@ -666,10 +641,10 @@ class DerivSniperBot:
                     continue
 
                 if call_ready:
-                    self.last_structure_key[symbol] = call_structure_key
+                    self.last_structure_key[symbol] = call_key
                     await self.execute_trade("CALL", symbol, source="AUTO")
                 elif put_ready:
-                    self.last_structure_key[symbol] = put_structure_key
+                    self.last_structure_key[symbol] = put_key
                     await self.execute_trade("PUT", symbol, source="AUTO")
 
             except asyncio.CancelledError:
@@ -701,6 +676,7 @@ class DerivSniperBot:
             try:
                 import math
 
+                # ✅ Martingale by PAYOUT (Deriv will quote the stake that matches this payout)
                 payout = float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step))
                 payout = money2(payout)
 
@@ -730,19 +706,22 @@ class DerivSniperBot:
 
                 p = prop["proposal"]
                 proposal_id = p["id"]
-                ask_price = float(p.get("ask_price", 0.0))
+                ask_price = float(p.get("ask_price", 0.0))  # ✅ stake required for requested payout
                 if ask_price <= 0:
                     await self.safe_send_tg("❌ Proposal returned invalid ask_price.")
                     return
 
-                if ask_price > float(MAX_STAKE_ALLOWED):
+                # ✅ Cap martingale using MARTINGALE_MAX_STAKE (not MAX_STAKE_ALLOWED)
+                if ask_price > float(MARTINGALE_MAX_STAKE):
                     await self.safe_send_tg(
-                        f"⛔️ Skipped trade: payout=${payout:.2f} needs stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
+                        f"⛔️ Skipped trade: payout=${payout:.2f} requires stake=${ask_price:.2f} "
+                        f"> martingale cap ${MARTINGALE_MAX_STAKE:.2f}"
                     )
                     self.cooldown_until = time.time() + COOLDOWN_SEC
                     return
 
-                buy_price_cap = float(MAX_STAKE_ALLOWED)
+                # ✅ Buy using EXACT stake that matches payout
+                buy_price_cap = money2(ask_price)
 
                 buy = await self.safe_deriv_call("buy", {"buy": proposal_id, "price": buy_price_cap}, retries=6)
                 if "error" in buy:
@@ -757,12 +736,11 @@ class DerivSniperBot:
 
                 if source == "AUTO":
                     self.trades_today += 1
-                    # remember direction for martingale lock
-                    self.last_signal = side
+                    self.last_signal = side  # lock direction during martingale sequence
 
                 safe_symbol = str(symbol).replace("_", " ")
                 msg = (
-                    f"🚀 {side} TRADE OPENED (BB Strategy)\n"
+                    f"🚀 {side} TRADE OPENED (Donchian Breakout)\n"
                     f"🛒 Market: {safe_symbol}\n"
                     f"⏱ Expiry: {DURATION_MIN}m\n"
                     f"🎁 Payout: ${payout:.2f}\n"
@@ -880,9 +858,9 @@ def format_market_detail(sym: str, d: dict) -> str:
     last_closed = d.get("last_closed", 0)
     signal = d.get("signal") or "—"
 
-    trend_label = d.get("trend_label", "—")
     slope_label = d.get("slope_label", "—")
-    bb_label = d.get("bb_label", "—")
+    dc_label = d.get("dc_label", "—")
+    width_label = d.get("width_label", "—")
     body_ratio = d.get("body_ratio", None)
     block_label = d.get("block_label", "—")
 
@@ -899,9 +877,9 @@ def format_market_detail(sym: str, d: dict) -> str:
         f"Gate: {gate}\n"
         f"Last closed: {fmt_time_hhmmss(last_closed)}\n"
         f"────────────────\n"
-        f"Trend: {trend_label}\n"
         f"{slope_label}\n"
-        f"{bb_label}\n"
+        f"{dc_label}\n"
+        f"{width_label}\n"
         f"Stats: {extra_line}\n"
         f"Filters: {block_label}\n"
         f"Signal: {signal}\n"
@@ -944,7 +922,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             return
         bot_logic.is_scanning = True
         bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
-        await _safe_edit(q, "🔍 SCANNER ACTIVE (BB Strategy)\n✅ Press STATUS to monitor.", reply_markup=main_keyboard())
+        await _safe_edit(q, "🔍 SCANNER ACTIVE (Donchian Breakout)\n✅ Press STATUS to monitor.", reply_markup=main_keyboard())
 
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
@@ -986,38 +964,13 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
         _ok, gate = bot_logic.can_auto_trade()
 
-        trade_status = "No Active Trade"
-        if bot_logic.active_trade_info and bot_logic.api:
-            try:
-                res = await bot_logic.safe_deriv_call(
-                    "proposal_open_contract",
-                    {"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info},
-                    retries=4,
-                )
-                pnl = float(res["proposal_open_contract"].get("profit", 0))
-                rem = max(0, int(DURATION_MIN * 60) - int(time.time() - bot_logic.trade_start_time))
-                icon = "✅ PROFIT" if pnl > 0 else "❌ LOSS" if pnl < 0 else "➖ FLAT"
-                mkt_clean = str(bot_logic.active_market).replace("_", " ")
-                trade_status = f"🚀 Active Trade ({mkt_clean})\n📈 PnL: {icon} ({pnl:+.2f})\n⏳ Left: {rem}s"
-            except Exception:
-                trade_status = "🚀 Active Trade: Syncing..."
-
-        pause_line = "⏸ Paused until 12:00am WAT\n" if time.time() < bot_logic.pause_until else ""
-        section_line = f"🧩 Section paused until {fmt_hhmm(bot_logic.section_pause_until)}\n" if time.time() < bot_logic.section_pause_until else ""
-
-        next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(bot_logic.martingale_step)))
-
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"{pause_line}{section_line}"
-            f"🧩 Section: {bot_logic.section_index}/{SECTIONS_PER_DAY} | Section PnL: {bot_logic.section_profit:+.2f} / +{SECTION_PROFIT_TARGET:.2f} | Sections won: {bot_logic.sections_won_today}\n"
-            f"🎁 Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
-            f"🛡️ Martingale Lock: {bot_logic.last_signal if bot_logic.martingale_step > 0 else 'OFF'}\n"
-            f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
+            f"🎁 Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS} | Lock: {bot_logic.last_signal if bot_logic.martingale_step > 0 else 'OFF'}\n"
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
-            f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━\n"
             f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
             f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
             f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
@@ -1034,7 +987,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        "💎 Deriv Bot (Bollinger Strategy)\n"
+        "💎 Deriv Bot (Donchian Breakout)\n"
         f"🕯 Timeframe: M1 | ⏱ Expiry: {DURATION_MIN}m\n",
         reply_markup=main_keyboard(),
     )
