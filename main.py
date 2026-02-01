@@ -774,10 +774,8 @@ class DerivSniperBot:
                     self.cooldown_until = time.time() + COOLDOWN_SEC
                     return
 
-                # ✅ Buy using EXACT stake that matches payout
-                buy_price_cap = money2(ask_price)
-
-                buy = await self.safe_deriv_call("buy", {"buy": proposal_id, "price": buy_price_cap}, retries=6)
+                # ✅ Buy using SAFE cap (prevents rejection if ask_price shifts slightly)
+                buy = await self.safe_deriv_call("buy", {"buy": proposal_id, "price": float(MARTINGALE_MAX_STAKE)}, retries=6)
                 if "error" in buy:
                     err_msg = str(buy["error"].get("message", "Buy error"))
                     await self.safe_send_tg(f"❌ Trade Refused:\n{err_msg}")
