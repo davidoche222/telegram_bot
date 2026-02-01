@@ -51,7 +51,7 @@ CANDLES_COUNT = 200  # a bit more history helps Donchian + filters
 DURATION_MIN = 4 # ✅ keep 2-minute expiry (DO NOT TOUCH)
 
 # ---- Donchian breakout ----
-DONCHIAN_PERIOD = 20          # classic
+DONCHIAN_PERIOD = 14         # classic
 BREAKOUT_BUFFER = 0.0         # set to small value if you want: e.g. 0.05 (points)
 USE_HIGH_LOW_BANDS = True     # True = highest high/lowest low; False = uses closes
 
@@ -533,14 +533,25 @@ class DerivSniperBot:
                     self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
 
-                upper_now = float(dc_upper[-2])
-                lower_now = float(dc_lower[-2])
-                width_now = max(0.0, upper_now - lower_now)
+                # ✅ DONCHIAN "PREVIOUS BAND" FIX:
+                # confirm candle must be compared to the band computed BEFORE it closed (index -3)
+                if np.isnan(dc_upper[-3]) or np.isnan(dc_lower[-3]):
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "gate": "Indicators",
+                        "why": ["Donchian prev band not ready yet."],
+                    }
+                    self.last_processed_closed_t0[symbol] = confirm_t0
+                    continue
 
-                # width avg filter
-                start_idx = max(0, len(dc_upper) - 2 - WIDTH_AVG_LOOKBACK)
+                upper_prev = float(dc_upper[-3])
+                lower_prev = float(dc_lower[-3])
+                width_now = max(0.0, upper_prev - lower_prev)
+
+                # width avg filter (exclude the confirm candle)
+                start_idx = max(0, len(dc_upper) - 3 - WIDTH_AVG_LOOKBACK)
                 widths = []
-                for i in range(start_idx, len(dc_upper) - 1):
+                for i in range(start_idx, len(dc_upper) - 2):
                     if not np.isnan(dc_upper[i]) and not np.isnan(dc_lower[i]):
                         widths.append(float(dc_upper[i] - dc_lower[i]))
                 width_avg = float(np.mean(widths)) if widths else width_now
@@ -555,14 +566,13 @@ class DerivSniperBot:
                 body_ratio = abs(c_close - c_open) / c_range
                 strong_candle = body_ratio >= float(MIN_BODY_RATIO)
 
-                # breakout conditions (close above/below band + optional buffer)
-                breakout_call = c_close > (upper_now + float(BREAKOUT_BUFFER))
-                breakout_put = c_close < (lower_now - float(BREAKOUT_BUFFER))
+                # breakout conditions (compare to PREVIOUS band + optional buffer)
+                breakout_call = c_close > (upper_prev + float(BREAKOUT_BUFFER))
+                breakout_put = c_close < (lower_prev - float(BREAKOUT_BUFFER))
 
                 # structure key so we don't trade same breakout repeatedly
-                # (band rounded reduces duplicate spam)
-                call_key = (confirm_t0, "CALL", round(upper_now, 5))
-                put_key = (confirm_t0, "PUT", round(lower_now, 5))
+                call_key = (confirm_t0, "CALL", round(upper_prev, 5))
+                put_key = (confirm_t0, "PUT", round(lower_prev, 5))
 
                 call_ready = (
                     slope_ok and ema50_rising
@@ -580,20 +590,21 @@ class DerivSniperBot:
                     and (self.last_structure_key[symbol] != put_key)
                 )
 
-                signal = "CALL" if call_ready else "PUT" if put_ready else None
-
                 # ✅ Martingale direction lock
                 if self.martingale_step > 0 and self.last_signal:
-                    if signal is None:
+                    if (call_ready or put_ready) and (("CALL" if call_ready else "PUT") != self.last_signal):
                         call_ready = False
                         put_ready = False
-                    elif signal != self.last_signal:
-                        call_ready = False
-                        put_ready = False
+                    elif (not call_ready and not put_ready):
+                        # no ready signal anyway; leave as is
+                        pass
 
-                # Debug
+                # recompute signal for status display (does not change trade logic)
+                signal = "CALL" if call_ready else "PUT" if put_ready else None
+
+                # Debug labels
                 slope_label = "EMA50 SLOPE ↑" if ema50_rising else "EMA50 SLOPE ↓" if ema50_falling else "EMA50 SLOPE FLAT"
-                dc_label = f"Donchian({DONCHIAN_PERIOD}) U:{upper_now:.5f} L:{lower_now:.5f} W:{width_now:.5f}"
+                dc_label = f"Donchian({DONCHIAN_PERIOD}) U:{upper_prev:.5f} L:{lower_prev:.5f} W:{width_now:.5f}"
                 width_label = f"Width OK: {'✅' if width_ok else '❌'} (now {width_now:.5f} vs avg {width_avg:.5f})"
 
                 block_parts = []
@@ -617,21 +628,64 @@ class DerivSniperBot:
                     why.append(f"Gate blocked: {gate}")
                 if signal and (call_ready or put_ready):
                     why.append(f"READY: {signal} (enter next candle)")
-                elif self.martingale_step > 0 and self.last_signal and signal and signal != self.last_signal:
-                    why.append(f"Blocked by Martingale Lock (need {self.last_signal})")
                 else:
                     why.append("No entry yet (conditions not aligned).")
+
+                # ---- Extra STATUS info (approaching breakout + waiting-for checklist) ----
+                live = candles[-1]
+                live_close = float(live["c"])
+
+                dist_to_upper = float((upper_prev + float(BREAKOUT_BUFFER)) - live_close)
+                dist_to_lower = float(live_close - (lower_prev - float(BREAKOUT_BUFFER)))
+
+                blocked_by_marti_lock = False
+                if self.martingale_step > 0 and self.last_signal:
+                    # if there is a breakout but wrong direction, show block
+                    if breakout_call and self.last_signal != "CALL":
+                        blocked_by_marti_lock = True
+                    if breakout_put and self.last_signal != "PUT":
+                        blocked_by_marti_lock = True
+
+                structure_seen = (self.last_structure_key[symbol] == call_key) or (self.last_structure_key[symbol] == put_key)
 
                 self.market_debug[symbol] = {
                     "time": time.time(),
                     "gate": gate,
                     "last_closed": confirm_t0,
-                    "signal": signal,
+
+                    # display signal (ready or not)
+                    "signal": signal or "—",
+
+                    # labels
                     "slope_label": slope_label,
                     "dc_label": dc_label,
                     "width_label": width_label,
-                    "body_ratio": body_ratio,
                     "block_label": block_label,
+
+                    # raw values for richer status
+                    "upper_now": upper_prev,
+                    "lower_now": lower_prev,
+                    "width_now": width_now,
+                    "width_avg": width_avg,
+                    "body_ratio": body_ratio,
+                    "ema50_slope": ema50_slope,
+
+                    # filter booleans
+                    "slope_ok": slope_ok,
+                    "ema50_rising": ema50_rising,
+                    "ema50_falling": ema50_falling,
+                    "width_ok": width_ok,
+                    "strong_candle": strong_candle,
+                    "breakout_call": breakout_call,
+                    "breakout_put": breakout_put,
+                    "blocked_by_marti_lock": blocked_by_marti_lock,
+                    "structure_seen": structure_seen,
+
+                    # live candle / approaching breakout info
+                    "last_live_close": live_close,
+                    "dist_to_upper": dist_to_upper,
+                    "dist_to_lower": dist_to_lower,
+
                     "why": why[:10],
                 }
 
@@ -856,13 +910,74 @@ def format_market_detail(sym: str, d: dict) -> str:
     age = int(time.time() - d.get("time", time.time()))
     gate = d.get("gate", "—")
     last_closed = d.get("last_closed", 0)
+
+    upper_now = d.get("upper_now", None)
+    lower_now = d.get("lower_now", None)
+    width_now = d.get("width_now", None)
+    width_avg = d.get("width_avg", None)
+
+    last_live_close = d.get("last_live_close", None)
+    dist_to_upper = d.get("dist_to_upper", None)
+    dist_to_lower = d.get("dist_to_lower", None)
+
     signal = d.get("signal") or "—"
+    body_ratio = d.get("body_ratio", None)
+    ema50_slope = d.get("ema50_slope", None)
+
+    slope_ok = d.get("slope_ok", False)
+    ema50_rising = d.get("ema50_rising", False)
+    ema50_falling = d.get("ema50_falling", False)
+    width_ok = d.get("width_ok", False)
+    strong_candle = d.get("strong_candle", False)
+    breakout_call = d.get("breakout_call", False)
+    breakout_put = d.get("breakout_put", False)
+    blocked_by_marti_lock = d.get("blocked_by_marti_lock", False)
+    structure_seen = d.get("structure_seen", False)
 
     slope_label = d.get("slope_label", "—")
     dc_label = d.get("dc_label", "—")
     width_label = d.get("width_label", "—")
-    body_ratio = d.get("body_ratio", None)
     block_label = d.get("block_label", "—")
+
+    approach_lines = []
+    if isinstance(last_live_close, (int, float)) and not np.isnan(last_live_close) and \
+       isinstance(upper_now, (int, float)) and isinstance(lower_now, (int, float)):
+
+        if isinstance(dist_to_upper, (int, float)) and isinstance(dist_to_lower, (int, float)):
+            approach_lines.append(f"Live close: {last_live_close:.5f}")
+            approach_lines.append(f"Δ to Upper: {dist_to_upper:+.5f} | Δ to Lower: {dist_to_lower:+.5f}")
+
+            thr = 0.00001
+            if isinstance(width_now, (int, float)) and width_now and width_now > 0:
+                thr = max(0.15 * width_now, 0.00001)
+
+            if 0 < dist_to_upper <= thr:
+                approach_lines.append("🟡 Approaching CALL breakout (near Upper)")
+            if 0 < dist_to_lower <= thr:
+                approach_lines.append("🟡 Approaching PUT breakout (near Lower)")
+            if dist_to_upper <= 0:
+                approach_lines.append("🟣 Above Upper NOW (breakout zone)")
+            if dist_to_lower <= 0:
+                approach_lines.append("🟣 Below Lower NOW (breakout zone)")
+
+    approach_block = "\n".join(approach_lines) if approach_lines else "—"
+
+    wait_lines = []
+    wait_lines.append("✅ Conditions checklist (what bot is waiting for):")
+    wait_lines.append(f"• Gate OK: {'✅' if gate == 'OK' else '❌'} ({gate})")
+    wait_lines.append(f"• EMA slope ready: {'✅' if slope_ok else '❌'}" + (f" (slope {ema50_slope:+.3f})" if isinstance(ema50_slope, (int, float)) else ""))
+    if isinstance(width_now, (int, float)) and isinstance(width_avg, (int, float)):
+        wait_lines.append(f"• Width OK: {'✅' if width_ok else '❌'} (now {width_now:.5f} vs avg {width_avg:.5f})")
+    else:
+        wait_lines.append(f"• Width OK: {'✅' if width_ok else '❌'}")
+
+    wait_lines.append(f"• Strong candle body: {'✅' if strong_candle else '❌'}" + (f" (body {body_ratio:.2f})" if isinstance(body_ratio, (int, float)) else ""))
+    wait_lines.append(f"• CALL breakout: {'✅' if breakout_call else '❌'} | Trend rising: {'✅' if ema50_rising else '❌'}")
+    wait_lines.append(f"• PUT breakout: {'✅' if breakout_put else '❌'} | Trend falling: {'✅' if ema50_falling else '❌'}")
+    wait_lines.append(f"• Martingale Lock: {'❌ BLOCKED' if blocked_by_marti_lock else '✅ OK'}")
+    wait_lines.append(f"• Structure already traded: {'❌ YES (blocked)' if structure_seen else '✅ NO'}")
+
+    wait_block = "\n".join(wait_lines)
 
     extra = []
     if isinstance(body_ratio, (int, float)) and not np.isnan(body_ratio):
@@ -883,6 +998,10 @@ def format_market_detail(sym: str, d: dict) -> str:
         f"Stats: {extra_line}\n"
         f"Filters: {block_label}\n"
         f"Signal: {signal}\n"
+        f"────────────────\n"
+        f"📌 Approaching breakout:\n{approach_block}\n"
+        f"────────────────\n"
+        f"{wait_block}\n"
         f"{why_line}\n"
     )
 
@@ -964,9 +1083,15 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
         _ok, gate = bot_logic.can_auto_trade()
 
+        section_pause_line = ""
+        if time.time() < bot_logic.section_pause_until:
+            section_pause_line = f"🧩 Section paused until {fmt_hhmm(bot_logic.section_pause_until)}\n"
+
         header = (
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
+            f"🧩 Section: {bot_logic.section_index}/{SECTIONS_PER_DAY} | Section PnL: {bot_logic.section_profit:+.2f} / +{SECTION_PROFIT_TARGET:.2f} | Sections won: {bot_logic.sections_won_today}\n"
+            f"{section_pause_line}"
             f"🎁 Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS} | Lock: {bot_logic.last_signal if bot_logic.martingale_step > 0 else 'OFF'}\n"
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
