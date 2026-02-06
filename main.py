@@ -87,7 +87,7 @@ STATUS_REFRESH_COOLDOWN_SEC = 10
 ADX_PERIOD = 14
 ATR_PERIOD = 14
 
-ADX_MIN = 25.0       # trend strength threshold
+ADX_MIN = 22.0       # trend strength threshold
 ATR_MIN = 0.0        # 0.0 = show ATR but don't block trades by ATR
 
 TREND_FILTER_MODE = "BOTH"  # "BOTH" requires ADX✅ and ATR✅, "EITHER" allows ADX✅ OR ATR✅
