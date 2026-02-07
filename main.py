@@ -37,29 +37,20 @@ TF_SEC = 60  # M1 candles
 CANDLES_COUNT = 300
 
 RSI_PERIOD = 14
-DURATION_MIN = 2  # ✅ 2-minute expiry
+DURATION_MIN = 3  # ✅ 2-minute expiry
 
-# ========================= STRATEGY 2 SETTINGS (BINARY) =========================
+# ========================= TREND FILTER (EMA) =========================
 EMA_TREND_PERIOD = 200
-EMA_PULLBACK_PERIOD = 50
+EMA_PULLBACK_PERIOD = 50  # kept (used as EMA50 trend structure)
 
 # ✅ loosen RSI for more entries but still quality
 RSI_CALL_MIN = 52.0
 RSI_PUT_MAX = 48.0
 
-STOCH_K_PERIOD = 5
-STOCH_D_PERIOD = 3
-STOCH_SMOOTH = 3
-STOCH_OVERSOLD = 20.0
-STOCH_OVERBOUGHT = 80.0
-
 # ========================= DAILY TARGETS / LIMITS =========================
-# ✅ remove daily profit stop (it blocks trade count)
 DAILY_PROFIT_TARGET = 999999.0
-# ✅ widen daily loss stop in can_auto_trade() (see below)
 
 # ========================= SECTIONS =========================
-# ✅ disable section pauses (they block trades)
 SECTIONS_PER_DAY = 1
 SECTION_PROFIT_TARGET = 999999
 SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)
@@ -76,27 +67,24 @@ MARTINGALE_MAX_STEPS = 4
 MARTINGALE_MAX_STAKE = 16.0
 
 # ========================= CANDLE STRENGTH FILTER =========================
-# ✅ loosen candle strength a bit (quality filter still ON)
 MIN_BODY_RATIO = 0.32
 MIN_CANDLE_RANGE = 1e-6
 
 # ========================= ENTRY QUALITY TOGGLES =========================
-# ✅ keep only high-impact filters for win-rate
 USE_ADX_FILTER = True
 USE_SPIKE_BLOCK = True
 USE_STRONG_CANDLE_FILTER = True
 
-# ❌ disable heavy blockers that kill frequency
-USE_STOCH_FILTER = False
-USE_NEXT_OPEN_FILTER = False
-USE_FLAT_BLOCK = False
-
-# ✅ frequency knob: distance to EMA50 allowed for pullback
-EMA50_PULLBACK_TOL = 0.18  # raise to 0.22 if under 20/day; lower to 0.14 if over 30/day
+# ========================= BREAKOUT STRATEGY SETTINGS (ONLY STRATEGY) =========================
+# We trade breakouts after a compression "box".
+BREAKOUT_BOX_LEN = 8               # range window (try 6–10)
+COMPRESSION_ATR_MAX = 1.20         # box height must be <= ATR * this (higher = more trades)
+COMPRESSION_BODY_ATR_MAX = 0.55    # avg candle body inside box must be <= ATR * this
+BREAKOUT_BUFFER = 0.0              # try 0.03–0.10 if you get fakeouts
 
 # ========================= ANTI RATE-LIMIT =========================
-TICKS_GLOBAL_MIN_INTERVAL = 0.35  # seconds between ANY ticks_history calls
-RATE_LIMIT_BACKOFF_BASE = 20      # seconds (will grow if rate limit repeats)
+TICKS_GLOBAL_MIN_INTERVAL = 0.35
+RATE_LIMIT_BACKOFF_BASE = 20
 
 # ========================= UI: REFRESH COOLDOWN =========================
 STATUS_REFRESH_COOLDOWN_SEC = 10
@@ -105,11 +93,8 @@ STATUS_REFRESH_COOLDOWN_SEC = 10
 ADX_PERIOD = 14
 ATR_PERIOD = 14
 
-# ✅ looser ADX to allow more trades but avoid chop
 ADX_MIN = 20.0
-ATR_MIN = 0.0        # 0.0 = show ATR but don't block trades by ATR
-
-# ✅ use EITHER so ATR_MIN=0 doesn't accidentally block if you later change it
+ATR_MIN = 0.0
 TREND_FILTER_MODE = "EITHER"
 
 
@@ -152,36 +137,6 @@ def calculate_rsi(values, period=14):
         rsi[i] = 100.0 - (100.0 / (1.0 + rs))
 
     return rsi
-
-
-def calculate_stochastic(highs, lows, closes, k_period=5, d_period=3, smooth=3):
-    highs = np.array(highs, dtype=float)
-    lows = np.array(lows, dtype=float)
-    closes = np.array(closes, dtype=float)
-
-    n = len(closes)
-    if n < k_period + smooth + d_period + 5:
-        return np.array([]), np.array([])
-
-    k_raw = np.full(n, np.nan, dtype=float)
-
-    for i in range(k_period - 1, n):
-        hh = np.max(highs[i - k_period + 1:i + 1])
-        ll = np.min(lows[i - k_period + 1:i + 1])
-        denom = (hh - ll) + 1e-12
-        k_raw[i] = 100.0 * ((closes[i] - ll) / denom)
-
-    # smooth %K
-    k_smooth = np.full(n, np.nan, dtype=float)
-    for i in range((k_period - 1) + (smooth - 1), n):
-        k_smooth[i] = np.nanmean(k_raw[i - smooth + 1:i + 1])
-
-    # %D = SMA of smoothed %K
-    d_line = np.full(n, np.nan, dtype=float)
-    for i in range((k_period - 1) + (smooth - 1) + (d_period - 1), n):
-        d_line[i] = np.nanmean(k_smooth[i - d_period + 1:i + 1])
-
-    return k_smooth, d_line
 
 
 def calculate_atr(highs, lows, closes, period=14):
@@ -589,7 +544,7 @@ class DerivSniperBot:
                     self._next_poll_epoch[symbol] = time.time() + 10
                     continue
 
-                pullback = candles[-3]
+                # confirm = last closed candle
                 confirm = candles[-2]
                 confirm_t0 = int(confirm["t0"])
 
@@ -603,11 +558,10 @@ class DerivSniperBot:
                 highs = [x["h"] for x in candles]
                 lows = [x["l"] for x in candles]
 
-                ema20_arr = calculate_ema(closes, 20)
                 ema50_arr = calculate_ema(closes, EMA_PULLBACK_PERIOD)
                 ema200_arr = calculate_ema(closes, EMA_TREND_PERIOD)
 
-                if len(ema20_arr) < 60 or len(ema50_arr) < 60 or len(ema200_arr) < 60:
+                if len(ema50_arr) < 60 or len(ema200_arr) < 60:
                     self.market_debug[symbol] = {
                         "time": time.time(),
                         "gate": "Indicators",
@@ -616,19 +570,8 @@ class DerivSniperBot:
                     self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
 
-                ema20_pullback = float(ema20_arr[-3])
-                ema20_confirm = float(ema20_arr[-2])
-
-                ema50_pullback = float(ema50_arr[-3])
                 ema50_confirm = float(ema50_arr[-2])
-
                 ema200_confirm = float(ema200_arr[-2])
-
-                # keep variables for UI
-                slope_ok = True
-                ema50_slope = 0.0
-                ema50_rising = False
-                ema50_falling = False
 
                 # RSI
                 rsi_arr = calculate_rsi(closes, RSI_PERIOD)
@@ -641,44 +584,6 @@ class DerivSniperBot:
                     self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
                 rsi_now = float(rsi_arr[-2])
-
-                # Stochastic (kept for UI/optional filter)
-                stoch_k, stoch_d = calculate_stochastic(
-                    highs, lows, closes,
-                    k_period=STOCH_K_PERIOD,
-                    d_period=STOCH_D_PERIOD,
-                    smooth=STOCH_SMOOTH
-                )
-                if (
-                    len(stoch_k) < 60
-                    or np.isnan(stoch_k[-2]) or np.isnan(stoch_d[-2])
-                    or np.isnan(stoch_k[-3]) or np.isnan(stoch_d[-3])
-                ):
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "gate": "Indicators",
-                        "why": ["Stochastic not ready yet."],
-                    }
-                    self.last_processed_closed_t0[symbol] = confirm_t0
-                    continue
-
-                k_prev = float(stoch_k[-3])
-                d_prev = float(stoch_d[-3])
-                k_now = float(stoch_k[-2])
-                d_now = float(stoch_d[-2])
-
-                stoch_turn_up = (
-                    (k_prev <= STOCH_OVERSOLD)
-                    and (k_now > k_prev)
-                    and (k_now > d_now)
-                    and (k_prev <= d_prev)
-                )
-                stoch_turn_down = (
-                    (k_prev >= STOCH_OVERBOUGHT)
-                    and (k_now < k_prev)
-                    and (k_now < d_now)
-                    and (k_prev >= d_prev)
-                )
 
                 # ADX + ATR
                 atr_arr = calculate_atr(highs, lows, closes, ATR_PERIOD)
@@ -703,7 +608,7 @@ class DerivSniperBot:
 
                 # Candle strength
                 bodies = [abs(float(candles[i]["c"]) - float(candles[i]["o"])) for i in range(-22, -2)]
-                avg_body = float(np.mean(bodies)) if len(bodies) >= 10 else float(
+                avg_body_all = float(np.mean(bodies)) if len(bodies) >= 10 else float(
                     np.mean([abs(float(c["c"]) - float(c["o"])) for c in candles[-60:-2]])
                 )
                 last_body = abs(c_close - c_open)
@@ -716,55 +621,79 @@ class DerivSniperBot:
 
                 # Spike block
                 spike_mult = 1.5
-                spike_block = (avg_body > 0 and last_body > spike_mult * avg_body)
+                spike_block = (avg_body_all > 0 and last_body > spike_mult * avg_body_all)
 
-                # Trend filter: EMA50 aligned with EMA200 + price on correct side
+                # Trend direction (we still trade breakouts in direction of trend)
                 trend_up = (ema50_confirm > ema200_confirm) and (c_close > ema200_confirm)
                 trend_down = (ema50_confirm < ema200_confirm) and (c_close < ema200_confirm)
 
-                # Pullback logic (✅ simplified): distance to EMA50 (tunable)
-                dist_to_ema50 = abs(c_close - ema50_confirm)
-                pullback_ok = dist_to_ema50 <= float(EMA50_PULLBACK_TOL)
+                # ========================= BREAKOUT ONLY =========================
+                # Build a compression box from the candles BEFORE the breakout candle.
+                # Use the last BREAKOUT_BOX_LEN candles ending at -3.
+                box_needed = int(BREAKOUT_BOX_LEN)
+                if box_needed < 3:
+                    box_needed = 3
 
-                # Optional "next open" (OFF by default)
-                next_open = float(candles[-1]["o"]) if len(candles) >= 1 else float("nan")
-                next_open_above_ema50 = (not np.isnan(next_open)) and (next_open > ema50_confirm)
-                next_open_below_ema50 = (not np.isnan(next_open)) and (next_open < ema50_confirm)
+                box_slice = candles[-(box_needed + 2):-2]  # excludes confirm candle (-2)
+                # if not enough, fallback
+                if len(box_slice) < box_needed:
+                    box_slice = candles[-(box_needed + 2):-2]
+
+                box_high = max(float(x["h"]) for x in box_slice)
+                box_low = min(float(x["l"]) for x in box_slice)
+                box_height = box_high - box_low
+
+                # Compression quality: box height and avg body are small relative to ATR
+                box_bodies = [abs(float(x["c"]) - float(x["o"])) for x in box_slice]
+                box_avg_body = float(np.mean(box_bodies)) if box_bodies else 0.0
+
+                atr_ref = atr_now if (not np.isnan(atr_now) and atr_now > 0) else 0.0
+                compression_ok = True
+                compression_why = []
+
+                if atr_ref > 0:
+                    if box_height > (atr_ref * float(COMPRESSION_ATR_MAX)):
+                        compression_ok = False
+                        compression_why.append("Box too tall")
+                    if box_avg_body > (atr_ref * float(COMPRESSION_BODY_ATR_MAX)):
+                        compression_ok = False
+                        compression_why.append("Bodies too big")
+                else:
+                    # if ATR not ready, don't block purely on compression sizing
+                    compression_why.append("ATR not ready")
+
+                # Breakout trigger (close breaks box + optional buffer)
+                buf = float(BREAKOUT_BUFFER)
+                breakout_up = (c_close > (box_high + buf))
+                breakout_down = (c_close < (box_low - buf))
 
                 call_rsi_ok = rsi_now >= RSI_CALL_MIN
                 put_rsi_ok = rsi_now <= RSI_PUT_MAX
 
-                # Optional filters
                 adx_filter_ok = (trend_filter_ok if USE_ADX_FILTER else True)
                 strong_ok = (strong_candle if USE_STRONG_CANDLE_FILTER else True)
                 spike_ok = ((not spike_block) if USE_SPIKE_BLOCK else True)
-                stoch_up_ok = (stoch_turn_up if USE_STOCH_FILTER else True)
-                stoch_down_ok = (stoch_turn_down if USE_STOCH_FILTER else True)
-                next_open_call_ok = (next_open_above_ema50 if USE_NEXT_OPEN_FILTER else True)
-                next_open_put_ok = (next_open_below_ema50 if USE_NEXT_OPEN_FILTER else True)
 
-                # ✅ Final signals (quality + more frequency)
                 call_ready = (
                     trend_up
-                    and pullback_ok
+                    and compression_ok
+                    and breakout_up
                     and bull_confirm
                     and call_rsi_ok
                     and adx_filter_ok
                     and strong_ok
                     and spike_ok
-                    and stoch_up_ok
-                    and next_open_call_ok
                 )
+
                 put_ready = (
                     trend_down
-                    and pullback_ok
+                    and compression_ok
+                    and breakout_down
                     and bear_confirm
                     and put_rsi_ok
                     and adx_filter_ok
                     and strong_ok
                     and spike_ok
-                    and stoch_down_ok
-                    and next_open_put_ok
                 )
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
@@ -773,25 +702,31 @@ class DerivSniperBot:
                 trend_label = "UPTREND" if trend_up else "DOWNTREND" if trend_down else "SIDEWAYS"
                 ema_label = "EMA50 ABOVE EMA200" if trend_up else "EMA50 BELOW EMA200" if trend_down else "EMA50 ~ EMA200"
                 trend_strength = "STRONG" if trend_up or trend_down else "WEAK"
-                pullback_label = f"PULLBACK NEAR EMA50 ✅ (±{EMA50_PULLBACK_TOL})" if pullback_ok else "WAITING PULLBACK NEAR EMA50…"
+
+                pullback_label = (
+                    f"BOX ✅ len={box_needed} | H={box_high:.3f} L={box_low:.3f} | ht={box_height:.3f}"
+                    if compression_ok
+                    else f"BOX ❌ ({', '.join(compression_why) if compression_why else 'not compressed'})"
+                )
+
                 confirm_close_label = (
-                    "CONFIRM BULL ✅" if bull_confirm else
-                    "CONFIRM BEAR ✅" if bear_confirm else
-                    "CONFIRM DOJI/FLAT"
+                    "BREAKOUT UP ✅" if breakout_up else
+                    "BREAKOUT DOWN ✅" if breakout_down else
+                    "WAITING BREAKOUT…"
                 )
                 slope_label = "—"
 
                 block_label_parts = []
+                if not compression_ok:
+                    block_label_parts.append("NO COMPRESSION")
                 if USE_SPIKE_BLOCK and spike_block:
                     block_label_parts.append("SPIKE BLOCK")
                 if USE_STRONG_CANDLE_FILTER and (not strong_candle):
                     block_label_parts.append("WEAK CANDLE")
                 if USE_ADX_FILTER and (not trend_filter_ok):
                     block_label_parts.append("ADX/ATR FAIL")
-                if USE_STOCH_FILTER and (not (stoch_turn_up or stoch_turn_down)):
-                    block_label_parts.append("STOCH FAIL")
-                if USE_NEXT_OPEN_FILTER and (not (next_open_above_ema50 or next_open_below_ema50)):
-                    block_label_parts.append("NEXT OPEN FAIL")
+                if not (trend_up or trend_down):
+                    block_label_parts.append("NO TREND")
 
                 block_label = " | ".join(block_label_parts) if block_label_parts else "OK"
 
@@ -799,7 +734,7 @@ class DerivSniperBot:
                 if not ok_gate:
                     why.append(f"Gate blocked: {gate}")
                 if signal:
-                    why.append(f"READY: {signal}")
+                    why.append(f"READY: {signal} (BREAKOUT)")
                 else:
                     why.append("No entry yet (conditions not aligned).")
 
@@ -817,7 +752,7 @@ class DerivSniperBot:
                     "slope_label": slope_label,
                     "block_label": block_label,
 
-                    "ema50_slope": ema50_slope,
+                    "ema50_slope": 0.0,  # kept for UI key compatibility
                     "rsi_now": rsi_now,
                     "body_ratio": body_ratio,
 
@@ -836,9 +771,9 @@ class DerivSniperBot:
                     continue
 
                 if call_ready:
-                    await self.execute_trade("CALL", symbol, source="AUTO", rsi_now=rsi_now, ema50_slope=ema50_slope)
+                    await self.execute_trade("CALL", symbol, source="AUTO", rsi_now=rsi_now, ema50_slope=0.0)
                 elif put_ready:
-                    await self.execute_trade("PUT", symbol, source="AUTO", rsi_now=rsi_now, ema50_slope=ema50_slope)
+                    await self.execute_trade("PUT", symbol, source="AUTO", rsi_now=rsi_now, ema50_slope=0.0)
 
             except asyncio.CancelledError:
                 break
@@ -972,11 +907,6 @@ class DerivSniperBot:
                     else:
                         self.martingale_halt = True
                         self.is_scanning = False
-
-                    # ✅ remove section pause-after-3-losses (trade blocker)
-                    # If you want a small cooldown instead, uncomment:
-                    # if self.consecutive_losses >= 3:
-                    #     self.cooldown_until = time.time() + 180  # 3 minutes
                 else:
                     self.consecutive_losses = 0
                     self.martingale_step = 0
@@ -1212,6 +1142,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
             f"📌 Trend Filters: ADX(min {ADX_MIN}) + ATR(min {ATR_MIN}) | Mode: {TREND_FILTER_MODE}\n"
+            f"📦 Breakout: box_len={BREAKOUT_BOX_LEN} | comp_ht<=ATR*{COMPRESSION_ATR_MAX} | body<=ATR*{COMPRESSION_BODY_ATR_MAX} | buf={BREAKOUT_BUFFER}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
             f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
             f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
