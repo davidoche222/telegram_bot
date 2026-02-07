@@ -21,8 +21,9 @@ APP_ID = 1089
 
 MARKETS = ["R_10", "R_25"]  # add more if you want
 
-COOLDOWN_SEC = 120
-MAX_TRADES_PER_DAY = 60
+# ✅ more trades/day, but still controlled
+COOLDOWN_SEC = 20
+MAX_TRADES_PER_DAY = 80
 MAX_CONSEC_LOSSES = 10
 
 TELEGRAM_TOKEN = "8589420556:AAHmB6YE9KIEu0tBIgWdd9baBDt0eDh5FY8"
@@ -42,8 +43,9 @@ DURATION_MIN = 2  # ✅ 2-minute expiry
 EMA_TREND_PERIOD = 200
 EMA_PULLBACK_PERIOD = 50
 
-RSI_CALL_MIN = 55.0   # ✅ Strategy 2: stricter RSI for binaries
-RSI_PUT_MAX = 45.0
+# ✅ loosen RSI for more entries but still quality
+RSI_CALL_MIN = 52.0
+RSI_PUT_MAX = 48.0
 
 STOCH_K_PERIOD = 5
 STOCH_D_PERIOD = 3
@@ -51,14 +53,15 @@ STOCH_SMOOTH = 3
 STOCH_OVERSOLD = 20.0
 STOCH_OVERBOUGHT = 80.0
 
-# ========================= EMA50 SLOPE + DAILY TARGET =========================
-EMA_SLOPE_LOOKBACK = 10
-EMA_SLOPE_MIN = 0.2
-DAILY_PROFIT_TARGET = 2.0
+# ========================= DAILY TARGETS / LIMITS =========================
+# ✅ remove daily profit stop (it blocks trade count)
+DAILY_PROFIT_TARGET = 999999.0
+# ✅ widen daily loss stop in can_auto_trade() (see below)
 
 # ========================= SECTIONS =========================
-SECTIONS_PER_DAY = 4
-SECTION_PROFIT_TARGET = 1
+# ✅ disable section pauses (they block trades)
+SECTIONS_PER_DAY = 1
+SECTION_PROFIT_TARGET = 999999
 SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)
 
 # ========================= PAYOUT MODE =========================
@@ -73,8 +76,23 @@ MARTINGALE_MAX_STEPS = 4
 MARTINGALE_MAX_STAKE = 16.0
 
 # ========================= CANDLE STRENGTH FILTER =========================
-MIN_BODY_RATIO = 0.45
+# ✅ loosen candle strength a bit (quality filter still ON)
+MIN_BODY_RATIO = 0.32
 MIN_CANDLE_RANGE = 1e-6
+
+# ========================= ENTRY QUALITY TOGGLES =========================
+# ✅ keep only high-impact filters for win-rate
+USE_ADX_FILTER = True
+USE_SPIKE_BLOCK = True
+USE_STRONG_CANDLE_FILTER = True
+
+# ❌ disable heavy blockers that kill frequency
+USE_STOCH_FILTER = False
+USE_NEXT_OPEN_FILTER = False
+USE_FLAT_BLOCK = False
+
+# ✅ frequency knob: distance to EMA50 allowed for pullback
+EMA50_PULLBACK_TOL = 0.18  # raise to 0.22 if under 20/day; lower to 0.14 if over 30/day
 
 # ========================= ANTI RATE-LIMIT =========================
 TICKS_GLOBAL_MIN_INTERVAL = 0.35  # seconds between ANY ticks_history calls
@@ -83,14 +101,16 @@ RATE_LIMIT_BACKOFF_BASE = 20      # seconds (will grow if rate limit repeats)
 # ========================= UI: REFRESH COOLDOWN =========================
 STATUS_REFRESH_COOLDOWN_SEC = 10
 
-# ========================= ADX + ATR FILTERS (NEW) =========================
+# ========================= ADX + ATR FILTERS =========================
 ADX_PERIOD = 14
 ATR_PERIOD = 14
 
-ADX_MIN = 22.0       # trend strength threshold
+# ✅ looser ADX to allow more trades but avoid chop
+ADX_MIN = 20.0
 ATR_MIN = 0.0        # 0.0 = show ATR but don't block trades by ATR
 
-TREND_FILTER_MODE = "BOTH"  # "BOTH" requires ADX✅ and ATR✅, "EITHER" allows ADX✅ OR ATR✅
+# ✅ use EITHER so ATR_MIN=0 doesn't accidentally block if you later change it
+TREND_FILTER_MODE = "EITHER"
 
 
 # ========================= INDICATOR MATH =========================
@@ -499,9 +519,10 @@ class DerivSniperBot:
             self.pause_until = self._next_midnight_epoch()
             return False, f"Daily target reached (+${self.total_profit_today:.2f})"
 
-        if self.total_profit_today <= -2.0:
+        # ✅ widen daily loss stop so your day doesn't end too early
+        if self.total_profit_today <= -8.0:
             self.pause_until = self._next_midnight_epoch()
-            return False, "Stopped: Daily loss limit (-$2.00) reached"
+            return False, "Stopped: Daily loss limit (-$8.00) reached"
 
         if self.consecutive_losses >= MAX_CONSEC_LOSSES:
             return False, "Stopped: max loss streak reached"
@@ -582,7 +603,6 @@ class DerivSniperBot:
                 highs = [x["h"] for x in candles]
                 lows = [x["l"] for x in candles]
 
-                # ===================== STRATEGY 2 IMPLEMENTATION =====================
                 ema20_arr = calculate_ema(closes, 20)
                 ema50_arr = calculate_ema(closes, EMA_PULLBACK_PERIOD)
                 ema200_arr = calculate_ema(closes, EMA_TREND_PERIOD)
@@ -604,7 +624,7 @@ class DerivSniperBot:
 
                 ema200_confirm = float(ema200_arr[-2])
 
-                # keep variables for UI (unchanged keys)
+                # keep variables for UI
                 slope_ok = True
                 ema50_slope = 0.0
                 ema50_rising = False
@@ -622,7 +642,7 @@ class DerivSniperBot:
                     continue
                 rsi_now = float(rsi_arr[-2])
 
-                # Stochastic
+                # Stochastic (kept for UI/optional filter)
                 stoch_k, stoch_d = calculate_stochastic(
                     highs, lows, closes,
                     k_period=STOCH_K_PERIOD,
@@ -647,7 +667,20 @@ class DerivSniperBot:
                 k_now = float(stoch_k[-2])
                 d_now = float(stoch_d[-2])
 
-                # ===== ADX + ATR (EXISTING) =====
+                stoch_turn_up = (
+                    (k_prev <= STOCH_OVERSOLD)
+                    and (k_now > k_prev)
+                    and (k_now > d_now)
+                    and (k_prev <= d_prev)
+                )
+                stoch_turn_down = (
+                    (k_prev >= STOCH_OVERBOUGHT)
+                    and (k_now < k_prev)
+                    and (k_now < d_now)
+                    and (k_prev >= d_prev)
+                )
+
+                # ADX + ATR
                 atr_arr = calculate_atr(highs, lows, closes, ATR_PERIOD)
                 adx_arr = calculate_adx(highs, lows, closes, ADX_PERIOD)
 
@@ -662,21 +695,13 @@ class DerivSniperBot:
                 else:
                     trend_filter_ok = adx_ok and atr_ok
 
-                # Pullback touches EMA50 (Strategy 2)
-                pb_high = float(pullback["h"])
-                pb_low = float(pullback["l"])
-                touched_ema50 = (pb_low <= ema50_pullback <= pb_high)
-
-                # Confirm candle data
+                # Confirm candle
                 c_open = float(confirm["o"])
                 c_close = float(confirm["c"])
                 bull_confirm = c_close > c_open
                 bear_confirm = c_close < c_open
 
-                close_above_ema20 = c_close > ema20_confirm
-                close_below_ema20 = c_close < ema20_confirm
-
-                # Candle strength filter (EXISTING)
+                # Candle strength
                 bodies = [abs(float(candles[i]["c"]) - float(candles[i]["o"])) for i in range(-22, -2)]
                 avg_body = float(np.mean(bodies)) if len(bodies) >= 10 else float(
                     np.mean([abs(float(c["c"]) - float(c["o"])) for c in candles[-60:-2]])
@@ -689,84 +714,66 @@ class DerivSniperBot:
                 body_ratio = last_body / c_range
                 strong_candle = body_ratio >= float(MIN_BODY_RATIO)
 
-                # Strategy 2: body must be > previous candle body
-                pb_open = float(pullback["o"])
-                pb_close = float(pullback["c"])
-                pb_body = abs(pb_close - pb_open)
-                body_gt_prev = last_body > pb_body
-
-                # spike block (EXISTING)
+                # Spike block
                 spike_mult = 1.5
                 spike_block = (avg_body > 0 and last_body > spike_mult * avg_body)
 
-                # flat block (UPDATED to Strategy 2: EMA50 vs EMA200)
-                ema_diff_min = 0.40
-                ema_diff = abs(ema50_confirm - ema200_confirm)
-                flat_block = ema_diff < ema_diff_min
-
-                # Strategy 2 Trend filter: EMA50 aligned with EMA200 + price on correct side
+                # Trend filter: EMA50 aligned with EMA200 + price on correct side
                 trend_up = (ema50_confirm > ema200_confirm) and (c_close > ema200_confirm)
                 trend_down = (ema50_confirm < ema200_confirm) and (c_close < ema200_confirm)
 
-                # Strategy 2 Stochastic turning rules
-                stoch_turn_up = (
-                    (k_prev <= STOCH_OVERSOLD)
-                    and (k_now > k_prev)
-                    and (k_now > d_now)
-                    and (k_prev <= d_prev)
-                )
-                stoch_turn_down = (
-                    (k_prev >= STOCH_OVERBOUGHT)
-                    and (k_now < k_prev)
-                    and (k_now < d_now)
-                    and (k_prev >= d_prev)
-                )
+                # Pullback logic (✅ simplified): distance to EMA50 (tunable)
+                dist_to_ema50 = abs(c_close - ema50_confirm)
+                pullback_ok = dist_to_ema50 <= float(EMA50_PULLBACK_TOL)
 
-                # Strategy 2: next candle open confirmation (enter at next candle open)
-                # candles[-1] is the currently forming candle after confirm close (its "o" is stable)
+                # Optional "next open" (OFF by default)
                 next_open = float(candles[-1]["o"]) if len(candles) >= 1 else float("nan")
                 next_open_above_ema50 = (not np.isnan(next_open)) and (next_open > ema50_confirm)
                 next_open_below_ema50 = (not np.isnan(next_open)) and (next_open < ema50_confirm)
 
-                # Strategy 2 RSI rules (binary-optimized)
                 call_rsi_ok = rsi_now >= RSI_CALL_MIN
                 put_rsi_ok = rsi_now <= RSI_PUT_MAX
 
-                # Final Strategy 2 signals
+                # Optional filters
+                adx_filter_ok = (trend_filter_ok if USE_ADX_FILTER else True)
+                strong_ok = (strong_candle if USE_STRONG_CANDLE_FILTER else True)
+                spike_ok = ((not spike_block) if USE_SPIKE_BLOCK else True)
+                stoch_up_ok = (stoch_turn_up if USE_STOCH_FILTER else True)
+                stoch_down_ok = (stoch_turn_down if USE_STOCH_FILTER else True)
+                next_open_call_ok = (next_open_above_ema50 if USE_NEXT_OPEN_FILTER else True)
+                next_open_put_ok = (next_open_below_ema50 if USE_NEXT_OPEN_FILTER else True)
+
+                # ✅ Final signals (quality + more frequency)
                 call_ready = (
                     trend_up
-                    and touched_ema50
+                    and pullback_ok
                     and bull_confirm
-                    and strong_candle
-                    and body_gt_prev
                     and call_rsi_ok
-                    and stoch_turn_up
-                    and next_open_above_ema50
-                    and not spike_block
-                    and not flat_block
-                    and trend_filter_ok
+                    and adx_filter_ok
+                    and strong_ok
+                    and spike_ok
+                    and stoch_up_ok
+                    and next_open_call_ok
                 )
                 put_ready = (
                     trend_down
-                    and touched_ema50
+                    and pullback_ok
                     and bear_confirm
-                    and strong_candle
-                    and body_gt_prev
                     and put_rsi_ok
-                    and stoch_turn_down
-                    and next_open_below_ema50
-                    and not spike_block
-                    and not flat_block
-                    and trend_filter_ok
+                    and adx_filter_ok
+                    and strong_ok
+                    and spike_ok
+                    and stoch_down_ok
+                    and next_open_put_ok
                 )
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
 
-                # ---------- labels for your STATUS UI (kept same keys) ----------
+                # ---------- labels for STATUS UI ----------
                 trend_label = "UPTREND" if trend_up else "DOWNTREND" if trend_down else "SIDEWAYS"
                 ema_label = "EMA50 ABOVE EMA200" if trend_up else "EMA50 BELOW EMA200" if trend_down else "EMA50 ~ EMA200"
-                trend_strength = "STRONG" if not flat_block else "WEAK"
-                pullback_label = "PULLBACK EMA50 ✅" if touched_ema50 else "WAITING EMA50 PULLBACK…"
+                trend_strength = "STRONG" if trend_up or trend_down else "WEAK"
+                pullback_label = f"PULLBACK NEAR EMA50 ✅ (±{EMA50_PULLBACK_TOL})" if pullback_ok else "WAITING PULLBACK NEAR EMA50…"
                 confirm_close_label = (
                     "CONFIRM BULL ✅" if bull_confirm else
                     "CONFIRM BEAR ✅" if bear_confirm else
@@ -775,20 +782,16 @@ class DerivSniperBot:
                 slope_label = "—"
 
                 block_label_parts = []
-                if spike_block:
+                if USE_SPIKE_BLOCK and spike_block:
                     block_label_parts.append("SPIKE BLOCK")
-                if flat_block:
-                    block_label_parts.append("WEAK/FLAT TREND")
-                if not strong_candle:
+                if USE_STRONG_CANDLE_FILTER and (not strong_candle):
                     block_label_parts.append("WEAK CANDLE")
-                if not body_gt_prev:
-                    block_label_parts.append("BODY<=PREV")
-                if not adx_ok:
-                    block_label_parts.append("ADX LOW")
-                if not atr_ok:
-                    block_label_parts.append("ATR LOW")
-                if not trend_filter_ok:
-                    block_label_parts.append("TREND FILTER FAIL")
+                if USE_ADX_FILTER and (not trend_filter_ok):
+                    block_label_parts.append("ADX/ATR FAIL")
+                if USE_STOCH_FILTER and (not (stoch_turn_up or stoch_turn_down)):
+                    block_label_parts.append("STOCH FAIL")
+                if USE_NEXT_OPEN_FILTER and (not (next_open_above_ema50 or next_open_below_ema50)):
+                    block_label_parts.append("NEXT OPEN FAIL")
 
                 block_label = " | ".join(block_label_parts) if block_label_parts else "OK"
 
@@ -796,7 +799,7 @@ class DerivSniperBot:
                 if not ok_gate:
                     why.append(f"Gate blocked: {gate}")
                 if signal:
-                    why.append(f"READY: {signal} (enter next candle)")
+                    why.append(f"READY: {signal}")
                 else:
                     why.append("No entry yet (conditions not aligned).")
 
@@ -876,8 +879,6 @@ class DerivSniperBot:
 
                 payout = max(float(MIN_PAYOUT), float(payout))
                 payout = money2(payout)
-
-                # ✅ BALANCE PROTECTION REMOVED (this was the limiter)
 
                 proposal_req = {
                     "proposal": 1,
@@ -971,8 +972,11 @@ class DerivSniperBot:
                     else:
                         self.martingale_halt = True
                         self.is_scanning = False
-                    if self.consecutive_losses >= 3:
-                        self.section_pause_until = self._next_section_start_epoch(time.time())
+
+                    # ✅ remove section pause-after-3-losses (trade blocker)
+                    # If you want a small cooldown instead, uncomment:
+                    # if self.consecutive_losses >= 3:
+                    #     self.cooldown_until = time.time() + 180  # 3 minutes
                 else:
                     self.consecutive_losses = 0
                     self.martingale_step = 0
