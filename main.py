@@ -78,8 +78,8 @@ USE_STRONG_CANDLE_FILTER = True
 # ========================= BREAKOUT STRATEGY SETTINGS (ONLY STRATEGY) =========================
 # We trade breakouts after a compression "box".
 BREAKOUT_BOX_LEN = 8               # range window (try 6–10)
-COMPRESSION_ATR_MAX = 1.20         # box height must be <= ATR * this (higher = more trades)
-COMPRESSION_BODY_ATR_MAX = 0.55    # avg candle body inside box must be <= ATR * this
+COMPRESSION_ATR_MAX = 2.0         # box height must be <= ATR * this (higher = more trades)
+COMPRESSION_BODY_ATR_MAX = 1.00    # avg candle body inside box must be <= ATR * this
 BREAKOUT_BUFFER = 0.0              # try 0.03–0.10 if you get fakeouts
 
 # ========================= ANTI RATE-LIMIT =========================
