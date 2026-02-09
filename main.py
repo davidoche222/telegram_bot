@@ -6,6 +6,8 @@ import asyncio
 import logging
 import random
 import time
+import json
+import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -37,15 +39,29 @@ TF_SEC = 60  # M1 candles
 CANDLES_COUNT = 300
 
 RSI_PERIOD = 14
-DURATION_MIN = 2  # ✅ 2-minute expiry
 
-# ========================= TREND FILTER (EMA) =========================
-EMA_TREND_PERIOD = 200
-EMA_PULLBACK_PERIOD = 50  # kept (used as EMA50 trend structure)
+# ✅ Strategy recommended expiry for 1M entry
+DURATION_MIN = 3  # ✅ 3-minute expiry (you can set back to 2 if you prefer)
 
-# ✅ loosen RSI for more entries but still quality
-RSI_CALL_MIN = 52.0
-RSI_PUT_MAX = 48.0
+# ========================= TREND/PULLBACK INDICATORS =========================
+# 15M trend filter
+EMA_TREND_FAST = 50
+EMA_TREND_SLOW = 200
+
+# 5M pullback
+EMA_PULLBACK = 20
+
+# RSI pullback quality on 5M
+RSI_BUY_MIN = 45.0
+RSI_SELL_MAX = 55.0
+
+# Pullback "near EMA20" tolerance uses 5M ATR
+ATR_PERIOD = 14
+PULLBACK_ATR_MULT = 0.60  # distance to EMA20 must be <= ATR * this
+
+# Entry quality on 1M
+MIN_BODY_RATIO = 0.32
+MIN_CANDLE_RANGE = 1e-6
 
 # ========================= DAILY TARGETS / LIMITS =========================
 DAILY_PROFIT_TARGET = 999999.0
@@ -66,21 +82,9 @@ MARTINGALE_MULT = 1.8
 MARTINGALE_MAX_STEPS = 4
 MARTINGALE_MAX_STAKE = 16.0
 
-# ========================= CANDLE STRENGTH FILTER =========================
-MIN_BODY_RATIO = 0.32
-MIN_CANDLE_RANGE = 1e-6
-
 # ========================= ENTRY QUALITY TOGGLES =========================
-USE_ADX_FILTER = True
 USE_SPIKE_BLOCK = True
 USE_STRONG_CANDLE_FILTER = True
-
-# ========================= BREAKOUT STRATEGY SETTINGS (ONLY STRATEGY) =========================
-# We trade breakouts after a compression "box".
-BREAKOUT_BOX_LEN = 8               # range window (try 6–10)
-COMPRESSION_ATR_MAX = 2.0         # box height must be <= ATR * this (higher = more trades)
-COMPRESSION_BODY_ATR_MAX = 1.00    # avg candle body inside box must be <= ATR * this
-BREAKOUT_BUFFER = 0.0              # try 0.03–0.10 if you get fakeouts
 
 # ========================= ANTI RATE-LIMIT =========================
 TICKS_GLOBAL_MIN_INTERVAL = 0.35
@@ -89,13 +93,20 @@ RATE_LIMIT_BACKOFF_BASE = 20
 # ========================= UI: REFRESH COOLDOWN =========================
 STATUS_REFRESH_COOLDOWN_SEC = 10
 
-# ========================= ADX + ATR FILTERS =========================
-ADX_PERIOD = 14
-ATR_PERIOD = 14
+# ========================= STATS (30 DAYS) =========================
+STATS_DAYS = 30
+TRADE_LOG_FILE = "trade_log.jsonl"  # persists your 30-day test across restarts
 
-ADX_MIN = 20.0
-ATR_MIN = 0.0
-TREND_FILTER_MODE = "EITHER"
+# ========================= SESSION BUCKETS (UTC) =========================
+# We bucket by UTC because it’s consistent for bots.
+# Display will still show WAT times elsewhere.
+SESSION_BUCKETS = [
+    ("ASIA", 0, 6),          # 00:00–06:59 UTC
+    ("LONDON", 7, 11),       # 07:00–11:59 UTC
+    ("OVERLAP", 12, 15),     # 12:00–15:59 UTC
+    ("NEWYORK", 16, 20),     # 16:00–20:59 UTC
+    ("LATE_NY", 21, 23),     # 21:00–23:59 UTC
+]
 
 
 # ========================= INDICATOR MATH =========================
@@ -161,53 +172,6 @@ def calculate_atr(highs, lows, closes, period=14):
     return atr
 
 
-def calculate_adx(highs, lows, closes, period=14):
-    highs = np.array(highs, dtype=float)
-    lows = np.array(lows, dtype=float)
-    closes = np.array(closes, dtype=float)
-
-    n = len(closes)
-    if n < period * 2 + 2:
-        return np.array([])
-
-    up_move = highs[1:] - highs[:-1]
-    down_move = lows[:-1] - lows[1:]
-
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    prev_close = closes[:-1]
-    tr = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - prev_close), np.abs(lows[1:] - prev_close)))
-
-    tr_s = np.zeros_like(tr)
-    plus_s = np.zeros_like(plus_dm)
-    minus_s = np.zeros_like(minus_dm)
-
-    tr_s[period - 1] = np.sum(tr[:period])
-    plus_s[period - 1] = np.sum(plus_dm[:period])
-    minus_s[period - 1] = np.sum(minus_dm[:period])
-
-    for i in range(period, len(tr)):
-        tr_s[i] = tr_s[i - 1] - (tr_s[i - 1] / period) + tr[i]
-        plus_s[i] = plus_s[i - 1] - (plus_s[i - 1] / period) + plus_dm[i]
-        minus_s[i] = minus_s[i - 1] - (minus_s[i - 1] / period) + minus_dm[i]
-
-    plus_di = 100.0 * (plus_s / (tr_s + 1e-12))
-    minus_di = 100.0 * (minus_s / (tr_s + 1e-12))
-    dx = 100.0 * (np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12))
-
-    adx = np.full(n, np.nan, dtype=float)
-    dx_full = np.full(n, np.nan, dtype=float)
-    dx_full[1:] = dx
-
-    start = period * 2
-    adx[start] = np.nanmean(dx_full[period:start + 1])
-    for i in range(start + 1, n):
-        adx[i] = ((adx[i - 1] * (period - 1)) + dx_full[i]) / period
-
-    return adx
-
-
 def build_candles_from_deriv(candles_raw):
     out = []
     for x in candles_raw:
@@ -242,6 +206,61 @@ def money2(x: float) -> float:
     return math.ceil(float(x) * 100.0) / 100.0
 
 
+def session_bucket(epoch_ts: float) -> str:
+    dt = datetime.fromtimestamp(epoch_ts, ZoneInfo("UTC"))
+    h = dt.hour
+    for name, start_h, end_h in SESSION_BUCKETS:
+        if start_h <= h <= end_h:
+            return name
+    return "UNKNOWN"
+
+
+def is_strong_candle(candle: dict) -> tuple[bool, float]:
+    c_open = float(candle["o"])
+    c_close = float(candle["c"])
+    c_high = float(candle["h"])
+    c_low = float(candle["l"])
+    rng = max(MIN_CANDLE_RANGE, c_high - c_low)
+    body = abs(c_close - c_open)
+    ratio = body / rng
+    return ratio >= float(MIN_BODY_RATIO), ratio
+
+
+def is_engulfing(prev: dict, cur: dict, direction: str) -> bool:
+    # direction: "BUY" or "SELL"
+    po, pc = float(prev["o"]), float(prev["c"])
+    co, cc = float(cur["o"]), float(cur["c"])
+    prev_bear = pc < po
+    prev_bull = pc > po
+    cur_bull = cc > co
+    cur_bear = cc < co
+
+    if direction == "BUY":
+        return prev_bear and cur_bull and (cc >= po) and (co <= pc)
+    else:
+        return prev_bull and cur_bear and (cc <= po) and (co >= pc)
+
+
+def is_rejection(candle: dict, direction: str) -> bool:
+    # Simple wick rejection:
+    # BUY: long lower wick
+    # SELL: long upper wick
+    o = float(candle["o"])
+    c = float(candle["c"])
+    h = float(candle["h"])
+    l = float(candle["l"])
+    rng = max(MIN_CANDLE_RANGE, h - l)
+    body = abs(c - o)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+
+    # Require some real range and a wick dominance
+    if direction == "BUY":
+        return (lower_wick / rng) >= 0.45 and (body / rng) <= 0.55 and c >= o
+    else:
+        return (upper_wick / rng) >= 0.45 and (body / rng) <= 0.55 and c <= o
+
+
 # ========================= BOT CORE =========================
 class DerivSniperBot:
     def __init__(self):
@@ -257,6 +276,7 @@ class DerivSniperBot:
         self.active_trade_info = None
         self.active_market = "None"
         self.trade_start_time = 0.0
+        self.active_trade_meta = None  # store symbol/side/open_time for stats
 
         self.cooldown_until = 0.0
         self.trades_today = 0
@@ -292,6 +312,86 @@ class DerivSniperBot:
 
         # refresh cooldown
         self.status_cooldown_until = 0.0
+
+        # ======== 30-day stats store ========
+        self.trade_log_path = os.path.abspath(TRADE_LOG_FILE)
+        self.trade_records = []  # list of dicts
+        self._load_trade_log()
+
+    # ---------- 30-day stats ----------
+    def _load_trade_log(self):
+        self.trade_records = []
+        if not os.path.exists(self.trade_log_path):
+            return
+        try:
+            with open(self.trade_log_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if isinstance(rec, dict) and "t" in rec:
+                            self.trade_records.append(rec)
+                    except Exception:
+                        continue
+            self._prune_trade_records()
+        except Exception as e:
+            logger.warning(f"Failed to load trade log: {e}")
+
+    def _append_trade_log(self, rec: dict):
+        try:
+            with open(self.trade_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning(f"Failed to write trade log: {e}")
+
+    def _prune_trade_records(self):
+        cutoff = time.time() - (STATS_DAYS * 24 * 3600)
+        self.trade_records = [r for r in self.trade_records if float(r.get("t", 0)) >= cutoff]
+
+    def record_trade_result(self, symbol: str, open_epoch: float, profit: float):
+        # Only record AUTO trades (you can change this if you want MANUAL included too)
+        sess = session_bucket(open_epoch)
+        win = 1 if profit > 0 else 0
+        rec = {
+            "t": float(open_epoch),
+            "symbol": str(symbol),
+            "session": str(sess),
+            "win": int(win),
+            "profit": float(profit),
+        }
+        self.trade_records.append(rec)
+        self._append_trade_log(rec)
+        self._prune_trade_records()
+
+    def stats_30d(self):
+        self._prune_trade_records()
+        by_market = {}
+        by_session = {}
+
+        for r in self.trade_records:
+            sym = r.get("symbol", "—")
+            sess = r.get("session", "—")
+            win = int(r.get("win", 0))
+
+            by_market.setdefault(sym, {"wins": 0, "losses": 0, "trades": 0})
+            by_session.setdefault(sess, {"wins": 0, "losses": 0, "trades": 0})
+
+            by_market[sym]["trades"] += 1
+            by_session[sess]["trades"] += 1
+            if win == 1:
+                by_market[sym]["wins"] += 1
+                by_session[sess]["wins"] += 1
+            else:
+                by_market[sym]["losses"] += 1
+                by_session[sess]["losses"] += 1
+
+        def wr(d):
+            t = d["trades"]
+            return (100.0 * d["wins"] / t) if t > 0 else 0.0
+
+        return by_market, by_session, wr
 
     # ---------- helpers ----------
     @staticmethod
@@ -500,19 +600,20 @@ class DerivSniperBot:
             while self.is_scanning:
                 if self.active_trade_info and (time.time() - self.trade_start_time > (DURATION_MIN * 60 + 90)):
                     self.active_trade_info = None
+                    self.active_trade_meta = None
                 await asyncio.sleep(1)
         finally:
             for t in self.market_tasks.values():
                 t.cancel()
             self.market_tasks.clear()
 
-    async def fetch_real_m1_candles(self, symbol: str):
+    async def fetch_candles(self, symbol: str, granularity_sec: int, count: int):
         payload = {
             "ticks_history": symbol,
             "end": "latest",
-            "count": CANDLES_COUNT,
+            "count": int(count),
             "style": "candles",
-            "granularity": TF_SEC,
+            "granularity": int(granularity_sec),
         }
         data = await self.safe_ticks_history(payload, retries=4)
         return build_candles_from_deriv(data.get("candles", []))
@@ -534,18 +635,22 @@ class DerivSniperBot:
 
                 ok_gate, gate = self.can_auto_trade()
 
-                candles = await self.fetch_real_m1_candles(symbol)
-                if len(candles) < 70:
+                # ---- fetch 1M, 5M, 15M candles ----
+                candles_1m = await self.fetch_candles(symbol, 60, 300)
+                candles_5m = await self.fetch_candles(symbol, 300, 300)
+                candles_15m = await self.fetch_candles(symbol, 900, 300)
+
+                if len(candles_1m) < 30 or len(candles_5m) < 60 or len(candles_15m) < 220:
                     self.market_debug[symbol] = {
                         "time": time.time(),
                         "gate": "Waiting for more candles",
-                        "why": [f"Not enough candle history yet (need ~70, have {len(candles)})."],
+                        "why": [f"Need 15M>=220, 5M>=60, 1M>=30 | got 15M={len(candles_15m)} 5M={len(candles_5m)} 1M={len(candles_1m)}"],
                     }
-                    self._next_poll_epoch[symbol] = time.time() + 10
+                    self._next_poll_epoch[symbol] = time.time() + 12
                     continue
 
-                # confirm = last closed candle
-                confirm = candles[-2]
+                # confirm = last closed 1M candle
+                confirm = candles_1m[-2]
                 confirm_t0 = int(confirm["t0"])
 
                 next_closed_epoch = confirm_t0 + TF_SEC
@@ -554,187 +659,94 @@ class DerivSniperBot:
                 if self.last_processed_closed_t0[symbol] == confirm_t0:
                     continue
 
-                closes = [x["c"] for x in candles]
-                highs = [x["h"] for x in candles]
-                lows = [x["l"] for x in candles]
+                # ========================= 15M TREND FILTER =========================
+                closes_15 = [x["c"] for x in candles_15m]
+                ema_fast_15 = calculate_ema(closes_15, EMA_TREND_FAST)
+                ema_slow_15 = calculate_ema(closes_15, EMA_TREND_SLOW)
 
-                ema50_arr = calculate_ema(closes, EMA_PULLBACK_PERIOD)
-                ema200_arr = calculate_ema(closes, EMA_TREND_PERIOD)
-
-                if len(ema50_arr) < 60 or len(ema200_arr) < 60:
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "gate": "Indicators",
-                        "why": ["EMA arrays not ready yet."],
-                    }
+                if len(ema_fast_15) < 5 or len(ema_slow_15) < 5:
+                    self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["15M EMA not ready."]}
                     self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
 
-                ema50_confirm = float(ema50_arr[-2])
-                ema200_confirm = float(ema200_arr[-2])
+                ema_fast_now = float(ema_fast_15[-2])
+                ema_slow_now = float(ema_slow_15[-2])
+                price_15 = float(closes_15[-2])
 
-                # RSI
-                rsi_arr = calculate_rsi(closes, RSI_PERIOD)
-                if len(rsi_arr) < 60 or np.isnan(rsi_arr[-2]):
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "gate": "Indicators",
-                        "why": ["RSI not ready yet."],
-                    }
+                trend_up = (ema_fast_now > ema_slow_now) and (price_15 > ema_fast_now) and (price_15 > ema_slow_now)
+                trend_down = (ema_fast_now < ema_slow_now) and (price_15 < ema_fast_now) and (price_15 < ema_slow_now)
+                trend_sideways = not (trend_up or trend_down)
+
+                # ========================= 5M PULLBACK FILTER =========================
+                closes_5 = [x["c"] for x in candles_5m]
+                highs_5 = [x["h"] for x in candles_5m]
+                lows_5 = [x["l"] for x in candles_5m]
+
+                ema20_5 = calculate_ema(closes_5, EMA_PULLBACK)
+                rsi_5 = calculate_rsi(closes_5, RSI_PERIOD)
+                atr_5 = calculate_atr(highs_5, lows_5, closes_5, ATR_PERIOD)
+
+                if len(ema20_5) < 10 or len(rsi_5) < 10 or len(atr_5) < 10 or np.isnan(rsi_5[-2]) or np.isnan(atr_5[-2]):
+                    self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["5M EMA/RSI/ATR not ready."]}
                     self.last_processed_closed_t0[symbol] = confirm_t0
                     continue
-                rsi_now = float(rsi_arr[-2])
 
-                # ADX + ATR
-                atr_arr = calculate_atr(highs, lows, closes, ATR_PERIOD)
-                adx_arr = calculate_adx(highs, lows, closes, ADX_PERIOD)
+                ema20_now = float(ema20_5[-2])
+                rsi5_now = float(rsi_5[-2])
+                atr5_now = float(atr_5[-2])
+                price_5 = float(closes_5[-2])
 
-                atr_now = float(atr_arr[-2]) if len(atr_arr) and not np.isnan(atr_arr[-2]) else float("nan")
-                adx_now = float(adx_arr[-2]) if len(adx_arr) and not np.isnan(adx_arr[-2]) else float("nan")
+                near_ema20 = abs(price_5 - ema20_now) <= (atr5_now * float(PULLBACK_ATR_MULT))
+                pullback_buy_ok = near_ema20 and (rsi5_now >= float(RSI_BUY_MIN))
+                pullback_sell_ok = near_ema20 and (rsi5_now <= float(RSI_SELL_MAX))
 
-                atr_ok = (not np.isnan(atr_now)) and (atr_now >= float(ATR_MIN))
-                adx_ok = (not np.isnan(adx_now)) and (adx_now >= float(ADX_MIN))
+                # ========================= 1M ENTRY CONFIRMATION =========================
+                prev_1m = candles_1m[-3]
+                cur_1m = candles_1m[-2]
 
-                if TREND_FILTER_MODE.upper() == "EITHER":
-                    trend_filter_ok = adx_ok or atr_ok
-                else:
-                    trend_filter_ok = adx_ok and atr_ok
+                strong_ok, body_ratio = is_strong_candle(cur_1m)
+                spike_block = False
+                if USE_SPIKE_BLOCK:
+                    bodies = [abs(float(candles_1m[i]["c"]) - float(candles_1m[i]["o"])) for i in range(-22, -2)]
+                    avg_body = float(np.mean(bodies)) if bodies else 0.0
+                    last_body = abs(float(cur_1m["c"]) - float(cur_1m["o"]))
+                    spike_block = (avg_body > 0 and last_body > 1.5 * avg_body)
 
-                # Confirm candle
-                c_open = float(confirm["o"])
-                c_close = float(confirm["c"])
-                bull_confirm = c_close > c_open
-                bear_confirm = c_close < c_open
+                entry_buy = (is_engulfing(prev_1m, cur_1m, "BUY") or is_rejection(cur_1m, "BUY"))
+                entry_sell = (is_engulfing(prev_1m, cur_1m, "SELL") or is_rejection(cur_1m, "SELL"))
 
-                # Candle strength
-                bodies = [abs(float(candles[i]["c"]) - float(candles[i]["o"])) for i in range(-22, -2)]
-                avg_body_all = float(np.mean(bodies)) if len(bodies) >= 10 else float(
-                    np.mean([abs(float(c["c"]) - float(c["o"])) for c in candles[-60:-2]])
-                )
-                last_body = abs(c_close - c_open)
-
-                c_high = float(confirm["h"])
-                c_low = float(confirm["l"])
-                c_range = max(MIN_CANDLE_RANGE, c_high - c_low)
-                body_ratio = last_body / c_range
-                strong_candle = body_ratio >= float(MIN_BODY_RATIO)
-
-                # Spike block
-                spike_mult = 1.5
-                spike_block = (avg_body_all > 0 and last_body > spike_mult * avg_body_all)
-
-                # Trend direction (we still trade breakouts in direction of trend)
-                trend_up = (ema50_confirm > ema200_confirm) and (c_close > ema200_confirm)
-                trend_down = (ema50_confirm < ema200_confirm) and (c_close < ema200_confirm)
-
-                # ========================= BREAKOUT ONLY =========================
-                # Build a compression box from the candles BEFORE the breakout candle.
-                # Use the last BREAKOUT_BOX_LEN candles ending at -3.
-                box_needed = int(BREAKOUT_BOX_LEN)
-                if box_needed < 3:
-                    box_needed = 3
-
-                box_slice = candles[-(box_needed + 2):-2]  # excludes confirm candle (-2)
-                # if not enough, fallback
-                if len(box_slice) < box_needed:
-                    box_slice = candles[-(box_needed + 2):-2]
-
-                box_high = max(float(x["h"]) for x in box_slice)
-                box_low = min(float(x["l"]) for x in box_slice)
-                box_height = box_high - box_low
-
-                # Compression quality: box height and avg body are small relative to ATR
-                box_bodies = [abs(float(x["c"]) - float(x["o"])) for x in box_slice]
-                box_avg_body = float(np.mean(box_bodies)) if box_bodies else 0.0
-
-                atr_ref = atr_now if (not np.isnan(atr_now) and atr_now > 0) else 0.0
-                compression_ok = True
-                compression_why = []
-
-                if atr_ref > 0:
-                    if box_height > (atr_ref * float(COMPRESSION_ATR_MAX)):
-                        compression_ok = False
-                        compression_why.append("Box too tall")
-                    if box_avg_body > (atr_ref * float(COMPRESSION_BODY_ATR_MAX)):
-                        compression_ok = False
-                        compression_why.append("Bodies too big")
-                else:
-                    # if ATR not ready, don't block purely on compression sizing
-                    compression_why.append("ATR not ready")
-
-                # Breakout trigger (close breaks box + optional buffer)
-                buf = float(BREAKOUT_BUFFER)
-                breakout_up = (c_close > (box_high + buf))
-                breakout_down = (c_close < (box_low - buf))
-
-                call_rsi_ok = rsi_now >= RSI_CALL_MIN
-                put_rsi_ok = rsi_now <= RSI_PUT_MAX
-
-                adx_filter_ok = (trend_filter_ok if USE_ADX_FILTER else True)
-                strong_ok = (strong_candle if USE_STRONG_CANDLE_FILTER else True)
+                strong_filter_ok = (strong_ok if USE_STRONG_CANDLE_FILTER else True)
                 spike_ok = ((not spike_block) if USE_SPIKE_BLOCK else True)
 
-                call_ready = (
-                    trend_up
-                    and compression_ok
-                    and breakout_up
-                    and bull_confirm
-                    and call_rsi_ok
-                    and adx_filter_ok
-                    and strong_ok
-                    and spike_ok
-                )
-
-                put_ready = (
-                    trend_down
-                    and compression_ok
-                    and breakout_down
-                    and bear_confirm
-                    and put_rsi_ok
-                    and adx_filter_ok
-                    and strong_ok
-                    and spike_ok
-                )
+                call_ready = trend_up and pullback_buy_ok and entry_buy and strong_filter_ok and spike_ok
+                put_ready = trend_down and pullback_sell_ok and entry_sell and strong_filter_ok and spike_ok
 
                 signal = "CALL" if call_ready else "PUT" if put_ready else None
 
                 # ---------- labels for STATUS UI ----------
                 trend_label = "UPTREND" if trend_up else "DOWNTREND" if trend_down else "SIDEWAYS"
-                ema_label = "EMA50 ABOVE EMA200" if trend_up else "EMA50 BELOW EMA200" if trend_down else "EMA50 ~ EMA200"
-                trend_strength = "STRONG" if trend_up or trend_down else "WEAK"
-
-                pullback_label = (
-                    f"BOX ✅ len={box_needed} | H={box_high:.3f} L={box_low:.3f} | ht={box_height:.3f}"
-                    if compression_ok
-                    else f"BOX ❌ ({', '.join(compression_why) if compression_why else 'not compressed'})"
-                )
-
-                confirm_close_label = (
-                    "BREAKOUT UP ✅" if breakout_up else
-                    "BREAKOUT DOWN ✅" if breakout_down else
-                    "WAITING BREAKOUT…"
-                )
-                slope_label = "—"
-
-                block_label_parts = []
-                if not compression_ok:
-                    block_label_parts.append("NO COMPRESSION")
+                ema_label = f"15M EMA{EMA_TREND_FAST}={'↑' if ema_fast_now > ema_slow_now else '↓'} EMA{EMA_TREND_SLOW}"
+                pullback_label = f"5M Pullback: {'✅' if near_ema20 else '❌'} | dist={abs(price_5-ema20_now):.3f} <= ATR*{PULLBACK_ATR_MULT} ({atr5_now*PULLBACK_ATR_MULT:.3f})"
+                confirm_close_label = f"1M Entry: {'✅' if (entry_buy or entry_sell) else '❌'} (engulf/reject)"
+                block_parts = []
+                if trend_sideways:
+                    block_parts.append("NO 15M TREND")
+                if trend_up and not pullback_buy_ok:
+                    block_parts.append("5M BUY FILTER FAIL")
+                if trend_down and not pullback_sell_ok:
+                    block_parts.append("5M SELL FILTER FAIL")
                 if USE_SPIKE_BLOCK and spike_block:
-                    block_label_parts.append("SPIKE BLOCK")
-                if USE_STRONG_CANDLE_FILTER and (not strong_candle):
-                    block_label_parts.append("WEAK CANDLE")
-                if USE_ADX_FILTER and (not trend_filter_ok):
-                    block_label_parts.append("ADX/ATR FAIL")
-                if not (trend_up or trend_down):
-                    block_label_parts.append("NO TREND")
+                    block_parts.append("SPIKE BLOCK")
+                if USE_STRONG_CANDLE_FILTER and not strong_ok:
+                    block_parts.append("WEAK CANDLE")
 
-                block_label = " | ".join(block_label_parts) if block_label_parts else "OK"
+                block_label = " | ".join(block_parts) if block_parts else "OK"
 
                 why = []
                 if not ok_gate:
                     why.append(f"Gate blocked: {gate}")
                 if signal:
-                    why.append(f"READY: {signal} (BREAKOUT)")
+                    why.append(f"READY: {signal} (TREND + PULLBACK + 1M CONFIRM)")
                 else:
                     why.append("No entry yet (conditions not aligned).")
 
@@ -746,21 +758,15 @@ class DerivSniperBot:
 
                     "trend_label": trend_label,
                     "ema_label": ema_label,
-                    "trend_strength": trend_strength,
+                    "trend_strength": "STRONG" if (trend_up or trend_down) else "WEAK",
                     "pullback_label": pullback_label,
                     "confirm_close_label": confirm_close_label,
-                    "slope_label": slope_label,
+                    "slope_label": "—",
                     "block_label": block_label,
 
-                    "ema50_slope": 0.0,  # kept for UI key compatibility
-                    "rsi_now": rsi_now,
-                    "body_ratio": body_ratio,
-
-                    "adx_now": adx_now,
-                    "atr_now": atr_now,
-                    "adx_ok": adx_ok,
-                    "atr_ok": atr_ok,
-                    "trend_filter_ok": trend_filter_ok,
+                    "rsi_now": rsi5_now,          # 5M RSI
+                    "body_ratio": body_ratio,     # 1M candle body ratio
+                    "atr_now": atr5_now,          # 5M ATR
 
                     "why": why[:10],
                 }
@@ -771,9 +777,9 @@ class DerivSniperBot:
                     continue
 
                 if call_ready:
-                    await self.execute_trade("CALL", symbol, source="AUTO", rsi_now=rsi_now, ema50_slope=0.0)
+                    await self.execute_trade("CALL", symbol, source="AUTO", rsi_now=rsi5_now, ema50_slope=0.0)
                 elif put_ready:
-                    await self.execute_trade("PUT", symbol, source="AUTO", rsi_now=rsi_now, ema50_slope=0.0)
+                    await self.execute_trade("PUT", symbol, source="AUTO", rsi_now=rsi5_now, ema50_slope=0.0)
 
             except asyncio.CancelledError:
                 break
@@ -859,6 +865,14 @@ class DerivSniperBot:
                 self.trade_start_time = time.time()
                 self.current_stake = ask_price
 
+                # store meta for stats/session tracking
+                self.active_trade_meta = {
+                    "symbol": symbol,
+                    "side": side,
+                    "open_epoch": float(self.trade_start_time),
+                    "source": source,
+                }
+
                 if source == "AUTO":
                     self.trades_today += 1
 
@@ -870,6 +884,7 @@ class DerivSniperBot:
                     f"🎁 Payout: ${payout:.2f}\n"
                     f"🎲 Martingale step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
                     f"💵 Stake (Deriv): ${ask_price:.2f}\n"
+                    f"🕓 Session (UTC): {session_bucket(self.trade_start_time)}\n"
                     f"🤖 Source: {source}\n"
                     f"🎯 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}"
                 )
@@ -890,6 +905,12 @@ class DerivSniperBot:
                 retries=6,
             )
             profit = float(res["proposal_open_contract"].get("profit", 0))
+
+            # ======== record 30-day stats (AUTO only) ========
+            if source == "AUTO" and self.active_trade_meta:
+                sym = self.active_trade_meta.get("symbol", "—")
+                open_epoch = float(self.active_trade_meta.get("open_epoch", time.time()))
+                self.record_trade_result(sym, open_epoch, profit)
 
             if source == "AUTO":
                 self.total_profit_today += profit
@@ -940,6 +961,7 @@ class DerivSniperBot:
             )
         finally:
             self.active_trade_info = None
+            self.active_trade_meta = None
             self.cooldown_until = time.time() + COOLDOWN_SEC
 
 
@@ -986,30 +1008,18 @@ def format_market_detail(sym: str, d: dict) -> str:
     block_label = d.get("block_label", "—")
 
     rsi_now = d.get("rsi_now", None)
-    ema50_slope = d.get("ema50_slope", None)
     body_ratio = d.get("body_ratio", None)
-
-    adx_now = d.get("adx_now", None)
     atr_now = d.get("atr_now", None)
-    adx_ok = d.get("adx_ok", False)
-    atr_ok = d.get("atr_ok", False)
-
-    adx_line = "ADX: —"
-    atr_line = "ATR: —"
-    if isinstance(adx_now, (int, float)) and not np.isnan(adx_now):
-        adx_line = f"ADX: {adx_now:.2f} {'✅' if adx_ok else '❌'} (min {ADX_MIN})"
-    if isinstance(atr_now, (int, float)) and not np.isnan(atr_now):
-        atr_line = f"ATR: {atr_now:.5f} {'✅' if atr_ok else '❌'} (min {ATR_MIN})"
 
     extra = []
     if isinstance(rsi_now, (int, float)) and not np.isnan(rsi_now):
-        extra.append(f"RSI: {rsi_now:.2f}")
-    if isinstance(ema50_slope, (int, float)) and not np.isnan(ema50_slope):
-        extra.append(f"EMA50 slope: {ema50_slope:.3f}")
+        extra.append(f"RSI(5M): {rsi_now:.2f}")
+    if isinstance(atr_now, (int, float)) and not np.isnan(atr_now):
+        extra.append(f"ATR(5M): {atr_now:.5f}")
     if isinstance(body_ratio, (int, float)) and not np.isnan(body_ratio):
-        extra.append(f"Body ratio: {body_ratio:.2f}")
-    extra_line = " | ".join(extra) if extra else "—"
+        extra.append(f"Body ratio(1M): {body_ratio:.2f}")
 
+    extra_line = " | ".join(extra) if extra else "—"
     why = d.get("why", [])
     why_line = "Why: " + (str(why[0]) if why else "—")
 
@@ -1023,8 +1033,6 @@ def format_market_detail(sym: str, d: dict) -> str:
         f"{slope_label}\n"
         f"{pullback_label}\n"
         f"{confirm_close_label}\n"
-        f"{adx_line}\n"
-        f"{atr_line}\n"
         f"Stats: {extra_line}\n"
         f"Filters: {block_label}\n"
         f"Signal: {signal}\n"
@@ -1122,7 +1130,8 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 rem = max(0, int(DURATION_MIN * 60) - int(time.time() - bot_logic.trade_start_time))
                 icon = "✅ PROFIT" if pnl > 0 else "❌ LOSS" if pnl < 0 else "➖ FLAT"
                 mkt_clean = str(bot_logic.active_market).replace("_", " ")
-                trade_status = f"🚀 Active Trade ({mkt_clean})\n📈 PnL: {icon} ({pnl:+.2f})\n⏳ Left: {rem}s"
+                sess = session_bucket(bot_logic.trade_start_time)
+                trade_status = f"🚀 Active Trade ({mkt_clean})\n🕓 Session(UTC): {sess}\n📈 PnL: {icon} ({pnl:+.2f})\n⏳ Left: {rem}s"
             except Exception:
                 trade_status = "🚀 Active Trade: Syncing..."
 
@@ -1130,6 +1139,33 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         section_line = f"🧩 Section paused until {fmt_hhmm(bot_logic.section_pause_until)}\n" if time.time() < bot_logic.section_pause_until else ""
 
         next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(bot_logic.martingale_step)))
+
+        # ======== 30-day stats block ========
+        by_mkt, by_sess, wr = bot_logic.stats_30d()
+
+        def fmt_stats_block(title: str, items: dict, sort_key: str):
+            # sort by winrate desc, then trades desc
+            rows = []
+            for k, v in items.items():
+                rows.append((k, wr(v), v["trades"], v["wins"], v["losses"]))
+            rows.sort(key=lambda x: (x[1], x[2]), reverse=True)
+
+            lines = [f"{title} (last {STATS_DAYS}d):"]
+            if not rows:
+                lines.append("— No trades recorded yet")
+                return "\n".join(lines)
+
+            for k, wrr, t, w, l in rows:
+                lines.append(f"- {k.replace('_',' ')}: {wrr:.1f}% ({w}/{t})")
+            return "\n".join(lines)
+
+        stats_block = (
+            "📈 PERFORMANCE TRACKER\n"
+            + fmt_stats_block("Markets", by_mkt, "market")
+            + "\n"
+            + fmt_stats_block("Sessions(UTC)", by_sess, "session")
+            + "\n"
+        )
 
         header = (
             f"🕒 Time (WAT): {now_time}\n"
@@ -1141,9 +1177,9 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
             f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
-            f"📌 Trend Filters: ADX(min {ADX_MIN}) + ATR(min {ATR_MIN}) | Mode: {TREND_FILTER_MODE}\n"
-            f"📦 Breakout: box_len={BREAKOUT_BOX_LEN} | comp_ht<=ATR*{COMPRESSION_ATR_MAX} | body<=ATR*{COMPRESSION_BODY_ATR_MAX} | buf={BREAKOUT_BUFFER}\n"
+            f"🧭 Strategy: 15M trend (EMA{EMA_TREND_FAST}/{EMA_TREND_SLOW}) + 5M pullback (EMA{EMA_PULLBACK}+RSI) + 1M entry (engulf/reject)\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
+            f"{stats_block}"
             f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
             f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
             f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
@@ -1161,8 +1197,9 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         "💎 Deriv Bot\n"
-        f"🕯 Timeframe: M1 | ⏱ Expiry: {DURATION_MIN}m\n"
-        "✅ Anti-rate-limit enabled (ticks_history once/minute per market)\n",
+        f"🕯 Entry: M1 | ⏱ Expiry: {DURATION_MIN}m\n"
+        "✅ 15M/5M/1M Trend-Pullback Strategy enabled\n"
+        f"✅ 30-day tracker enabled (saved to {TRADE_LOG_FILE})\n",
         reply_markup=main_keyboard(),
     )
 
