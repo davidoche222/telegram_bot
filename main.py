@@ -21,7 +21,7 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "ZkOFWOlPtwnjqTS"
 APP_ID = 1089
 
-MARKETS = ["R_10", "R_25"]  # add more if you want
+MARKETS = ["R_50", "R_75","R_100","R_10"]  # add more if you want
 
 # ✅ more trades/day, but still controlled
 COOLDOWN_SEC = 20
