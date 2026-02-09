@@ -21,7 +21,7 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "ZkOFWOlPtwnjqTS"
 APP_ID = 1089
 
-MARKETS = ["R_50", "R_75","R_100","R_10"]  # add more if you want
+MARKETS = ["R_50", "R_75", "R_100", "R_10"]  # add more if you want
 
 # ✅ more trades/day, but still controlled
 COOLDOWN_SEC = 20
@@ -78,6 +78,7 @@ MIN_PAYOUT = 0.35
 MAX_STAKE_ALLOWED = 10.00
 
 # ========================= MARTINGALE SETTINGS =========================
+# (Kept for compatibility, but martingale is DISABLED in logic below)
 MARTINGALE_MULT = 1.8
 MARTINGALE_MAX_STEPS = 4
 MARTINGALE_MAX_STAKE = 16.0
@@ -286,6 +287,8 @@ class DerivSniperBot:
         self.balance = "0.00"
 
         self.current_stake = 0.0
+
+        # ===== MARTINGALE DISABLED =====
         self.martingale_step = 0
         self.martingale_halt = False
 
@@ -351,7 +354,6 @@ class DerivSniperBot:
         self.trade_records = [r for r in self.trade_records if float(r.get("t", 0)) >= cutoff]
 
     def record_trade_result(self, symbol: str, open_epoch: float, profit: float):
-        # Only record AUTO trades (you can change this if you want MANUAL included too)
         sess = session_bucket(open_epoch)
         win = 1 if profit > 0 else 0
         rec = {
@@ -545,6 +547,8 @@ class DerivSniperBot:
             self.total_profit_today = 0.0
             self.cooldown_until = 0.0
             self.pause_until = 0.0
+
+            # ===== MARTINGALE DISABLED =====
             self.martingale_step = 0
             self.current_stake = 0.0
             self.martingale_halt = False
@@ -559,6 +563,8 @@ class DerivSniperBot:
     def can_auto_trade(self) -> tuple[bool, str]:
         self._daily_reset_if_needed()
 
+        # ===== MARTINGALE DISABLED =====
+        # self.martingale_halt is never set True now, so this gate is effectively inactive.
         if self.martingale_halt:
             return False, f"Stopped: Martingale {MARTINGALE_MAX_STEPS} steps completed"
 
@@ -797,7 +803,7 @@ class DerivSniperBot:
 
             await asyncio.sleep(0.05)
 
-    # ========================= PAYOUT MODE + MARTINGALE =========================
+    # ========================= PAYOUT MODE (MARTINGALE DISABLED) =========================
     async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL",
                             rsi_now: float = 0.0, ema50_slope: float = 0.0):
         if not self.api or self.active_trade_info:
@@ -811,8 +817,8 @@ class DerivSniperBot:
             try:
                 import math
 
-                payout = float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step))
-                payout = money2(payout)
+                # ✅ MARTINGALE OFF: fixed payout every trade
+                payout = money2(float(PAYOUT_TARGET))
 
                 payout = max(0.01, float(payout))
                 if not math.isfinite(payout):
@@ -882,7 +888,7 @@ class DerivSniperBot:
                     f"🛒 Market: {safe_symbol}\n"
                     f"⏱ Expiry: {DURATION_MIN}m\n"
                     f"🎁 Payout: ${payout:.2f}\n"
-                    f"🎲 Martingale step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
+                    f"🎲 Martingale: OFF\n"
                     f"💵 Stake (Deriv): ${ask_price:.2f}\n"
                     f"🕓 Session (UTC): {session_bucket(self.trade_start_time)}\n"
                     f"🤖 Source: {source}\n"
@@ -920,18 +926,15 @@ class DerivSniperBot:
                     self.sections_won_today += 1
                     self.section_pause_until = self._next_section_start_epoch(time.time())
 
+                # ✅ MARTINGALE OFF: no step increase, no martingale halt
                 if profit <= 0:
                     self.consecutive_losses += 1
                     self.total_losses_today += 1
-                    if self.martingale_step < MARTINGALE_MAX_STEPS:
-                        self.martingale_step += 1
-                    else:
-                        self.martingale_halt = True
-                        self.is_scanning = False
                 else:
                     self.consecutive_losses = 0
-                    self.martingale_step = 0
-                    self.martingale_halt = False
+
+                self.martingale_step = 0
+                self.martingale_halt = False
 
                 if self.total_profit_today >= DAILY_PROFIT_TARGET:
                     self.pause_until = self._next_midnight_epoch()
@@ -939,14 +942,15 @@ class DerivSniperBot:
             await self.fetch_balance()
 
             pause_note = "\n⏸ Paused until 12:00am WAT" if time.time() < self.pause_until else ""
-            halt_note = f"\n🛑 Martingale stopped after {MARTINGALE_MAX_STEPS} steps" if self.martingale_halt else ""
+            halt_note = ""  # martingale disabled
             section_note = (
                 f"\n🧩 Section paused until {fmt_hhmm(self.section_pause_until)}"
                 if time.time() < self.section_pause_until
                 else ""
             )
 
-            next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step)))
+            # ✅ MARTINGALE OFF
+            next_payout = money2(float(PAYOUT_TARGET))
 
             await self.safe_send_tg(
                 (
@@ -954,7 +958,7 @@ class DerivSniperBot:
                     f"🧩 Section: {self.section_index}/{SECTIONS_PER_DAY} | Section PnL: {self.section_profit:+.2f} | Sections won: {self.sections_won_today}\n"
                     f"📊 Today: {self.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {self.total_losses_today} | Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
                     f"💵 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
-                    f"🎁 Next payout: ${next_payout:.2f} (step {self.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
+                    f"🎁 Next payout: ${next_payout:.2f} (Martingale OFF)\n"
                     f"💰 Balance: {self.balance}"
                     f"{pause_note}{section_note}{halt_note}"
                 )
@@ -1138,13 +1142,13 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         pause_line = "⏸ Paused until 12:00am WAT\n" if time.time() < bot_logic.pause_until else ""
         section_line = f"🧩 Section paused until {fmt_hhmm(bot_logic.section_pause_until)}\n" if time.time() < bot_logic.section_pause_until else ""
 
-        next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(bot_logic.martingale_step)))
+        # ✅ MARTINGALE OFF
+        next_payout = money2(float(PAYOUT_TARGET))
 
         # ======== 30-day stats block ========
         by_mkt, by_sess, wr = bot_logic.stats_30d()
 
         def fmt_stats_block(title: str, items: dict, sort_key: str):
-            # sort by winrate desc, then trades desc
             rows = []
             for k, v in items.items():
                 rows.append((k, wr(v), v["trades"], v["wins"], v["losses"]))
@@ -1172,7 +1176,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
             f"{pause_line}{section_line}"
             f"🧩 Section: {bot_logic.section_index}/{SECTIONS_PER_DAY} | Section PnL: {bot_logic.section_profit:+.2f} / +{SECTION_PROFIT_TARGET:.2f} | Sections won: {bot_logic.sections_won_today}\n"
-            f"🎁 Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
+            f"🎁 Next payout: ${next_payout:.2f} | Martingale: OFF\n"
             f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
             f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
