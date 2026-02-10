@@ -68,7 +68,7 @@ DAILY_PROFIT_TARGET = 999999.0
 
 # ========================= SECTIONS =========================
 SECTIONS_PER_DAY = 1
-SECTION_PROFIT_TARGET = 999999
+SECTION_PROFIT_TARGET = 4
 SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)
 
 # ========================= PAYOUT MODE =========================
