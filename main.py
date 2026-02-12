@@ -47,7 +47,7 @@ DURATION_MIN = 3  # 3-minute expiry
 # ========================= OPTIONAL: SESSION FILTER =========================
 # If you want ONLY late NY, keep this as {"LATE_NY"}.
 # If you want trade any time, set to None.
-ALLOWED_SESSIONS_UTC = {"LATE_NY"}  # or None
+ALLOWED_SESSIONS_UTC = {"None"}  # or None
 
 # ========================= TREND/PULLBACK INDICATORS =========================
 EMA_TREND_FAST = 50
@@ -66,7 +66,7 @@ MIN_BODY_RATIO = 0.32
 MIN_CANDLE_RANGE = 1e-6
 
 # ========================= DAILY TARGETS / LIMITS =========================
-DAILY_PROFIT_TARGET = 999999.0
+DAILY_PROFIT_TARGET = 10.0
 
 # ========================= SECTIONS =========================
 # ✅ One section per day, STOP when +$3 reached
