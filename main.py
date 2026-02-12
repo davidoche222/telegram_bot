@@ -47,7 +47,7 @@ DURATION_MIN = 3  # 3-minute expiry
 # ========================= OPTIONAL: SESSION FILTER =========================
 # If you want ONLY late NY, keep this as {"LATE_NY"}.
 # If you want trade any time, set to None.
-ALLOWED_SESSIONS_UTC = {"None"}  # or None
+ALLOWED_SESSIONS_UTC = None # or None
 
 # ========================= TREND/PULLBACK INDICATORS =========================
 EMA_TREND_FAST = 50
