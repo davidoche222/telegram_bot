@@ -82,7 +82,7 @@ MAX_STAKE_ALLOWED = 10.00
 
 # ========================= MARTINGALE SETTINGS =========================
 # ✅ DO NOT TOUCH (as you requested)
-MARTINGALE_MULT = 1.8
+MARTINGALE_MULT = 2
 MARTINGALE_MAX_STEPS = 4
 MARTINGALE_MAX_STAKE = 16.0
 
