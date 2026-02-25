@@ -819,11 +819,11 @@ class DerivSniperBot:
                 # Reset rate limit strikes after successful fetch
                 self._rate_limit_strikes[symbol] = 0
 
-                if len(candles_1m) < 30 or len(candles_5m) < 60 or len(candles_15m) < 220:
+                if len(candles_1m) < 30 or len(candles_5m) < 60 or len(candles_15m) < 200:
                     self.market_debug[symbol] = {
                         "time": time.time(),
                         "gate": "Waiting for more candles",
-                        "why": [f"Need 15M>=220, 5M>=60, 1M>=30 | got 15M={len(candles_15m)} 5M={len(candles_5m)} 1M={len(candles_1m)}"],
+                        "why": [f"Need 15M>=200, 5M>=60, 1M>=30 | got 15M={len(candles_15m)} 5M={len(candles_5m)} 1M={len(candles_1m)}"],
                     }
                     self._next_poll_epoch[symbol] = time.time() + 12
                     continue
