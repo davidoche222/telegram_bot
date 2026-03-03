@@ -24,9 +24,9 @@ logger = logging.getLogger(__name__)
 
 # ===== STRATEGY =====
 TF_SEC = 60
-CANDLES_COUNT = 210
+CANDLES_COUNT = 100
 DURATION_MIN = 2
-MA_PERIOD = 200
+MA_PERIOD = 50
 STD_PERIOD = 20
 ATR_SHORT = 14
 ATR_LONG = 50
@@ -35,20 +35,20 @@ CANDLE_COOLDOWN = 2
 
 # ===== IMPROVEMENT 3: Dynamic Z threshold per market =====
 Z_THRESHOLDS = {
-    "R_10":  {"min": 2.0, "max": 3.0},
-    "R_25":  {"min": 2.0, "max": 3.0},
-    "R_50":  {"min": 2.2, "max": 3.2},
-    "R_75":  {"min": 2.5, "max": 3.5},
-    "R_100": {"min": 2.8, "max": 3.8},
+    "R_10":  {"min": 1.8, "max": 3.0},
+    "R_25":  {"min": 1.8, "max": 3.0},
+    "R_50":  {"min": 2.0, "max": 3.2},
+    "R_75":  {"min": 2.0, "max": 3.5},
+    "R_100": {"min": 2.2, "max": 3.8},
 }
-DEFAULT_Z_THRESHOLD = {"min": 2.0, "max": 3.0}
+DEFAULT_Z_THRESHOLD = {"min": 1.8, "max": 3.0}
 
 # ===== IMPROVEMENT 4: Time-based filter (UTC hours) =====
 ALLOWED_HOURS_UTC = (7, 20)  # Only trade 07:00 - 20:00 UTC
 
 # ===== IMPROVEMENT 6: Adaptive expiry =====
-EXPIRY_NORMAL_MIN = 3
-EXPIRY_STRONG_MIN = 2
+EXPIRY_NORMAL_MIN = 2
+EXPIRY_STRONG_MIN = 1
 EXPIRY_STRONG_Z_THRESHOLD = 2.5
 
 # ===== IMPROVEMENT 11: Profit lock =====
@@ -892,7 +892,6 @@ def format_market_detail(sym,d):
         f"────────────────\n"
         f"📐 Z Now: {z_now} | Z Prev: {z_prev}\n"
         f"📐 Threshold: ±{z_min} | Cap: ±{z_max}\n"
-        f"📈 Trend (MA200): {trend}\n"
         f"📊 Volatility: {'🔴 EXPANDING' if vol_exp else '🟢 Normal'}\n"
         f"⚡ Spike: {'🔴 YES' if spike else '🟢 NO'}\n"
         f"💵 Stake mult: {stake_mult:.1f}x\n"
@@ -1014,7 +1013,7 @@ async def start_cmd(u:Update,c:ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         "💎 Deriv Z-Score Bot v2\n"
         f"🧭 Strategy: Z-Score Mean Reversion + Full Filter Suite\n"
-        f"📐 Dynamic Z thresholds | ATR filter | Trend filter\n"
+        f"📐 Dynamic Z thresholds | ATR filter | Spike filter\n"
         f"🛡 Spike block | Candle confirm | Z momentum | Correlation filter\n"
         f"💰 Equity protection | Profit lock | Session loss limits\n"
         f"📊 Auto market rotation | Performance tuning\n"
