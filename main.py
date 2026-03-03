@@ -1,1382 +1,711 @@
-# ⚠️ SECURITY NOTE:
-# Do NOT post your Deriv / Telegram tokens publicly.
-# Paste them only on your local machine.
+# ⚠️ SECURITY NOTE: Do NOT post tokens publicly. Paste them only on your local machine.
 
-import asyncio
-import logging
-import random
-import time
-import json
-import os
+import asyncio, logging, random, time, json, os, math
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
 import numpy as np
 from deriv_api import DerivAPI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# ========================= CONFIG =========================
-# ✅ KEEP YOUR REAL TOKENS ON YOUR PC ONLY (PASTE THEM HERE LOCALLY)
+# ===== CONFIG =====
 DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "ZkOFWOlPtwnjqTS"
 APP_ID = 1089
-
-# ✅ trade all markets (edit freely)
 MARKETS = ["R_50", "R_75", "R_100", "R_10"]
-
-# ✅ cooldown
 COOLDOWN_SEC = 3
 MAX_TRADES_PER_DAY = 80
-MAX_CONSEC_LOSSES = 10
-
-# ✅ KEEP YOUR TELEGRAM TOKEN ON YOUR PC ONLY (PASTE HERE LOCALLY)
+MAX_CONSEC_LOSSES = 5
 TELEGRAM_TOKEN = "8589420556:AAHmB6YE9KIEu0tBIgWdd9baBDt0eDh5FY8"
 TELEGRAM_CHAT_ID = "7634818949"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ========================= STRATEGY SETTINGS =========================
-TF_SEC = 60  # M1 candles
-CANDLES_COUNT = 210  # ✅ FIX: reduced from 300 — EMA200 only needs ~210, less API load
-RSI_PERIOD = 14
-
-DURATION_MIN = 3  # 3-minute expiry
-
-# ========================= OPTIONAL: SESSION FILTER =========================
-ALLOWED_SESSIONS_UTC = None  # or None
-
-# ========================= TREND/PULLBACK INDICATORS =========================
-EMA_TREND_FAST = 50
-EMA_TREND_SLOW = 200
-
-EMA_PULLBACK = 20
-
-# RSI pullback quality on 5M
-RSI_BUY_MIN = 45.0
-RSI_SELL_MAX = 55.0
-
-ATR_PERIOD = 14
-PULLBACK_ATR_MULT = 0.60
-
-MIN_BODY_RATIO = 0.32
-MIN_CANDLE_RANGE = 1e-6
-
-# ========================= DAILY TARGETS / LIMITS =========================
+# ===== STRATEGY =====
+TF_SEC = 60
+CANDLES_COUNT = 210
+DURATION_MIN = 3
+MA_PERIOD = 200
+STD_PERIOD = 20
+Z_ENTRY_THRESHOLD = 2.0
+ATR_SHORT = 14
+ATR_LONG = 50
+ATR_EXPANSION_MULT = 1.3
+CANDLE_COOLDOWN = 2
+ALLOWED_SESSIONS_UTC = None
 DAILY_PROFIT_TARGET = 10.0
-
-# ========================= SECTIONS =========================
-# ✅ One section per day, STOP when +$3 reached
+DAILY_LOSS_LIMIT = -8.0
 SECTIONS_PER_DAY = 1
 SECTION_PROFIT_TARGET = 3.0
 SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)
-
-# ========================= PAYOUT MODE =========================
-USE_PAYOUT_MODE = True
 PAYOUT_TARGET = 1
 MIN_PAYOUT = 0.35
 MAX_STAKE_ALLOWED = 10.00
-
-# ========================= MARTINGALE SETTINGS =========================
-# ✅ DO NOT TOUCH (as you requested)
 MARTINGALE_MULT = 2
 MARTINGALE_MAX_STEPS = 4
-MARTINGALE_MAX_STAKE = 16.0
-
-# ========================= ENTRY QUALITY TOGGLES =========================
-USE_SPIKE_BLOCK = True
-USE_STRONG_CANDLE_FILTER = True
-
-# ========================= ANTI RATE-LIMIT =========================
 TICKS_GLOBAL_MIN_INTERVAL = 0.35
 RATE_LIMIT_BACKOFF_BASE = 20
-
-# ========================= UI: REFRESH COOLDOWN =========================
 STATUS_REFRESH_COOLDOWN_SEC = 10
-
-# ========================= STATS (30 DAYS) =========================
 STATS_DAYS = 30
 TRADE_LOG_FILE = "trade_log.jsonl"
+SESSION_BUCKETS = [("ASIA",0,6),("LONDON",7,11),("OVERLAP",12,15),("NEWYORK",16,20),("LATE_NY",21,23)]
+MARKET_CONSEC_LOSS_BLOCK = 2
 
-# ========================= SESSION BUCKETS (UTC) =========================
-SESSION_BUCKETS = [
-    ("ASIA", 0, 6),
-    ("LONDON", 7, 11),
-    ("OVERLAP", 12, 15),
-    ("NEWYORK", 16, 20),
-    ("LATE_NY", 21, 23),
-]
-
-# ========================= PER-MARKET 2-LOSS RULE =========================
-# ✅ NEW: If a market loses 2 trades in a row, block it until another market wins.
-# This resets automatically when any OTHER market gets a winning trade.
-MARKET_CONSEC_LOSS_BLOCK = 2  # block after this many consecutive losses on one market
-
-
-# ========================= INDICATOR MATH =========================
-def calculate_ema(values, period: int):
-    values = np.array(values, dtype=float)
-    if len(values) < period:
-        return np.array([])
-    k = 2.0 / (period + 1.0)
-    ema = np.zeros_like(values)
-    ema[0] = values[0]
-    for i in range(1, len(values)):
-        ema[i] = values[i] * k + ema[i - 1] * (1 - k)
-    return ema
-
-
-def calculate_rsi(values, period=14):
-    values = np.array(values, dtype=float)
-    n = len(values)
-    if n < period + 2:
-        return np.array([])
-
-    deltas = np.diff(values)
-    gains = np.where(deltas > 0, deltas, 0.0)
-    losses = np.where(deltas < 0, -deltas, 0.0)
-
-    rsi = np.full(n, np.nan, dtype=float)
-
-    avg_gain = np.mean(gains[:period])
-    avg_loss = np.mean(losses[:period])
-    rs = avg_gain / (avg_loss + 1e-12)
-    rsi[period] = 100.0 - (100.0 / (1.0 + rs))
-
-    for i in range(period + 1, n):
-        gain = gains[i - 1]
-        loss = losses[i - 1]
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-        rs = avg_gain / (avg_loss + 1e-12)
-        rsi[i] = 100.0 - (100.0 / (1.0 + rs))
-
-    return rsi
-
+# ===== INDICATORS =====
+def calculate_zscore(closes, ma_period=200, std_period=20):
+    closes = np.array(closes, dtype=float)
+    if len(closes) < ma_period + 1:
+        return None, None
+    ma_now  = np.mean(closes[-ma_period:])
+    ma_prev = np.mean(closes[-ma_period-1:-1])
+    std_now  = np.std(closes[-std_period:], ddof=0)
+    std_prev = np.std(closes[-std_period-1:-1], ddof=0)
+    if std_now == 0 or std_prev == 0:
+        return None, None
+    return float((closes[-1] - ma_now) / std_now), float((closes[-2] - ma_prev) / std_prev)
 
 def calculate_atr(highs, lows, closes, period=14):
-    highs = np.array(highs, dtype=float)
-    lows = np.array(lows, dtype=float)
-    closes = np.array(closes, dtype=float)
-
-    n = len(closes)
-    if n < period + 2:
-        return np.array([])
-
-    prev_close = np.roll(closes, 1)
-    prev_close[0] = closes[0]
-
-    tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_close), np.abs(lows - prev_close)))
-
-    atr = np.full(n, np.nan, dtype=float)
-    atr[period] = np.mean(tr[1:period + 1])
-    for i in range(period + 1, n):
-        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
-
+    highs=np.array(highs,dtype=float); lows=np.array(lows,dtype=float); closes=np.array(closes,dtype=float)
+    n=len(closes)
+    if n < period+2: return np.array([])
+    pc=np.roll(closes,1); pc[0]=closes[0]
+    tr=np.maximum(highs-lows,np.maximum(np.abs(highs-pc),np.abs(lows-pc)))
+    atr=np.full(n,np.nan,dtype=float)
+    atr[period]=np.mean(tr[1:period+1])
+    for i in range(period+1,n):
+        atr[i]=(atr[i-1]*(period-1)+tr[i])/period
     return atr
 
+def volatility_expanding(highs, lows, closes):
+    a_s=calculate_atr(highs,lows,closes,ATR_SHORT)
+    a_l=calculate_atr(highs,lows,closes,ATR_LONG)
+    if len(a_s)<2 or len(a_l)<2: return True
+    a14=a_s[-2]; a50=a_l[-2]
+    if np.isnan(a14) or np.isnan(a50) or a50==0: return True
+    return bool(a14 > ATR_EXPANSION_MULT * a50)
 
-def build_candles_from_deriv(candles_raw):
-    out = []
-    for x in candles_raw:
-        out.append(
-            {
-                "t0": int(x.get("epoch", 0)),
-                "o": float(x.get("open", 0)),
-                "h": float(x.get("high", 0)),
-                "l": float(x.get("low", 0)),
-                "c": float(x.get("close", 0)),
-            }
-        )
-    return out
-
+def build_candles_from_deriv(raw):
+    return [{"t0":int(x.get("epoch",0)),"o":float(x.get("open",0)),"h":float(x.get("high",0)),"l":float(x.get("low",0)),"c":float(x.get("close",0))} for x in raw]
 
 def fmt_time_hhmmss(epoch):
-    try:
-        return datetime.fromtimestamp(epoch, ZoneInfo("Africa/Lagos")).strftime("%H:%M:%S")
-    except Exception:
-        return "—"
-
+    try: return datetime.fromtimestamp(epoch,ZoneInfo("Africa/Lagos")).strftime("%H:%M:%S")
+    except: return "—"
 
 def fmt_hhmm(epoch):
-    try:
-        return datetime.fromtimestamp(epoch, ZoneInfo("Africa/Lagos")).strftime("%H:%M")
-    except Exception:
-        return "—"
+    try: return datetime.fromtimestamp(epoch,ZoneInfo("Africa/Lagos")).strftime("%H:%M")
+    except: return "—"
 
+def money2(x):
+    return math.ceil(float(x)*100.0)/100.0
 
-def money2(x: float) -> float:
-    import math
-
-    return math.ceil(float(x) * 100.0) / 100.0
-
-
-def session_bucket(epoch_ts: float) -> str:
-    dt = datetime.fromtimestamp(epoch_ts, ZoneInfo("UTC"))
-    h = dt.hour
-    for name, start_h, end_h in SESSION_BUCKETS:
-        if start_h <= h <= end_h:
-            return name
+def session_bucket(ts):
+    h=datetime.fromtimestamp(ts,ZoneInfo("UTC")).hour
+    for name,s,e in SESSION_BUCKETS:
+        if s<=h<=e: return name
     return "UNKNOWN"
 
-
-def is_strong_candle(candle: dict) -> tuple[bool, float]:
-    c_open = float(candle["o"])
-    c_close = float(candle["c"])
-    c_high = float(candle["h"])
-    c_low = float(candle["l"])
-    rng = max(MIN_CANDLE_RANGE, c_high - c_low)
-    body = abs(c_close - c_open)
-    ratio = body / rng
-    return ratio >= float(MIN_BODY_RATIO), ratio
-
-
-def is_engulfing(prev: dict, cur: dict, direction: str) -> bool:
-    po, pc = float(prev["o"]), float(prev["c"])
-    co, cc = float(cur["o"]), float(cur["c"])
-    prev_bear = pc < po
-    prev_bull = pc > po
-    cur_bull = cc > co
-    cur_bear = cc < co
-
-    if direction == "BUY":
-        return prev_bear and cur_bull and (cc >= po) and (co <= pc)
-    else:
-        return prev_bull and cur_bear and (cc <= po) and (co >= pc)
-
-
-def is_rejection(candle: dict, direction: str) -> bool:
-    o = float(candle["o"])
-    c = float(candle["c"])
-    h = float(candle["h"])
-    l = float(candle["l"])
-    rng = max(MIN_CANDLE_RANGE, h - l)
-    body = abs(c - o)
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - l
-
-    if direction == "BUY":
-        return (lower_wick / rng) >= 0.45 and (body / rng) <= 0.55 and c >= o
-    else:
-        return (upper_wick / rng) >= 0.45 and (body / rng) <= 0.55 and c <= o
-
-
-# ========================= BOT CORE =========================
+# ===== BOT =====
 class DerivSniperBot:
     def __init__(self):
-        self.api = None
-        self.app = None
-        self.active_token = None
-        self.account_type = "None"
+        self.api=None; self.app=None; self.active_token=None; self.account_type="None"
+        self.is_scanning=False; self.scanner_task=None; self.market_tasks={}
+        self.active_trade_info=None; self.active_market="None"
+        self.trade_start_time=0.0; self.active_trade_meta=None
+        self.cooldown_until=0.0; self.trades_today=0; self.total_losses_today=0
+        self.consecutive_losses=0; self.total_profit_today=0.0; self.balance="0.00"
+        self.max_loss_streak_today=0; self.hit_5_losses_today=False
+        self.current_stake=0.0; self.martingale_step=0; self.martingale_halt=False
+        self.section_profit=0.0; self.sections_won_today=0
+        self.section_index=1; self.section_pause_until=0.0
+        self.trade_lock=asyncio.Lock(); self._pending_buy=False
+        self.market_debug={m:{} for m in MARKETS}
+        self.last_processed_closed_t0={m:0 for m in MARKETS}
+        self.candle_cooldown_counter={m:0 for m in MARKETS}
+        self.tz=ZoneInfo("Africa/Lagos")
+        self.current_day=datetime.now(self.tz).date()
+        self.pause_until=0.0
+        self._ticks_lock=asyncio.Lock(); self._last_ticks_ts=0.0
+        self._next_poll_epoch={m:0.0 for m in MARKETS}
+        self._rate_limit_strikes={m:0 for m in MARKETS}
+        self.status_cooldown_until=0.0
+        self.trade_log_path=os.path.abspath(TRADE_LOG_FILE)
+        self.trade_records=[]; self._load_trade_log()
+        self.market_consec_losses={m:0 for m in MARKETS}
+        self.market_blocked={m:False for m in MARKETS}
 
-        self.is_scanning = False
-        self.scanner_task = None
-        self.market_tasks = {}
-
-        self.active_trade_info = None
-        self.active_market = "None"
-        self.trade_start_time = 0.0
-        self.active_trade_meta = None
-
-        self.cooldown_until = 0.0
-        self.trades_today = 0
-        self.total_losses_today = 0
-        self.consecutive_losses = 0
-        self.total_profit_today = 0.0
-        self.balance = "0.00"
-
-        # ✅ track daily worst streak + if we ever hit 5 losses in a row
-        self.max_loss_streak_today = 0
-        self.hit_5_losses_today = False
-
-        self.current_stake = 0.0
-        self.martingale_step = 0
-        self.martingale_halt = False
-
-        # sections
-        self.section_profit = 0.0
-        self.sections_won_today = 0
-        self.section_index = 1
-        self.section_pause_until = 0.0
-
-        self.trade_lock = asyncio.Lock()
-
-        # ✅ blocks "double open" from any weird retry conditions
-        self._pending_buy = False
-
-        self.market_debug = {m: {} for m in MARKETS}
-        self.last_processed_closed_t0 = {m: 0 for m in MARKETS}
-
-        self.tz = ZoneInfo("Africa/Lagos")
-        self.current_day = datetime.now(self.tz).date()
-        self.pause_until = 0.0
-
-        self._ticks_lock = asyncio.Lock()
-        self._last_ticks_ts = 0.0
-        self._next_poll_epoch = {m: 0.0 for m in MARKETS}
-        self._rate_limit_strikes = {m: 0 for m in MARKETS}
-
-        self.status_cooldown_until = 0.0
-
-        self.trade_log_path = os.path.abspath(TRADE_LOG_FILE)
-        self.trade_records = []
-        self._load_trade_log()
-
-        # ========================= NEW: PER-MARKET 2-LOSS TRACKING =========================
-        # Tracks consecutive losses per market independently
-        self.market_consec_losses = {m: 0 for m in MARKETS}
-        # Tracks which markets are currently blocked due to 2 consecutive losses
-        self.market_blocked = {m: False for m in MARKETS}
-
-    # ---------- 30-day stats ----------
     def _load_trade_log(self):
-        self.trade_records = []
-        if not os.path.exists(self.trade_log_path):
-            return
+        self.trade_records=[]
+        if not os.path.exists(self.trade_log_path): return
         try:
-            with open(self.trade_log_path, "r", encoding="utf-8") as f:
+            with open(self.trade_log_path,"r",encoding="utf-8") as f:
                 for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
+                    line=line.strip()
+                    if not line: continue
                     try:
-                        rec = json.loads(line)
-                        if isinstance(rec, dict) and "t" in rec:
-                            self.trade_records.append(rec)
-                    except Exception:
-                        continue
+                        rec=json.loads(line)
+                        if isinstance(rec,dict) and "t" in rec: self.trade_records.append(rec)
+                    except: continue
             self._prune_trade_records()
-        except Exception as e:
-            logger.warning(f"Failed to load trade log: {e}")
+        except Exception as e: logger.warning(f"Failed to load trade log: {e}")
 
-    def _append_trade_log(self, rec: dict):
+    def _append_trade_log(self,rec):
         try:
-            with open(self.trade_log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except Exception as e:
-            logger.warning(f"Failed to write trade log: {e}")
+            with open(self.trade_log_path,"a",encoding="utf-8") as f:
+                f.write(json.dumps(rec,ensure_ascii=False)+"\n")
+        except Exception as e: logger.warning(f"Failed to write trade log: {e}")
 
     def _prune_trade_records(self):
-        cutoff = time.time() - (STATS_DAYS * 24 * 3600)
-        self.trade_records = [r for r in self.trade_records if float(r.get("t", 0)) >= cutoff]
+        cutoff=time.time()-(STATS_DAYS*24*3600)
+        self.trade_records=[r for r in self.trade_records if float(r.get("t",0))>=cutoff]
 
-    def record_trade_result(self, symbol: str, open_epoch: float, profit: float):
-        sess = session_bucket(open_epoch)
-        win = 1 if profit > 0 else 0
-        rec = {"t": float(open_epoch), "symbol": str(symbol), "session": str(sess), "win": int(win), "profit": float(profit)}
-        self.trade_records.append(rec)
-        self._append_trade_log(rec)
-        self._prune_trade_records()
+    def record_trade_result(self,symbol,open_epoch,profit):
+        sess=session_bucket(open_epoch); win=1 if profit>0 else 0
+        rec={"t":float(open_epoch),"symbol":str(symbol),"session":str(sess),"win":int(win),"profit":float(profit)}
+        self.trade_records.append(rec); self._append_trade_log(rec); self._prune_trade_records()
 
     def stats_30d(self):
         self._prune_trade_records()
-        by_market = {}
-        by_session = {}
-
+        by_market={}; by_session={}
         for r in self.trade_records:
-            sym = r.get("symbol", "—")
-            sess = r.get("session", "—")
-            win = int(r.get("win", 0))
+            sym=r.get("symbol","—"); sess=r.get("session","—"); win=int(r.get("win",0))
+            by_market.setdefault(sym,{"wins":0,"losses":0,"trades":0})
+            by_session.setdefault(sess,{"wins":0,"losses":0,"trades":0})
+            by_market[sym]["trades"]+=1; by_session[sess]["trades"]+=1
+            if win==1: by_market[sym]["wins"]+=1; by_session[sess]["wins"]+=1
+            else: by_market[sym]["losses"]+=1; by_session[sess]["losses"]+=1
+        def wr(d): t=d["trades"]; return (100.0*d["wins"]/t) if t>0 else 0.0
+        return by_market,by_session,wr
 
-            by_market.setdefault(sym, {"wins": 0, "losses": 0, "trades": 0})
-            by_session.setdefault(sess, {"wins": 0, "losses": 0, "trades": 0})
-
-            by_market[sym]["trades"] += 1
-            by_session[sess]["trades"] += 1
-            if win == 1:
-                by_market[sym]["wins"] += 1
-                by_session[sess]["wins"] += 1
-            else:
-                by_market[sym]["losses"] += 1
-                by_session[sess]["losses"] += 1
-
-        def wr(d):
-            t = d["trades"]
-            return (100.0 * d["wins"] / t) if t > 0 else 0.0
-
-        return by_market, by_session, wr
-
-    # ========================= NEW: PER-MARKET LOSS RULE HELPERS =========================
-
-    def _update_market_loss_state(self, symbol: str, profit: float):
-        """
-        Called after every AUTO trade result.
-        - If LOSS: increment that market's consecutive loss counter.
-          If it hits MARKET_CONSEC_LOSS_BLOCK, block that market.
-        - If WIN: reset that market's counter and unblock it.
-          Also unblock ALL other blocked markets (another market won).
-        """
-        if profit <= 0:
-            # Loss on this market
-            self.market_consec_losses[symbol] = self.market_consec_losses.get(symbol, 0) + 1
-            if self.market_consec_losses[symbol] >= MARKET_CONSEC_LOSS_BLOCK:
-                if not self.market_blocked.get(symbol, False):
-                    self.market_blocked[symbol] = True
-                    logger.info(f"🚫 Market {symbol} BLOCKED after {self.market_consec_losses[symbol]} consecutive losses.")
+    def _update_market_loss_state(self,symbol,profit):
+        if profit<=0:
+            self.market_consec_losses[symbol]=self.market_consec_losses.get(symbol,0)+1
+            if self.market_consec_losses[symbol]>=MARKET_CONSEC_LOSS_BLOCK:
+                if not self.market_blocked.get(symbol,False):
+                    self.market_blocked[symbol]=True
+                    logger.info(f"🚫 {symbol} BLOCKED after {self.market_consec_losses[symbol]} losses.")
         else:
-            # Win on this market — reset this market and unblock ALL blocked markets
-            self.market_consec_losses[symbol] = 0
-            self.market_blocked[symbol] = False
-
-            # Unblock every other market that was blocked (a win happened, fresh start)
+            self.market_consec_losses[symbol]=0; self.market_blocked[symbol]=False
             for m in MARKETS:
-                if m != symbol and self.market_blocked.get(m, False):
-                    self.market_blocked[m] = False
-                    self.market_consec_losses[m] = 0
-                    logger.info(f"✅ Market {m} UNBLOCKED after win on {symbol}.")
+                if m!=symbol and self.market_blocked.get(m,False):
+                    self.market_blocked[m]=False; self.market_consec_losses[m]=0
+                    logger.info(f"✅ {m} UNBLOCKED after win on {symbol}.")
 
-    def _is_market_blocked(self, symbol: str) -> tuple[bool, str]:
-        """Returns (blocked, reason_string) for a given market."""
-        if self.market_blocked.get(symbol, False):
-            losses = self.market_consec_losses.get(symbol, 0)
-            return True, f"Market blocked: {losses} consecutive losses — waiting for a win on another market"
-        return False, "OK"
+    def _is_market_blocked(self,symbol):
+        if self.market_blocked.get(symbol,False):
+            return True,f"Market blocked: {self.market_consec_losses.get(symbol,0)} consecutive losses"
+        return False,"OK"
 
     def _reset_market_loss_state(self):
-        """Called on daily reset."""
-        self.market_consec_losses = {m: 0 for m in MARKETS}
-        self.market_blocked = {m: False for m in MARKETS}
-
-    # ---------- helpers ----------
-    @staticmethod
-    def _is_gatewayish_error(msg: str) -> bool:
-        m = (msg or "").lower()
-        return any(
-            k in m
-            for k in [
-                "gateway",
-                "bad gateway",
-                "502",
-                "503",
-                "504",
-                "timeout",
-                "timed out",
-                "temporarily unavailable",
-                "connection",
-                "websocket",
-                "not connected",
-                "disconnect",
-                "internal server error",
-                "service unavailable",
-            ]
-        )
+        self.market_consec_losses={m:0 for m in MARKETS}
+        self.market_blocked={m:False for m in MARKETS}
 
     @staticmethod
-    def _is_rate_limit_error(msg: str) -> bool:
-        m = (msg or "").lower()
+    def _is_gatewayish_error(msg):
+        m=(msg or "").lower()
+        return any(k in m for k in ["gateway","bad gateway","502","503","504","timeout","timed out","temporarily unavailable","connection","websocket","not connected","disconnect","internal server error","service unavailable"])
+
+    @staticmethod
+    def _is_rate_limit_error(msg):
+        m=(msg or "").lower()
         return ("rate limit" in m) or ("reached the rate limit" in m) or ("too many requests" in m) or ("429" in m)
 
-    async def safe_send_tg(self, text: str, retries: int = 5):
-        if not self.app:
-            return
-        last_err = None
-        for i in range(1, retries + 1):
-            try:
-                await self.app.bot.send_message(TELEGRAM_CHAT_ID, text)
-                return
+    async def safe_send_tg(self,text,retries=5):
+        if not self.app: return
+        for i in range(1,retries+1):
+            try: await self.app.bot.send_message(TELEGRAM_CHAT_ID,text); return
             except Exception as e:
-                last_err = e
-                msg = str(e)
-                if self._is_gatewayish_error(msg):
-                    await asyncio.sleep(0.8 * i + random.random() * 0.4)
-                else:
-                    await asyncio.sleep(0.4 * i)
-        logger.warning(f"Telegram send failed after retries: {last_err}")
+                if self._is_gatewayish_error(str(e)): await asyncio.sleep(0.8*i+random.random()*0.4)
+                else: await asyncio.sleep(0.4*i)
 
-    # ---------- Sections ----------
-    def _today_midnight_epoch(self) -> float:
-        now = datetime.now(self.tz)
-        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return midnight.timestamp()
+    def _today_midnight_epoch(self):
+        now=datetime.now(self.tz)
+        return now.replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
 
-    def _get_section_index_for_epoch(self, epoch_ts: float) -> int:
-        midnight = self._today_midnight_epoch()
-        sec_into_day = max(0, int(epoch_ts - midnight))
-        idx0 = min(SECTIONS_PER_DAY - 1, sec_into_day // SECTION_LENGTH_SEC)
-        return int(idx0 + 1)
+    def _get_section_index_for_epoch(self,epoch_ts):
+        midnight=self._today_midnight_epoch()
+        sec_into_day=max(0,int(epoch_ts-midnight))
+        idx0=min(SECTIONS_PER_DAY-1,sec_into_day//SECTION_LENGTH_SEC)
+        return int(idx0+1)
 
-    def _next_section_start_epoch(self, epoch_ts: float) -> float:
-        midnight = self._today_midnight_epoch()
-        sec_into_day = max(0, int(epoch_ts - midnight))
-        idx0 = min(SECTIONS_PER_DAY - 1, sec_into_day // SECTION_LENGTH_SEC)
-        next_start = midnight + (idx0 + 1) * SECTION_LENGTH_SEC
-        if idx0 + 1 >= SECTIONS_PER_DAY:
-            next_midnight = (datetime.fromtimestamp(midnight, self.tz) + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-            return next_midnight.timestamp()
-        return float(next_start)
+    def _next_section_start_epoch(self,epoch_ts):
+        midnight=self._today_midnight_epoch()
+        sec_into_day=max(0,int(epoch_ts-midnight))
+        idx0=min(SECTIONS_PER_DAY-1,sec_into_day//SECTION_LENGTH_SEC)
+        if idx0+1>=SECTIONS_PER_DAY:
+            nm=(datetime.fromtimestamp(midnight,self.tz)+timedelta(days=1)).replace(hour=0,minute=0,second=0,microsecond=0)
+            return nm.timestamp()
+        return float(midnight+(idx0+1)*SECTION_LENGTH_SEC)
 
     def _sync_section_if_needed(self):
-        now = time.time()
-        today = datetime.now(self.tz).date()
-        if today != self.current_day:
-            return
-        new_idx = self._get_section_index_for_epoch(now)
-        if new_idx != self.section_index:
-            self.section_index = new_idx
-            self.section_profit = 0.0
-            self.section_pause_until = 0.0
+        today=datetime.now(self.tz).date()
+        if today!=self.current_day: return
+        new_idx=self._get_section_index_for_epoch(time.time())
+        if new_idx!=self.section_index:
+            self.section_index=new_idx; self.section_profit=0.0; self.section_pause_until=0.0
 
-    # ---------- Deriv connection ----------
-    async def connect(self) -> bool:
+    async def connect(self):
         try:
-            if not self.active_token:
-                return False
-            self.api = DerivAPI(app_id=APP_ID)
+            if not self.active_token: return False
+            self.api=DerivAPI(app_id=APP_ID)
             await self.api.authorize(self.active_token)
-            await self.fetch_balance()
-            return True
-        except Exception as e:
-            logger.error(f"Connect error: {e}")
-            return False
+            await self.fetch_balance(); return True
+        except Exception as e: logger.error(f"Connect error: {e}"); return False
 
-    async def safe_reconnect(self) -> bool:
+    async def safe_reconnect(self):
         try:
             if self.api:
-                try:
-                    await self.api.disconnect()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        self.api = None
-        return await self.connect()
+                try: await self.api.disconnect()
+                except: pass
+        except: pass
+        self.api=None; return await self.connect()
 
-    async def safe_deriv_call(self, fn_name: str, payload: dict, retries: int = 6):
-        last_err = None
-        for attempt in range(1, retries + 1):
+    async def safe_deriv_call(self,fn_name,payload,retries=6):
+        last_err=None
+        for attempt in range(1,retries+1):
             try:
                 if not self.api:
-                    ok = await self.safe_reconnect()
-                    if not ok:
-                        raise RuntimeError("Reconnect failed")
-                fn = getattr(self.api, fn_name)
-                return await fn(payload)
+                    ok=await self.safe_reconnect()
+                    if not ok: raise RuntimeError("Reconnect failed")
+                return await getattr(self.api,fn_name)(payload)
             except Exception as e:
-                last_err = e
-                msg = str(e)
-                if self._is_gatewayish_error(msg):
-                    await self.safe_reconnect()
-                if self._is_rate_limit_error(msg):
-                    await asyncio.sleep(min(20.0, 2.5 * attempt + random.random()))
-                else:
-                    await asyncio.sleep(min(8.0, 0.6 * attempt + random.random() * 0.5))
+                last_err=e; msg=str(e)
+                if self._is_gatewayish_error(msg): await self.safe_reconnect()
+                if self._is_rate_limit_error(msg): await asyncio.sleep(min(20.0,2.5*attempt+random.random()))
+                else: await asyncio.sleep(min(8.0,0.6*attempt+random.random()*0.5))
         raise last_err
 
-    async def safe_ticks_history(self, payload: dict, retries: int = 4):
+    async def safe_ticks_history(self,payload,retries=4):
         async with self._ticks_lock:
-            now = time.time()
-            gap = (self._last_ticks_ts + TICKS_GLOBAL_MIN_INTERVAL) - now
-            if gap > 0:
-                await asyncio.sleep(gap)
-            self._last_ticks_ts = time.time()
-        return await self.safe_deriv_call("ticks_history", payload, retries=retries)
+            now=time.time(); gap=(self._last_ticks_ts+TICKS_GLOBAL_MIN_INTERVAL)-now
+            if gap>0: await asyncio.sleep(gap)
+            self._last_ticks_ts=time.time()
+        return await self.safe_deriv_call("ticks_history",payload,retries=retries)
 
-    # ========================= FIX 1: TIMEOUT WRAPPER =========================
-    async def fetch_candles(self, symbol: str, granularity_sec: int, count: int):
-        payload = {
-            "ticks_history": symbol,
-            "end": "latest",
-            "count": int(count),
-            "style": "candles",
-            "granularity": int(granularity_sec),
-        }
-        data = await self.safe_ticks_history(payload, retries=4)
-        return build_candles_from_deriv(data.get("candles", []))
+    async def fetch_candles(self,symbol,granularity_sec,count):
+        data=await self.safe_ticks_history({"ticks_history":symbol,"end":"latest","count":int(count),"style":"candles","granularity":int(granularity_sec)},retries=4)
+        return build_candles_from_deriv(data.get("candles",[]))
 
-    async def fetch_candles_with_timeout(self, symbol: str, granularity_sec: int, count: int, timeout_sec: float = 12.0):
-        """
-        ✅ FIX: Wraps fetch_candles with a hard timeout.
-        If Deriv's API hangs, this cancels the request and forces a reconnect
-        instead of freezing the entire scanner for that market indefinitely.
-        """
+    async def fetch_candles_with_timeout(self,symbol,granularity_sec,count,timeout_sec=12.0):
         try:
-            return await asyncio.wait_for(
-                self.fetch_candles(symbol, granularity_sec, count),
-                timeout=timeout_sec,
-            )
+            return await asyncio.wait_for(self.fetch_candles(symbol,granularity_sec,count),timeout=timeout_sec)
         except asyncio.TimeoutError:
-            logger.warning(f"fetch_candles TIMEOUT ({symbol} gran={granularity_sec}s) — forcing reconnect")
-            asyncio.create_task(self.safe_reconnect())
-            return []
+            logger.warning(f"fetch_candles TIMEOUT ({symbol}) — forcing reconnect")
+            asyncio.create_task(self.safe_reconnect()); return []
         except Exception as e:
-            logger.warning(f"fetch_candles ERROR ({symbol} gran={granularity_sec}s): {e}")
-            if self._is_gatewayish_error(str(e)):
-                asyncio.create_task(self.safe_reconnect())
+            logger.warning(f"fetch_candles ERROR ({symbol}): {e}")
+            if self._is_gatewayish_error(str(e)): asyncio.create_task(self.safe_reconnect())
             return []
 
     async def fetch_balance(self):
-        if not self.api:
-            return
+        if not self.api: return
         try:
-            bal = await self.safe_deriv_call("balance", {"balance": 1}, retries=4)
-            self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
-        except Exception:
-            pass
+            bal=await self.safe_deriv_call("balance",{"balance":1},retries=4)
+            self.balance=f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
+        except: pass
 
-    # ---------- Daily reset ----------
-    def _next_midnight_epoch(self) -> float:
-        now = datetime.now(self.tz)
-        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        return next_midnight.timestamp()
+    def _next_midnight_epoch(self):
+        now=datetime.now(self.tz)
+        return (now+timedelta(days=1)).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
 
     def _daily_reset_if_needed(self):
-        today = datetime.now(self.tz).date()
-        if today != self.current_day:
-            self.current_day = today
-            self.trades_today = 0
-            self.total_losses_today = 0
-            self.consecutive_losses = 0
-            self.total_profit_today = 0.0
-            self.cooldown_until = 0.0
-            self.pause_until = 0.0
-            self.martingale_step = 0
-            self.current_stake = 0.0
-            self.martingale_halt = False
-
-            self.section_profit = 0.0
-            self.sections_won_today = 0
-            self.section_index = self._get_section_index_for_epoch(time.time())
-            self.section_pause_until = 0.0
-
-            # ✅ reset streak memory
-            self.max_loss_streak_today = 0
-            self.hit_5_losses_today = False
-
-            # ✅ reset per-market loss state daily
+        today=datetime.now(self.tz).date()
+        if today!=self.current_day:
+            self.current_day=today; self.trades_today=0; self.total_losses_today=0
+            self.consecutive_losses=0; self.total_profit_today=0.0
+            self.cooldown_until=0.0; self.pause_until=0.0
+            self.martingale_step=0; self.current_stake=0.0; self.martingale_halt=False
+            self.section_profit=0.0; self.sections_won_today=0
+            self.section_index=self._get_section_index_for_epoch(time.time())
+            self.section_pause_until=0.0; self.max_loss_streak_today=0
+            self.hit_5_losses_today=False
+            self.candle_cooldown_counter={m:0 for m in MARKETS}
             self._reset_market_loss_state()
-
         self._sync_section_if_needed()
 
-    def _session_gate_ok(self) -> tuple[bool, str]:
-        if not ALLOWED_SESSIONS_UTC:
-            return True, "OK"
-        sess = session_bucket(time.time())
-        if sess in ALLOWED_SESSIONS_UTC:
-            return True, "OK"
-        return False, f"Session blocked: {sess} (allowed: {', '.join(sorted(ALLOWED_SESSIONS_UTC))})"
+    def _session_gate_ok(self):
+        if not ALLOWED_SESSIONS_UTC: return True,"OK"
+        sess=session_bucket(time.time())
+        if sess in ALLOWED_SESSIONS_UTC: return True,"OK"
+        return False,f"Session blocked: {sess}"
 
-    def can_auto_trade(self) -> tuple[bool, str]:
+    def can_auto_trade(self):
         self._daily_reset_if_needed()
+        ok_sess,msg_sess=self._session_gate_ok()
+        if not ok_sess: return False,msg_sess
+        if self.martingale_halt: return False,f"Stopped: Martingale {MARTINGALE_MAX_STEPS} steps completed"
+        if time.time()<self.section_pause_until:
+            return False,f"Section paused. Resumes {fmt_hhmm(self.section_pause_until)} ({int(self.section_pause_until-time.time())}s)"
+        if time.time()<self.pause_until:
+            return False,f"Paused until 12:00am WAT ({int(self.pause_until-time.time())}s)"
+        if self.total_profit_today>=DAILY_PROFIT_TARGET:
+            self.pause_until=self._next_midnight_epoch()
+            return False,f"Daily target reached (+${self.total_profit_today:.2f})"
+        if self.total_profit_today<=DAILY_LOSS_LIMIT:
+            self.pause_until=self._next_midnight_epoch()
+            return False,f"Stopped: Daily loss limit (${DAILY_LOSS_LIMIT:.2f}) reached"
+        if self.consecutive_losses>=MAX_CONSEC_LOSSES:
+            return False,f"⛔ Stopped: {MAX_CONSEC_LOSSES} consecutive losses reached"
+        if self.trades_today>=MAX_TRADES_PER_DAY: return False,"Stopped: daily trade limit reached"
+        if time.time()<self.cooldown_until: return False,f"Cooldown {int(self.cooldown_until-time.time())}s"
+        if self.active_trade_info: return False,"Trade in progress"
+        if self._pending_buy: return False,"Trade in progress (pending buy)"
+        if not self.api: return False,"Not connected"
+        return True,"OK"
 
-        ok_sess, msg_sess = self._session_gate_ok()
-        if not ok_sess:
-            return False, msg_sess
+    def can_trade_market(self,symbol):
+        ok,gate_msg=self.can_auto_trade()
+        if not ok: return False,gate_msg
+        blocked,block_msg=self._is_market_blocked(symbol)
+        if blocked: return False,block_msg
+        return True,"OK"
 
-        if self.martingale_halt:
-            return False, f"Stopped: Martingale {MARTINGALE_MAX_STEPS} steps completed"
-
-        if time.time() < self.section_pause_until:
-            left = int(self.section_pause_until - time.time())
-            return False, f"Section paused. Resumes {fmt_hhmm(self.section_pause_until)} ({left}s)"
-
-        if time.time() < self.pause_until:
-            left = int(self.pause_until - time.time())
-            return False, f"Paused until 12:00am WAT ({left}s)"
-
-        if self.total_profit_today >= DAILY_PROFIT_TARGET:
-            self.pause_until = self._next_midnight_epoch()
-            return False, f"Daily target reached (+${self.total_profit_today:.2f})"
-
-        if self.total_profit_today <= -8.0:
-            self.pause_until = self._next_midnight_epoch()
-            return False, "Stopped: Daily loss limit (-$8.00) reached"
-
-        if self.consecutive_losses >= MAX_CONSEC_LOSSES:
-            return False, "Stopped: max loss streak reached"
-        if self.trades_today >= MAX_TRADES_PER_DAY:
-            return False, "Stopped: daily trade limit reached"
-        if time.time() < self.cooldown_until:
-            return False, f"Cooldown {int(self.cooldown_until - time.time())}s"
-        if self.active_trade_info:
-            return False, "Trade in progress"
-        if self._pending_buy:
-            return False, "Trade in progress (pending buy)"
-        if not self.api:
-            return False, "Not connected"
-        return True, "OK"
-
-    def can_trade_market(self, symbol: str) -> tuple[bool, str]:
-        """
-        ✅ NEW: Per-market gate check.
-        Checks both the global can_auto_trade gate AND the per-market 2-loss block.
-        """
-        ok, gate_msg = self.can_auto_trade()
-        if not ok:
-            return False, gate_msg
-        blocked, block_msg = self._is_market_blocked(symbol)
-        if blocked:
-            return False, block_msg
-        return True, "OK"
-
-    # ---------- Scanner loop ----------
     async def background_scanner(self):
-        if not self.api:
-            return
-        self.market_tasks = {sym: asyncio.create_task(self.scan_market(sym)) for sym in MARKETS}
+        if not self.api: return
+        self.market_tasks={sym:asyncio.create_task(self.scan_market(sym)) for sym in MARKETS}
         try:
             while self.is_scanning:
-                if self.active_trade_info and (time.time() - self.trade_start_time > (DURATION_MIN * 60 + 90)):
-                    self.active_trade_info = None
-                    self.active_trade_meta = None
+                if self.active_trade_info and (time.time()-self.trade_start_time>(DURATION_MIN*60+90)):
+                    self.active_trade_info=None; self.active_trade_meta=None
                 await asyncio.sleep(1)
         finally:
-            for t in self.market_tasks.values():
-                t.cancel()
+            for t in self.market_tasks.values(): t.cancel()
             self.market_tasks.clear()
 
-    async def scan_market(self, symbol: str):
-        self._next_poll_epoch[symbol] = time.time() + random.random() * 0.5
+    async def scan_market(self,symbol):
+        self._next_poll_epoch[symbol]=time.time()+random.random()*0.5
 
         while self.is_scanning:
             try:
-                now = time.time()
-                nxt = float(self._next_poll_epoch.get(symbol, 0.0))
-                if now < nxt:
-                    await asyncio.sleep(min(1.0, nxt - now))
-                    continue
+                now=time.time(); nxt=float(self._next_poll_epoch.get(symbol,0.0))
+                if now<nxt:
+                    await asyncio.sleep(min(1.0,nxt-now)); continue
 
-                if self.consecutive_losses >= MAX_CONSEC_LOSSES or self.trades_today >= MAX_TRADES_PER_DAY:
-                    self.is_scanning = False
-                    break
+                if self.consecutive_losses>=MAX_CONSEC_LOSSES or self.trades_today>=MAX_TRADES_PER_DAY:
+                    self.is_scanning=False; break
 
-                # ✅ Use per-market gate (includes 2-loss block check)
-                ok_gate, gate = self.can_trade_market(symbol)
+                ok_gate,gate=self.can_trade_market(symbol)
 
-                # ✅ FIX: Use timeout-wrapped fetch to prevent scanner from hanging
-                candles_1m = await self.fetch_candles_with_timeout(symbol, 60, CANDLES_COUNT)
-                candles_5m = await self.fetch_candles_with_timeout(symbol, 300, CANDLES_COUNT)
-                candles_15m = await self.fetch_candles_with_timeout(symbol, 900, CANDLES_COUNT)
+                candles_1m=await self.fetch_candles_with_timeout(symbol,60,CANDLES_COUNT)
 
-                # ✅ FIX: Explicit empty check — if timeout returned [], skip and retry in 8s
-                if not candles_1m or not candles_5m or not candles_15m:
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "gate": "Candle fetch failed",
-                        "why": ["One or more timeframes returned empty — retrying in 8s"],
-                    }
-                    self._next_poll_epoch[symbol] = time.time() + 8
-                    continue
+                if not candles_1m:
+                    self.market_debug[symbol]={"time":time.time(),"gate":"Candle fetch failed","why":["M1 candles empty — retrying in 8s"]}
+                    self._next_poll_epoch[symbol]=time.time()+8; continue
 
-                # ✅ FIX: Reset rate limit strikes after a successful fetch
-                self._rate_limit_strikes[symbol] = 0
+                self._rate_limit_strikes[symbol]=0
 
-                if len(candles_1m) < 30 or len(candles_5m) < 60 or len(candles_15m) < 200:
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "gate": "Waiting for more candles",
-                        "why": [f"Need 15M>=200, 5M>=60, 1M>=30 | got 15M={len(candles_15m)} 5M={len(candles_5m)} 1M={len(candles_1m)}"],
-                    }
-                    self._next_poll_epoch[symbol] = time.time() + 12
-                    continue
+                if len(candles_1m)<MA_PERIOD+5:
+                    self.market_debug[symbol]={"time":time.time(),"gate":f"Warming up ({len(candles_1m)}/{MA_PERIOD+5})","why":[f"Need {MA_PERIOD+5} candles"]}
+                    self._next_poll_epoch[symbol]=time.time()+12; continue
 
-                confirm = candles_1m[-2]
-                confirm_t0 = int(confirm["t0"])
+                confirm=candles_1m[-2]; confirm_t0=int(confirm["t0"])
+                self._next_poll_epoch[symbol]=float(confirm_t0+TF_SEC+2.5)
 
-                # ✅ FIX: Increased poll buffer from 0.35s to 2.5s
-                # Deriv API can take 1-3s to serve a freshly closed candle.
-                # The old 0.35s buffer caused the bot to poll too early, get stale data,
-                # hit the last_processed check, and skip the candle entirely.
-                next_closed_epoch = confirm_t0 + TF_SEC
-                self._next_poll_epoch[symbol] = float(next_closed_epoch + 2.5)
+                if self.last_processed_closed_t0[symbol]==confirm_t0: continue
 
-                if self.last_processed_closed_t0[symbol] == confirm_t0:
-                    continue
+                # ===== Z-SCORE STRATEGY =====
+                closes=[x["c"] for x in candles_1m[:-1]]
+                highs=[x["h"] for x in candles_1m[:-1]]
+                lows=[x["l"] for x in candles_1m[:-1]]
 
-                closes_15 = [x["c"] for x in candles_15m]
-                ema_fast_15 = calculate_ema(closes_15, EMA_TREND_FAST)
-                ema_slow_15 = calculate_ema(closes_15, EMA_TREND_SLOW)
+                z_now,z_prev=calculate_zscore(closes,ma_period=MA_PERIOD,std_period=STD_PERIOD)
 
-                if len(ema_fast_15) < 5 or len(ema_slow_15) < 5:
-                    self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["15M EMA not ready."]}
-                    self.last_processed_closed_t0[symbol] = confirm_t0
-                    continue
+                if z_now is None or z_prev is None:
+                    self.market_debug[symbol]={"time":time.time(),"gate":gate,"why":["Z-score not ready (need more candles)"]}
+                    self.last_processed_closed_t0[symbol]=confirm_t0; continue
 
-                ema_fast_now = float(ema_fast_15[-2])
-                ema_slow_now = float(ema_slow_15[-2])
-                price_15 = float(closes_15[-2])
+                vol_exp=volatility_expanding(highs,lows,closes)
 
-                trend_up = (ema_fast_now > ema_slow_now) and (price_15 > ema_fast_now) and (price_15 > ema_slow_now)
-                trend_down = (ema_fast_now < ema_slow_now) and (price_15 < ema_fast_now) and (price_15 < ema_slow_now)
-                trend_sideways = not (trend_up or trend_down)
+                # Candle cooldown
+                if self.candle_cooldown_counter.get(symbol,0)>0:
+                    self.candle_cooldown_counter[symbol]-=1
+                    self.market_debug[symbol]={"time":time.time(),"gate":gate,"z_now":round(z_now,4),"vol_expanding":vol_exp,"why":[f"Candle cooldown: {self.candle_cooldown_counter[symbol]+1} left"]}
+                    self.last_processed_closed_t0[symbol]=confirm_t0; continue
 
-                closes_5 = [x["c"] for x in candles_5m]
-                highs_5 = [x["h"] for x in candles_5m]
-                lows_5 = [x["l"] for x in candles_5m]
+                signal=None
+                reason="No entry: Z not at threshold"
 
-                ema20_5 = calculate_ema(closes_5, EMA_PULLBACK)
-                rsi_5 = calculate_rsi(closes_5, RSI_PERIOD)
-                atr_5 = calculate_atr(highs_5, lows_5, closes_5, ATR_PERIOD)
-
-                if len(ema20_5) < 10 or len(rsi_5) < 10 or len(atr_5) < 10 or np.isnan(rsi_5[-2]) or np.isnan(atr_5[-2]):
-                    self.market_debug[symbol] = {"time": time.time(), "gate": "Indicators", "why": ["5M EMA/RSI/ATR not ready."]}
-                    self.last_processed_closed_t0[symbol] = confirm_t0
-                    continue
-
-                ema20_now = float(ema20_5[-2])
-                rsi5_now = float(rsi_5[-2])
-                atr5_now = float(atr_5[-2])
-                price_5 = float(closes_5[-2])
-
-                near_ema20 = abs(price_5 - ema20_now) <= (atr5_now * float(PULLBACK_ATR_MULT))
-                pullback_buy_ok = near_ema20 and (rsi5_now >= float(RSI_BUY_MIN))
-                pullback_sell_ok = near_ema20 and (rsi5_now <= float(RSI_SELL_MAX))
-
-                prev_1m = candles_1m[-3]
-                cur_1m = candles_1m[-2]
-
-                strong_ok, body_ratio = is_strong_candle(cur_1m)
-                spike_block = False
-                if USE_SPIKE_BLOCK:
-                    bodies = [abs(float(candles_1m[i]["c"]) - float(candles_1m[i]["o"])) for i in range(-22, -2)]
-                    avg_body = float(np.mean(bodies)) if bodies else 0.0
-                    last_body = abs(float(cur_1m["c"]) - float(cur_1m["o"]))
-                    spike_block = (avg_body > 0 and last_body > 1.5 * avg_body)
-
-                entry_buy = (is_engulfing(prev_1m, cur_1m, "BUY") or is_rejection(cur_1m, "BUY"))
-                entry_sell = (is_engulfing(prev_1m, cur_1m, "SELL") or is_rejection(cur_1m, "SELL"))
-
-                strong_filter_ok = (strong_ok if USE_STRONG_CANDLE_FILTER else True)
-                spike_ok = ((not spike_block) if USE_SPIKE_BLOCK else True)
-
-                call_ready = trend_up and pullback_buy_ok and entry_buy and strong_filter_ok and spike_ok
-                put_ready = trend_down and pullback_sell_ok and entry_sell and strong_filter_ok and spike_ok
-
-                signal = "CALL" if call_ready else "PUT" if put_ready else None
-
-                trend_label = "UPTREND" if trend_up else "DOWNTREND" if trend_down else "SIDEWAYS"
-                ema_label = f"15M EMA{EMA_TREND_FAST}={'↑' if ema_fast_now > ema_slow_now else '↓'} EMA{EMA_TREND_SLOW}"
-                pullback_label = f"5M Pullback: {'✅' if near_ema20 else '❌'} | dist={abs(price_5-ema20_now):.3f} <= ATR*{PULLBACK_ATR_MULT} ({atr5_now*PULLBACK_ATR_MULT:.3f})"
-                confirm_close_label = f"1M Entry: {'✅' if (entry_buy or entry_sell) else '❌'} (engulf/reject)"
-
-                # ✅ NEW: show per-market block state in debug info
-                mkt_blocked, mkt_block_reason = self._is_market_blocked(symbol)
-                mkt_losses = self.market_consec_losses.get(symbol, 0)
-
-                block_parts = []
-                if trend_sideways:
-                    block_parts.append("NO 15M TREND")
-                if trend_up and not pullback_buy_ok:
-                    block_parts.append("5M BUY FILTER FAIL")
-                if trend_down and not pullback_sell_ok:
-                    block_parts.append("5M SELL FILTER FAIL")
-                if USE_SPIKE_BLOCK and spike_block:
-                    block_parts.append("SPIKE BLOCK")
-                if USE_STRONG_CANDLE_FILTER and not strong_ok:
-                    block_parts.append("WEAK CANDLE")
-                if mkt_blocked:
-                    block_parts.append(f"MKT BLOCKED ({mkt_losses}L streak)")
-
-                block_label = " | ".join(block_parts) if block_parts else "OK"
-
-                why = []
-                if not ok_gate:
-                    why.append(f"Gate blocked: {gate}")
-                if signal:
-                    why.append(f"READY: {signal} (TREND + PULLBACK + 1M CONFIRM)")
+                if not vol_exp:
+                    if z_prev>-Z_ENTRY_THRESHOLD and z_now<=-Z_ENTRY_THRESHOLD:
+                        signal="CALL"; reason=f"BUY: Z crossed below -{Z_ENTRY_THRESHOLD} (z={z_now:.3f}, prev={z_prev:.3f})"
+                    elif z_prev<Z_ENTRY_THRESHOLD and z_now>=Z_ENTRY_THRESHOLD:
+                        signal="PUT"; reason=f"SELL: Z crossed above +{Z_ENTRY_THRESHOLD} (z={z_now:.3f}, prev={z_prev:.3f})"
                 else:
-                    why.append("No entry yet (conditions not aligned).")
+                    reason=f"Blocked: Volatility expanding | Z={z_now:.3f}"
 
-                self.market_debug[symbol] = {
-                    "time": time.time(),
-                    "gate": gate,
-                    "last_closed": confirm_t0,
-                    "signal": signal,
-                    "trend_label": trend_label,
-                    "ema_label": ema_label,
-                    "trend_strength": "STRONG" if (trend_up or trend_down) else "WEAK",
-                    "pullback_label": pullback_label,
-                    "confirm_close_label": confirm_close_label,
-                    "slope_label": "—",
-                    "block_label": block_label,
-                    "rsi_now": rsi5_now,
-                    "body_ratio": body_ratio,
-                    "atr_now": atr5_now,
-                    "why": why[:10],
+                mkt_blocked,_=self._is_market_blocked(symbol)
+                mkt_losses=self.market_consec_losses.get(symbol,0)
+
+                self.market_debug[symbol]={
+                    "time":time.time(),"gate":gate,"last_closed":confirm_t0,"signal":signal,
+                    "z_now":round(z_now,4),"z_prev":round(z_prev,4),"z_threshold":Z_ENTRY_THRESHOLD,
+                    "vol_expanding":vol_exp,"mkt_blocked":mkt_blocked,"mkt_losses":mkt_losses,
+                    "why":[reason]
                 }
 
-                self.last_processed_closed_t0[symbol] = confirm_t0
+                self.last_processed_closed_t0[symbol]=confirm_t0
 
-                if not ok_gate:
-                    continue
+                if not ok_gate: continue
 
-                if call_ready:
-                    await self.execute_trade("CALL", symbol, source="AUTO", rsi_now=rsi5_now, ema50_slope=0.0)
-                elif put_ready:
-                    await self.execute_trade("PUT", symbol, source="AUTO", rsi_now=rsi5_now, ema50_slope=0.0)
+                if signal=="CALL":
+                    await self.execute_trade("CALL",symbol,source="AUTO",z_now=z_now)
+                    self.candle_cooldown_counter[symbol]=CANDLE_COOLDOWN
+                elif signal=="PUT":
+                    await self.execute_trade("PUT",symbol,source="AUTO",z_now=z_now)
+                    self.candle_cooldown_counter[symbol]=CANDLE_COOLDOWN
 
-            except asyncio.CancelledError:
-                break
+            except asyncio.CancelledError: break
             except Exception as e:
-                msg = str(e)
-                logger.error(f"Scanner Error ({symbol}): {msg}")
-
+                msg=str(e); logger.error(f"Scanner Error ({symbol}): {msg}")
                 if self._is_rate_limit_error(msg):
-                    self._rate_limit_strikes[symbol] = int(self._rate_limit_strikes.get(symbol, 0)) + 1
-                    backoff = RATE_LIMIT_BACKOFF_BASE * self._rate_limit_strikes[symbol]
-                    backoff = min(180, backoff)
-                    self._next_poll_epoch[symbol] = time.time() + backoff
+                    self._rate_limit_strikes[symbol]=int(self._rate_limit_strikes.get(symbol,0))+1
+                    self._next_poll_epoch[symbol]=time.time()+min(180,RATE_LIMIT_BACKOFF_BASE*self._rate_limit_strikes[symbol])
                 else:
                     await asyncio.sleep(2 if not self._is_gatewayish_error(msg) else 5)
-
             await asyncio.sleep(0.05)
 
-    # ========================= PAYOUT MODE + MARTINGALE =========================
-    async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL", rsi_now: float = 0.0, ema50_slope: float = 0.0):
-        if not self.api or self.active_trade_info:
-            return
-
+    async def execute_trade(self,side,symbol,reason="MANUAL",source="MANUAL",z_now=0.0):
+        if not self.api or self.active_trade_info: return
         async with self.trade_lock:
-            # ✅ For AUTO trades use the per-market gate; MANUAL trades bypass the market block
-            if source == "AUTO":
-                ok, _gate = self.can_trade_market(symbol)
-            else:
-                ok, _gate = self.can_auto_trade()
-            if not ok:
-                return
-            if self._pending_buy:
-                return
-
-            self._pending_buy = True
+            ok,_gate=(self.can_trade_market(symbol) if source=="AUTO" else self.can_auto_trade())
+            if not ok or self._pending_buy: return
+            self._pending_buy=True
             try:
-                import math
-
-                payout = float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step))
-                payout = money2(payout)
-                payout = max(0.01, float(payout))
-                if not math.isfinite(payout):
-                    payout = 0.01
-                payout = max(float(MIN_PAYOUT), float(payout))
-                payout = money2(payout)
-
-                proposal_req = {
-                    "proposal": 1,
-                    "amount": payout,
-                    "basis": "payout",
-                    "contract_type": side,
-                    "currency": "USD",
-                    "duration": int(DURATION_MIN),
-                    "duration_unit": "m",
-                    "symbol": symbol,
-                }
-
-                prop = await self.safe_deriv_call("proposal", proposal_req, retries=6)
+                payout=money2(max(float(MIN_PAYOUT),money2(max(0.01,float(PAYOUT_TARGET)*(float(MARTINGALE_MULT)**int(self.martingale_step))))))
+                prop=await self.safe_deriv_call("proposal",{"proposal":1,"amount":payout,"basis":"payout","contract_type":side,"currency":"USD","duration":int(DURATION_MIN),"duration_unit":"m","symbol":symbol},retries=6)
                 if "error" in prop:
-                    err = prop["error"].get("message", "Proposal error")
-                    await self.safe_send_tg(f"❌ Proposal Error:\n{err}")
-                    return
-
-                p = prop["proposal"]
-                proposal_id = p["id"]
-                ask_price = float(p.get("ask_price", 0.0))
-                if ask_price <= 0:
-                    await self.safe_send_tg("❌ Proposal returned invalid ask_price.")
-                    return
-
-                if ask_price > float(MAX_STAKE_ALLOWED):
-                    await self.safe_send_tg(f"⛔️ Skipped trade: payout=${payout:.2f} needs stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}")
-                    self.cooldown_until = time.time() + COOLDOWN_SEC
-                    return
-
-                buy_price_cap = float(MAX_STAKE_ALLOWED)
-
-                # ✅ IMPORTANT: Don't retry BUY (network hiccup can cause DOUBLE PURCHASE)
-                buy = await self.safe_deriv_call("buy", {"buy": proposal_id, "price": buy_price_cap}, retries=1)
-
+                    await self.safe_send_tg(f"❌ Proposal Error:\n{prop['error'].get('message','')}"); return
+                p=prop["proposal"]; proposal_id=p["id"]; ask_price=float(p.get("ask_price",0))
+                if ask_price<=0:
+                    await self.safe_send_tg("❌ Invalid ask_price."); return
+                if ask_price>float(MAX_STAKE_ALLOWED):
+                    await self.safe_send_tg(f"⛔️ Skipped: stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}")
+                    self.cooldown_until=time.time()+COOLDOWN_SEC; return
+                buy=await self.safe_deriv_call("buy",{"buy":proposal_id,"price":float(MAX_STAKE_ALLOWED)},retries=1)
                 if "error" in buy:
-                    err_msg = str(buy["error"].get("message", "Buy error"))
-                    await self.safe_send_tg(f"❌ Trade Refused:\n{err_msg}")
-                    return
-
-                self.active_trade_info = int(buy["buy"]["contract_id"])
-                self.active_market = symbol
-                self.trade_start_time = time.time()
-                self.current_stake = ask_price
-
-                self.active_trade_meta = {
-                    "symbol": symbol,
-                    "side": side,
-                    "open_epoch": float(self.trade_start_time),
-                    "source": source,
-                }
-
-                if source == "AUTO":
-                    self.trades_today += 1
-
-                safe_symbol = str(symbol).replace("_", " ")
-                mkt_losses = self.market_consec_losses.get(symbol, 0)
-                msg = (
+                    await self.safe_send_tg(f"❌ Trade Refused:\n{buy['error'].get('message','')}"); return
+                self.active_trade_info=int(buy["buy"]["contract_id"])
+                self.active_market=symbol; self.trade_start_time=time.time(); self.current_stake=ask_price
+                self.active_trade_meta={"symbol":symbol,"side":side,"open_epoch":float(self.trade_start_time),"source":source}
+                if source=="AUTO": self.trades_today+=1
+                await self.safe_send_tg(
                     f"🚀 {side} TRADE OPENED\n"
-                    f"🛒 Market: {safe_symbol}\n"
+                    f"🛒 Market: {symbol.replace('_',' ')}\n"
                     f"⏱ Expiry: {DURATION_MIN}m\n"
                     f"🎁 Payout: ${payout:.2f}\n"
+                    f"📐 Z-Score: {z_now:.4f} (threshold ±{Z_ENTRY_THRESHOLD})\n"
                     f"🎲 Martingale step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
-                    f"💵 Stake (Deriv): ${ask_price:.2f}\n"
-                    f"🕓 Session (UTC): {session_bucket(self.trade_start_time)}\n"
+                    f"💵 Stake: ${ask_price:.2f}\n"
+                    f"🕓 Session(UTC): {session_bucket(self.trade_start_time)}\n"
                     f"🤖 Source: {source}\n"
-                    f"📉 {safe_symbol} loss streak: {mkt_losses}\n"
+                    f"📉 {symbol.replace('_',' ')} loss streak: {self.market_consec_losses.get(symbol,0)}\n"
                     f"🎯 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}"
                 )
-                await self.safe_send_tg(msg)
-
-                asyncio.create_task(self.check_result(self.active_trade_info, source, side, rsi_now, ema50_slope))
-
+                asyncio.create_task(self.check_result(self.active_trade_info,source,side,z_now))
             except Exception as e:
                 logger.error(f"Trade error: {e}")
                 await self.safe_send_tg(f"⚠️ Trade error:\n{e}")
             finally:
-                self._pending_buy = False
+                self._pending_buy=False
 
-    async def check_result(self, cid: int, source: str, side: str, rsi_now: float, ema50_slope: float):
-        await asyncio.sleep(int(DURATION_MIN) * 60 + 5)
+    async def check_result(self,cid,source,side,z_now):
+        await asyncio.sleep(int(DURATION_MIN)*60+5)
         try:
-            res = await self.safe_deriv_call("proposal_open_contract", {"proposal_open_contract": 1, "contract_id": cid}, retries=6)
-            profit = float(res["proposal_open_contract"].get("profit", 0))
-
-            traded_symbol = "—"
-            if source == "AUTO" and self.active_trade_meta:
-                traded_symbol = self.active_trade_meta.get("symbol", "—")
-                open_epoch = float(self.active_trade_meta.get("open_epoch", time.time()))
-                self.record_trade_result(traded_symbol, open_epoch, profit)
-
-            if source == "AUTO":
-                self.total_profit_today += profit
-                self.section_profit += profit
-
-                # ✅ NEW: Update per-market consecutive loss tracking
-                if traded_symbol in MARKETS:
-                    self._update_market_loss_state(traded_symbol, profit)
-                    mkt_losses_after = self.market_consec_losses.get(traded_symbol, 0)
-                    mkt_blocked_after = self.market_blocked.get(traded_symbol, False)
-
-                # ✅ stop for the day once section hits +$3
-                if self.section_profit >= float(SECTION_PROFIT_TARGET):
-                    self.sections_won_today += 1
-                    self.section_pause_until = self._next_section_start_epoch(time.time())
-
-                if profit <= 0:
-                    self.consecutive_losses += 1
-                    self.total_losses_today += 1
-
-                    # ✅ remember worst streak today + alert if ever hit 5
-                    if self.consecutive_losses > self.max_loss_streak_today:
-                        self.max_loss_streak_today = self.consecutive_losses
-                    if self.consecutive_losses >= 5 and not self.hit_5_losses_today:
-                        self.hit_5_losses_today = True
-                        await self.safe_send_tg("⚠️ ALERT: You have hit 5 losses in a row today (at least once).")
-
-                    if self.martingale_step < MARTINGALE_MAX_STEPS:
-                        self.martingale_step += 1
-                    else:
-                        self.martingale_halt = True
-                        self.is_scanning = False
+            res=await self.safe_deriv_call("proposal_open_contract",{"proposal_open_contract":1,"contract_id":cid},retries=6)
+            profit=float(res["proposal_open_contract"].get("profit",0))
+            traded_symbol="—"
+            if source=="AUTO" and self.active_trade_meta:
+                traded_symbol=self.active_trade_meta.get("symbol","—")
+                self.record_trade_result(traded_symbol,float(self.active_trade_meta.get("open_epoch",time.time())),profit)
+            if source=="AUTO":
+                self.total_profit_today+=profit; self.section_profit+=profit
+                if traded_symbol in MARKETS: self._update_market_loss_state(traded_symbol,profit)
+                if self.section_profit>=float(SECTION_PROFIT_TARGET):
+                    self.sections_won_today+=1; self.section_pause_until=self._next_section_start_epoch(time.time())
+                if profit<=0:
+                    self.consecutive_losses+=1; self.total_losses_today+=1
+                    if self.consecutive_losses>self.max_loss_streak_today:
+                        self.max_loss_streak_today=self.consecutive_losses
+                    if self.consecutive_losses>=5 and not self.hit_5_losses_today:
+                        self.hit_5_losses_today=True; self.is_scanning=False
+                        await self.safe_send_tg(f"⛔ STOPPED: 5 consecutive losses reached. Bot paused until tomorrow.")
+                    if self.martingale_step<MARTINGALE_MAX_STEPS: self.martingale_step+=1
+                    else: self.martingale_halt=True; self.is_scanning=False
                 else:
-                    self.consecutive_losses = 0
-                    self.martingale_step = 0
-                    self.martingale_halt = False
-
-                if self.total_profit_today >= DAILY_PROFIT_TARGET:
-                    self.pause_until = self._next_midnight_epoch()
-
+                    self.consecutive_losses=0; self.martingale_step=0; self.martingale_halt=False
+                if self.total_profit_today>=DAILY_PROFIT_TARGET:
+                    self.pause_until=self._next_midnight_epoch()
             await self.fetch_balance()
-
-            pause_note = "\n⏸ Paused until 12:00am WAT" if time.time() < self.pause_until else ""
-            halt_note = f"\n🛑 Martingale stopped after {MARTINGALE_MAX_STEPS} steps" if self.martingale_halt else ""
-            section_note = f"\n🧩 Section paused until {fmt_hhmm(self.section_pause_until)}" if time.time() < self.section_pause_until else ""
-
-            next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step)))
-
-            # ✅ NEW: Show per-market block state in result message
-            mkt_block_note = ""
-            if source == "AUTO" and traded_symbol in MARKETS:
-                mkt_losses_after = self.market_consec_losses.get(traded_symbol, 0)
-                mkt_blocked_after = self.market_blocked.get(traded_symbol, False)
-                safe_sym = traded_symbol.replace("_", " ")
-                if mkt_blocked_after:
-                    mkt_block_note = f"\n🚫 {safe_sym} BLOCKED ({mkt_losses_after}L row) — waiting for a win on another market"
-                else:
-                    mkt_block_note = f"\n📊 {safe_sym} loss streak: {mkt_losses_after}"
-
+            next_payout=money2(float(PAYOUT_TARGET)*(float(MARTINGALE_MULT)**int(self.martingale_step)))
+            mkt_losses_after=self.market_consec_losses.get(traded_symbol,0)
+            mkt_blocked_after=self.market_blocked.get(traded_symbol,False)
+            mkt_note=f"\n🚫 {traded_symbol.replace('_',' ')} BLOCKED ({mkt_losses_after}L row)" if mkt_blocked_after else f"\n📊 {traded_symbol.replace('_',' ')} loss streak: {mkt_losses_after}"
+            pause_note="\n⏸ Paused until 12:00am WAT" if time.time()<self.pause_until else ""
+            halt_note=f"\n🛑 Martingale stopped after {MARTINGALE_MAX_STEPS} steps" if self.martingale_halt else ""
+            section_note=f"\n🧩 Section paused until {fmt_hhmm(self.section_pause_until)}" if time.time()<self.section_pause_until else ""
             await self.safe_send_tg(
-                (
-                    f"🏁 FINISH: {'WIN' if profit > 0 else 'LOSS'} ({profit:+.2f})\n"
-                    f"🧩 Section: {self.section_index}/{SECTIONS_PER_DAY} | Section PnL: {self.section_profit:+.2f} / +{SECTION_PROFIT_TARGET:.2f}\n"
-                    f"📊 Today: {self.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {self.total_losses_today} | Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
-                    f"📌 Max streak today: {self.max_loss_streak_today} | Hit 5-loss today: {'YES' if self.hit_5_losses_today else 'NO'}\n"
-                    f"💵 Today PnL: {self.total_profit_today:+.2f} / +{DAILY_PROFIT_TARGET:.2f}\n"
-                    f"🎁 Next payout: ${next_payout:.2f} (step {self.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
-                    f"💰 Balance: {self.balance}"
-                    f"{mkt_block_note}"
-                    f"{pause_note}{section_note}{halt_note}"
-                )
+                f"🏁 FINISH: {'WIN' if profit>0 else 'LOSS'} ({profit:+.2f})\n"
+                f"📐 Z-Score was: {z_now:.4f}\n"
+                f"🧩 Section: {self.section_index}/{SECTIONS_PER_DAY} | PnL: {self.section_profit:+.2f}/+{SECTION_PROFIT_TARGET:.2f}\n"
+                f"📊 Today: {self.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {self.total_losses_today} | Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
+                f"📌 Max streak today: {self.max_loss_streak_today} | Hit 5-loss: {'YES ⛔' if self.hit_5_losses_today else 'NO'}\n"
+                f"💵 Today PnL: {self.total_profit_today:+.2f}/+{DAILY_PROFIT_TARGET:.2f}\n"
+                f"🎁 Next payout: ${next_payout:.2f} (step {self.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
+                f"💰 Balance: {self.balance}"
+                f"{mkt_note}{pause_note}{section_note}{halt_note}"
             )
         finally:
-            self.active_trade_info = None
-            self.active_trade_meta = None
-            self.cooldown_until = time.time() + COOLDOWN_SEC
+            self.active_trade_info=None; self.active_trade_meta=None
+            self.cooldown_until=time.time()+COOLDOWN_SEC
 
 
-# ========================= UI =========================
-bot_logic = DerivSniperBot()
-
+# ===== UI =====
+bot_logic=DerivSniperBot()
 
 def main_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("▶️ START", callback_data="START_SCAN"),
-                InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN"),
-            ],
-            [
-                InlineKeyboardButton("📊 STATUS", callback_data="STATUS"),
-                InlineKeyboardButton("🔄 REFRESH", callback_data="STATUS"),
-            ],
-            [InlineKeyboardButton("🧩 SECTION", callback_data="NEXT_SECTION")],
-            [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY")],
-            [
-                InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"),
-                InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL"),
-            ],
-        ]
-    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ START",callback_data="START_SCAN"),InlineKeyboardButton("⏹️ STOP",callback_data="STOP_SCAN")],
+        [InlineKeyboardButton("📊 STATUS",callback_data="STATUS"),InlineKeyboardButton("🔄 REFRESH",callback_data="STATUS")],
+        [InlineKeyboardButton("🧩 SECTION",callback_data="NEXT_SECTION")],
+        [InlineKeyboardButton("🧪 TEST BUY",callback_data="TEST_BUY")],
+        [InlineKeyboardButton("🧪 DEMO",callback_data="SET_DEMO"),InlineKeyboardButton("💰 LIVE",callback_data="SET_REAL")],
+    ])
 
-
-def format_market_detail(sym: str, d: dict) -> str:
-    if not d:
-        return f"📍 {sym.replace('_',' ')}\n⏳ No scan data yet"
-
-    age = int(time.time() - d.get("time", time.time()))
-    gate = d.get("gate", "—")
-    last_closed = d.get("last_closed", 0)
-    signal = d.get("signal") or "—"
-
-    trend_label = d.get("trend_label", "—")
-    ema_label = d.get("ema_label", "—")
-    trend_strength = d.get("trend_strength", "—")
-    pullback_label = d.get("pullback_label", "—")
-    confirm_close_label = d.get("confirm_close_label", "—")
-    slope_label = d.get("slope_label", "—")
-    block_label = d.get("block_label", "—")
-
-    rsi_now = d.get("rsi_now", None)
-    body_ratio = d.get("body_ratio", None)
-    atr_now = d.get("atr_now", None)
-
-    extra = []
-    if isinstance(rsi_now, (int, float)) and not np.isnan(rsi_now):
-        extra.append(f"RSI(5M): {rsi_now:.2f}")
-    if isinstance(atr_now, (int, float)) and not np.isnan(atr_now):
-        extra.append(f"ATR(5M): {atr_now:.5f}")
-    if isinstance(body_ratio, (int, float)) and not np.isnan(body_ratio):
-        extra.append(f"Body ratio(1M): {body_ratio:.2f}")
-
-    extra_line = " | ".join(extra) if extra else "—"
-    why = d.get("why", [])
-    why_line = "Why: " + (str(why[0]) if why else "—")
-
-    # ✅ NEW: Show per-market block status in detail view
-    mkt_losses = bot_logic.market_consec_losses.get(sym, 0)
-    mkt_blocked = bot_logic.market_blocked.get(sym, False)
-    block_status = f"🚫 BLOCKED ({mkt_losses}L streak)" if mkt_blocked else f"✅ Active ({mkt_losses}L streak)"
-
+def format_market_detail(sym,d):
+    if not d: return f"📍 {sym.replace('_',' ')}\n⏳ No scan data yet"
+    age=int(time.time()-d.get("time",time.time()))
+    z_now=d.get("z_now","—"); z_prev=d.get("z_prev","—")
+    vol_exp=d.get("vol_expanding",False); signal=d.get("signal") or "—"
+    mkt_blocked=d.get("mkt_blocked",False); mkt_losses=d.get("mkt_losses",0)
+    why=d.get("why",[]); gate=d.get("gate","—"); last_closed=d.get("last_closed",0)
     return (
-        f"📍 {sym.replace('_',' ')} ({age}s)\n"
+        f"📍 {sym.replace('_',' ')} ({age}s ago)\n"
         f"Gate: {gate}\n"
-        f"Market Status: {block_status}\n"
+        f"Market: {'🚫 BLOCKED' if mkt_blocked else '✅ Active'} ({mkt_losses}L streak)\n"
         f"Last closed: {fmt_time_hhmmss(last_closed)}\n"
         f"────────────────\n"
-        f"Trend: {trend_label} ({trend_strength})\n"
-        f"{ema_label}\n"
-        f"{slope_label}\n"
-        f"{pullback_label}\n"
-        f"{confirm_close_label}\n"
-        f"Stats: {extra_line}\n"
-        f"Filters: {block_label}\n"
+        f"📐 Z Now:  {z_now}\n"
+        f"📐 Z Prev: {z_prev}\n"
+        f"📐 Threshold: ±{Z_ENTRY_THRESHOLD}\n"
+        f"📊 Volatility: {'🔴 EXPANDING' if vol_exp else '🟢 Normal'}\n"
         f"Signal: {signal}\n"
-        f"{why_line}\n"
+        f"Why: {why[0] if why else '—'}\n"
     )
 
+async def _safe_answer(q,text=None,show_alert=False):
+    try: await q.answer(text=text,show_alert=show_alert)
+    except Exception as e: logger.warning(f"Callback answer: {e}")
 
-async def _safe_answer(q, text: str | None = None, show_alert: bool = False):
-    try:
-        await q.answer(text=text, show_alert=show_alert)
-    except Exception as e:
-        logger.warning(f"Callback answer ignored: {e}")
+async def _safe_edit(q,text,reply_markup=None):
+    try: await q.edit_message_text(text,reply_markup=reply_markup)
+    except Exception as e: logger.warning(f"Edit failed: {e}")
 
+async def btn_handler(u:Update,c:ContextTypes.DEFAULT_TYPE):
+    q=u.callback_query; await _safe_answer(q)
+    await _safe_edit(q,"⏳ Working...",reply_markup=main_keyboard())
 
-async def _safe_edit(q, text: str, reply_markup=None):
-    try:
-        await q.edit_message_text(text, reply_markup=reply_markup)
-    except Exception as e:
-        logger.warning(f"Edit failed: {e}")
-
-
-async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query
-    await _safe_answer(q)
-    await _safe_edit(q, "⏳ Working...", reply_markup=main_keyboard())
-
-    if q.data == "SET_DEMO":
-        bot_logic.active_token, bot_logic.account_type = DEMO_TOKEN, "DEMO"
-        ok = await bot_logic.connect()
-        await _safe_edit(q, "✅ Connected to DEMO" if ok else "❌ DEMO Failed", reply_markup=main_keyboard())
-
-    elif q.data == "SET_REAL":
-        bot_logic.active_token, bot_logic.account_type = REAL_TOKEN, "LIVE"
-        ok = await bot_logic.connect()
-        await _safe_edit(q, "✅ LIVE CONNECTED" if ok else "❌ LIVE Failed", reply_markup=main_keyboard())
-
-    elif q.data == "START_SCAN":
+    if q.data=="SET_DEMO":
+        bot_logic.active_token,bot_logic.account_type=DEMO_TOKEN,"DEMO"
+        ok=await bot_logic.connect()
+        await _safe_edit(q,"✅ Connected to DEMO" if ok else "❌ DEMO Failed",reply_markup=main_keyboard())
+    elif q.data=="SET_REAL":
+        bot_logic.active_token,bot_logic.account_type=REAL_TOKEN,"LIVE"
+        ok=await bot_logic.connect()
+        await _safe_edit(q,"✅ LIVE CONNECTED" if ok else "❌ LIVE Failed",reply_markup=main_keyboard())
+    elif q.data=="START_SCAN":
         if not bot_logic.api:
-            await _safe_edit(q, "❌ Connect first.", reply_markup=main_keyboard())
-            return
-        bot_logic.is_scanning = True
-        bot_logic.scanner_task = asyncio.create_task(bot_logic.background_scanner())
-        await _safe_edit(q, "🔍 SCANNER ACTIVE\n✅ Press STATUS to monitor.", reply_markup=main_keyboard())
-
-    elif q.data == "STOP_SCAN":
-        bot_logic.is_scanning = False
-        if bot_logic.scanner_task and not bot_logic.scanner_task.done():
-            bot_logic.scanner_task.cancel()
-        await _safe_edit(q, "⏹️ Scanner stopped.", reply_markup=main_keyboard())
-
-    elif q.data == "NEXT_SECTION":
+            await _safe_edit(q,"❌ Connect first.",reply_markup=main_keyboard()); return
+        bot_logic.is_scanning=True
+        bot_logic.scanner_task=asyncio.create_task(bot_logic.background_scanner())
+        await _safe_edit(q,"🔍 SCANNER ACTIVE\n✅ Z-Score strategy running.",reply_markup=main_keyboard())
+    elif q.data=="STOP_SCAN":
+        bot_logic.is_scanning=False
+        if bot_logic.scanner_task and not bot_logic.scanner_task.done(): bot_logic.scanner_task.cancel()
+        await _safe_edit(q,"⏹️ Scanner stopped.",reply_markup=main_keyboard())
+    elif q.data=="NEXT_SECTION":
         bot_logic._daily_reset_if_needed()
-        now = time.time()
-        nxt = bot_logic._next_section_start_epoch(now)
-        if nxt <= now + 1:
-            nxt = now + 1
-
-        forced_idx = bot_logic._get_section_index_for_epoch(nxt + 1)
-        bot_logic.section_index = forced_idx
-        bot_logic.section_profit = 0.0
-        bot_logic.section_pause_until = 0.0
-
-        await _safe_edit(q, f"🧩 Moved to Section {bot_logic.section_index}/{SECTIONS_PER_DAY}. Reset section PnL to 0.00.", reply_markup=main_keyboard())
-
-    elif q.data == "TEST_BUY":
-        # test buy uses first market in list
-        test_symbol = MARKETS[0] if MARKETS else "R_10"
-        asyncio.create_task(bot_logic.execute_trade("CALL", test_symbol, "Manual Test", source="MANUAL"))
-        await _safe_edit(q, f"🧪 Test trade triggered (CALL {test_symbol.replace('_',' ')}).", reply_markup=main_keyboard())
-
-    elif q.data == "STATUS":
-        now = time.time()
-        if now < bot_logic.status_cooldown_until:
-            left = int(bot_logic.status_cooldown_until - now)
-            await _safe_edit(q, f"⏳ Refresh cooldown: {left}s\n\nPress again after cooldown.", reply_markup=main_keyboard())
-            return
-        bot_logic.status_cooldown_until = now + STATUS_REFRESH_COOLDOWN_SEC
-
+        now=time.time(); nxt=bot_logic._next_section_start_epoch(now)
+        if nxt<=now+1: nxt=now+1
+        bot_logic.section_index=bot_logic._get_section_index_for_epoch(nxt+1)
+        bot_logic.section_profit=0.0; bot_logic.section_pause_until=0.0
+        await _safe_edit(q,f"🧩 Moved to Section {bot_logic.section_index}/{SECTIONS_PER_DAY}.",reply_markup=main_keyboard())
+    elif q.data=="TEST_BUY":
+        test_symbol=MARKETS[0] if MARKETS else "R_10"
+        asyncio.create_task(bot_logic.execute_trade("CALL",test_symbol,"Manual Test",source="MANUAL"))
+        await _safe_edit(q,f"🧪 Test trade triggered (CALL {test_symbol.replace('_',' ')}).",reply_markup=main_keyboard())
+    elif q.data=="STATUS":
+        now=time.time()
+        if now<bot_logic.status_cooldown_until:
+            await _safe_edit(q,f"⏳ Refresh cooldown: {int(bot_logic.status_cooldown_until-now)}s",reply_markup=main_keyboard()); return
+        bot_logic.status_cooldown_until=now+STATUS_REFRESH_COOLDOWN_SEC
         await bot_logic.fetch_balance()
-        now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
-        _ok, gate = bot_logic.can_auto_trade()
-
-        trade_status = "No Active Trade"
+        now_time=datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
+        _ok,gate=bot_logic.can_auto_trade()
+        trade_status="No Active Trade"
         if bot_logic.active_trade_info and bot_logic.api:
             try:
-                res = await bot_logic.safe_deriv_call(
-                    "proposal_open_contract",
-                    {"proposal_open_contract": 1, "contract_id": bot_logic.active_trade_info},
-                    retries=4,
-                )
-                pnl = float(res["proposal_open_contract"].get("profit", 0))
-                rem = max(0, int(DURATION_MIN * 60) - int(time.time() - bot_logic.trade_start_time))
-                icon = "✅ PROFIT" if pnl > 0 else "❌ LOSS" if pnl < 0 else "➖ FLAT"
-                mkt_clean = str(bot_logic.active_market).replace("_", " ")
-                sess = session_bucket(bot_logic.trade_start_time)
-                trade_status = f"🚀 Active Trade ({mkt_clean})\n🕓 Session(UTC): {sess}\n📈 PnL: {icon} ({pnl:+.2f})\n⏳ Left: {rem}s"
-            except Exception:
-                trade_status = "🚀 Active Trade: Syncing..."
-
-        pause_line = "⏸ Paused until 12:00am WAT\n" if time.time() < bot_logic.pause_until else ""
-        section_line = f"🧩 Section paused until {fmt_hhmm(bot_logic.section_pause_until)}\n" if time.time() < bot_logic.section_pause_until else ""
-
-        next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(bot_logic.martingale_step)))
-
-        by_mkt, by_sess, wr = bot_logic.stats_30d()
-
-        def fmt_stats_block(title: str, items: dict):
-            rows = []
-            for k, v in items.items():
-                rows.append((k, wr(v), v["trades"], v["wins"], v["losses"]))
-            rows.sort(key=lambda x: (x[1], x[2]), reverse=True)
-
-            lines = [f"{title} (last {STATS_DAYS}d):"]
-            if not rows:
-                lines.append("— No trades recorded yet")
-                return "\n".join(lines)
-
-            for k, wrr, t, w, l in rows:
-                lines.append(f"- {k.replace('_',' ')}: {wrr:.1f}% ({w}/{t})")
+                res=await bot_logic.safe_deriv_call("proposal_open_contract",{"proposal_open_contract":1,"contract_id":bot_logic.active_trade_info},retries=4)
+                pnl=float(res["proposal_open_contract"].get("profit",0))
+                rem=max(0,int(DURATION_MIN*60)-int(time.time()-bot_logic.trade_start_time))
+                icon="✅ PROFIT" if pnl>0 else "❌ LOSS" if pnl<0 else "➖ FLAT"
+                sess=session_bucket(bot_logic.trade_start_time)
+                trade_status=f"🚀 Active Trade ({bot_logic.active_market.replace('_',' ')})\n🕓 Session(UTC): {sess}\n📈 PnL: {icon} ({pnl:+.2f})\n⏳ Left: {rem}s"
+            except: trade_status="🚀 Active Trade: Syncing..."
+        pause_line="⏸ Paused until 12:00am WAT\n" if time.time()<bot_logic.pause_until else ""
+        section_line=f"🧩 Section paused until {fmt_hhmm(bot_logic.section_pause_until)}\n" if time.time()<bot_logic.section_pause_until else ""
+        next_payout=money2(float(PAYOUT_TARGET)*(float(MARTINGALE_MULT)**int(bot_logic.martingale_step)))
+        by_mkt,by_sess,wr=bot_logic.stats_30d()
+        def fmt_stats(title,items):
+            rows=[(k,wr(v),v["trades"],v["wins"]) for k,v in items.items()]
+            rows.sort(key=lambda x:(x[1],x[2]),reverse=True)
+            lines=[f"{title} (last {STATS_DAYS}d):"]
+            if not rows: lines.append("— No trades yet"); return "\n".join(lines)
+            for k,wrr,t,w in rows: lines.append(f"- {k.replace('_',' ')}: {wrr:.1f}% ({w}/{t})")
             return "\n".join(lines)
-
-        stats_block = (
-            "📈 PERFORMANCE TRACKER\n"
-            + fmt_stats_block("Markets", by_mkt)
-            + "\n"
-            + fmt_stats_block("Sessions(UTC)", by_sess)
-            + "\n"
-        )
-
-        # ✅ NEW: Per-market block summary in STATUS
-        mkt_status_lines = ["🛡 Market Block Status:"]
+        stats_block="📈 PERFORMANCE\n"+fmt_stats("Markets",by_mkt)+"\n"+fmt_stats("Sessions",by_sess)+"\n"
+        mkt_lines=["🛡 Market Block Status:"]
         for m in MARKETS:
-            ml = bot_logic.market_consec_losses.get(m, 0)
-            mb = bot_logic.market_blocked.get(m, False)
-            icon = "🚫" if mb else "✅"
-            mkt_status_lines.append(f"{icon} {m.replace('_',' ')}: {ml}L streak{'  BLOCKED' if mb else ''}")
-        mkt_status_block = "\n".join(mkt_status_lines) + "\n"
-
-        allowed_sess_line = (
-            f"🕓 Allowed sessions(UTC): {', '.join(sorted(ALLOWED_SESSIONS_UTC))}\n" if ALLOWED_SESSIONS_UTC else "🕓 Allowed sessions(UTC): ALL\n"
-        )
-
-        header = (
+            ml=bot_logic.market_consec_losses.get(m,0); mb=bot_logic.market_blocked.get(m,False)
+            mkt_lines.append(f"{'🚫' if mb else '✅'} {m.replace('_',' ')}: {ml}L streak{'  BLOCKED' if mb else ''}")
+        mkt_block="\n".join(mkt_lines)+"\n"
+        header=(
             f"🕒 Time (WAT): {now_time}\n"
             f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"{allowed_sess_line}"
             f"{pause_line}{section_line}"
-            f"🧩 Section: {bot_logic.section_index}/{SECTIONS_PER_DAY} | Section PnL: {bot_logic.section_profit:+.2f} / +{SECTION_PROFIT_TARGET:.2f}\n"
+            f"🧩 Section: {bot_logic.section_index}/{SECTIONS_PER_DAY} | PnL: {bot_logic.section_profit:+.2f}/+{SECTION_PROFIT_TARGET:.2f}\n"
             f"🎁 Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
-            f"🧯 Max stake allowed: ${MAX_STAKE_ALLOWED:.2f}\n"
-            f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
-            f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
-            f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
-            f"🧭 Strategy: 15M trend (EMA{EMA_TREND_FAST}/{EMA_TREND_SLOW}) + 5M pullback (EMA{EMA_PULLBACK}+RSI) + 1M entry (engulf/reject)\n"
+            f"🧯 Max stake: ${MAX_STAKE_ALLOWED:.2f} | Expiry: {DURATION_MIN}m\n"
+            f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} | Loss Limit: ${DAILY_LOSS_LIMIT:.2f}\n"
+            f"📡 Markets: {', '.join(m.replace('_',' ') for m in MARKETS)}\n"
+            f"🧭 Strategy: Z-Score Mean Reversion | MA{MA_PERIOD}/STD{STD_PERIOD} | ATR{ATR_SHORT}/{ATR_LONG}x{ATR_EXPANSION_MULT}\n"
+            f"⛔ Stop after: {MAX_CONSEC_LOSSES} consecutive losses\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
-            f"{stats_block}"
-            f"{mkt_status_block}"
-            f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
+            f"{stats_block}{mkt_block}"
+            f"💵 Today PnL: {bot_logic.total_profit_today:+.2f}\n"
             f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
-            f"📉 Loss Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | Max streak today: {bot_logic.max_loss_streak_today}\n"
-            f"⚠️ Hit 5-loss streak today: {'YES' if bot_logic.hit_5_losses_today else 'NO'}\n"
+            f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | Max today: {bot_logic.max_loss_streak_today}\n"
+            f"⚠️ Hit 5-loss today: {'YES ⛔' if bot_logic.hit_5_losses_today else 'NO'}\n"
             f"🚦 Gate: {gate}\n"
             f"💰 Balance: {bot_logic.balance}\n"
         )
+        details="\n\n📌 LIVE SCAN\n\n"+"\n\n".join([format_market_detail(sym,bot_logic.market_debug.get(sym,{})) for sym in MARKETS])
+        await _safe_edit(q,header+details,reply_markup=main_keyboard())
 
-        details = "\n\n📌 LIVE SCAN (FULL)\n\n" + "\n\n".join([format_market_detail(sym, bot_logic.market_debug.get(sym, {})) for sym in MARKETS])
-
-        await _safe_edit(q, header + details, reply_markup=main_keyboard())
-
-
-async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+async def start_cmd(u:Update,c:ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        "💎 Deriv Bot\n"
-        f"🕯 Entry: M1 | ⏱ Expiry: {DURATION_MIN}m\n"
-        f"✅ 1 section/day, stop at +${SECTION_PROFIT_TARGET:.2f}\n"
-        f"✅ 30-day tracker enabled (saved to {TRADE_LOG_FILE})\n"
-        f"✅ Per-market 2-loss block: active\n"
-        f"✅ Lag fix: timeout-wrapped candle fetch\n",
-        reply_markup=main_keyboard(),
+        "💎 Deriv Z-Score Bot\n"
+        f"🧭 Strategy: M1 Equilibrium Deviation Reversion\n"
+        f"📐 Z-Score: ±{Z_ENTRY_THRESHOLD} | MA{MA_PERIOD}/STD{STD_PERIOD}\n"
+        f"🛡 ATR Filter: {ATR_SHORT}/{ATR_LONG} x{ATR_EXPANSION_MULT}\n"
+        f"⛔ Stops after {MAX_CONSEC_LOSSES} consecutive losses\n"
+        f"⏱ Expiry: {DURATION_MIN}m | Stop at +${SECTION_PROFIT_TARGET:.2f}/section\n"
+        f"✅ 30-day tracker | Per-market 2-loss block active\n",
+        reply_markup=main_keyboard()
     )
 
-
-if __name__ == "__main__":
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    bot_logic.app = app
-    app.add_handler(CommandHandler("start", start_cmd))
+if __name__=="__main__":
+    app=Application.builder().token(TELEGRAM_TOKEN).build()
+    bot_logic.app=app
+    app.add_handler(CommandHandler("start",start_cmd))
     app.add_handler(CallbackQueryHandler(btn_handler))
     app.run_polling(drop_pending_updates=True)
