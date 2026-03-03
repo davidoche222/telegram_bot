@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ===== STRATEGY =====
 TF_SEC = 60
 CANDLES_COUNT = 210
-DURATION_MIN = 3
+DURATION_MIN = 2
 MA_PERIOD = 200
 STD_PERIOD = 20
 ATR_SHORT = 14
