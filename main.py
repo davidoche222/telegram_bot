@@ -44,7 +44,7 @@ Z_THRESHOLDS = {
 DEFAULT_Z_THRESHOLD = {"min": 1.8, "max": 3.0}
 
 # ===== Time-based filter (UTC hours) =====
-ALLOWED_HOURS_UTC = (7, 20)
+ALLOWED_HOURS_UTC = (0, 23)  # 24/7 — collecting session data
 
 # ===== Adaptive expiry =====
 EXPIRY_NORMAL_MIN = 2
@@ -189,6 +189,7 @@ class DerivSniperBot:
         self.last_processed_closed_t0={m:0 for m in MARKETS}
         self.candle_cooldown_counter={m:0 for m in MARKETS}
         self.profit_lock_active=False
+        self.prev_z={m:None for m in MARKETS}  # reversal confirmation tracking
         self.session_losses={}
         self.tz=ZoneInfo("Africa/Lagos")
         self.current_day=datetime.now(self.tz).date()
@@ -421,6 +422,7 @@ class DerivSniperBot:
             self.hit_5_losses_today=False
             self.candle_cooldown_counter={m:0 for m in MARKETS}
             self.profit_lock_active=False; self.session_losses={}
+            self.prev_z={m:None for m in MARKETS}
             self._reset_market_loss_state()
             self.starting_balance=self._get_current_balance_float()
         self._sync_section_if_needed()
@@ -570,20 +572,47 @@ class DerivSniperBot:
                 elif z_abs>z_max:
                     reason=f"Blocked: Z={z_now:.3f} beyond cap +-{z_max} (likely trend)"
                 else:
-                    # FIX 2: Only crossover required — momentum check removed
-                    # Momentum conflicted with crossover: when Z first crosses, prev is always opposite
-                    # 4. Z crosses threshold
-                    buy_cross=z_prev>-z_min and z_now<=-z_min
-                    sell_cross=z_prev<z_min and z_now>=z_min
+                    # HOW REVERSAL CONFIRMATION WORKS:
+                    # Step 1 — Z must cross the threshold (e.g. Z drops below -2.0)
+                    # Step 2 — On the NEXT candle, Z must start moving back toward 0
+                    # This avoids entering when Z crosses and keeps falling (false signal)
+                    # Example: Z = -1.8 → -2.1 (cross) → -2.3 (still falling, skip)
+                    #          Z = -1.8 → -2.1 (cross) → -1.9 (reversing, ENTER)
 
-                    if buy_cross:
+                    stored_z=self.prev_z.get(symbol)  # Z from previous candle
+
+                    # Check if previous candle crossed the threshold
+                    buy_crossed = stored_z is not None and stored_z > -z_min and z_prev <= -z_min
+                    sell_crossed = stored_z is not None and stored_z < z_min and z_prev >= z_min
+
+                    # Check if current candle is now reversing back toward zero
+                    buy_reversing  = z_prev <= -z_min and z_now > z_prev   # Z rising back up
+                    sell_reversing = z_prev >= z_min  and z_now < z_prev   # Z falling back down
+
+                    # Also allow same-candle cross + reversal (Z crossed and bounced in one candle)
+                    buy_cross_now  = z_prev > -z_min and z_now <= -z_min
+                    sell_cross_now = z_prev < z_min  and z_now >= z_min
+
+                    if (buy_crossed and buy_reversing) or (buy_cross_now and z_now > z_prev - 0.1):
                         signal="CALL"
-                        reason=f"BUY: Z={z_now:.3f} crossed below -{z_min} (prev={z_prev:.3f})"
-                    elif sell_cross:
+                        reason=f"BUY: Z={z_now:.3f} crossed +-{z_min} and reversing up (prev={z_prev:.3f})"
+                    elif (sell_crossed and sell_reversing) or (sell_cross_now and z_now < z_prev + 0.1):
                         signal="PUT"
-                        reason=f"SELL: Z={z_now:.3f} crossed above +{z_min} (prev={z_prev:.3f})"
+                        reason=f"SELL: Z={z_now:.3f} crossed +-{z_min} and reversing down (prev={z_prev:.3f})"
                     else:
-                        reason=f"Waiting: Z={z_now:.3f} | need cross of +-{z_min} (cap +-{z_max})"
+                        parts=[]
+                        if z_abs < z_min:
+                            parts.append(f"Z={z_now:.3f} not at threshold +-{z_min}")
+                        elif z_prev <= -z_min and z_now <= z_prev:
+                            parts.append(f"Z={z_now:.3f} crossed but still falling — waiting for reversal")
+                        elif z_prev >= z_min and z_now >= z_prev:
+                            parts.append(f"Z={z_now:.3f} crossed but still rising — waiting for reversal")
+                        else:
+                            parts.append(f"Z={z_now:.3f} waiting for cross of +-{z_min}")
+                        reason="Waiting: "+", ".join(parts)
+
+                # Update prev_z for next candle
+                self.prev_z[symbol]=z_prev
 
                 mkt_blocked,_=self._is_market_blocked(symbol)
                 mkt_losses=self.market_consec_losses.get(symbol,0)
@@ -908,7 +937,7 @@ async def btn_handler(u:Update,c:ContextTypes.DEFAULT_TYPE):
             f"💰 Equity: {eq_ratio:.0%} of starting balance\n"
             f"🔒 Profit lock: {'ACTIVE (floor +${:.2f})'.format(PROFIT_LOCK_FLOOR) if bot_logic.profit_lock_active else 'OFF'}\n"
             f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} | Loss Limit: ${DAILY_LOSS_LIMIT:.2f}\n"
-            f"🕐 Trading hours (UTC): {ALLOWED_HOURS_UTC[0]}:00 — {ALLOWED_HOURS_UTC[1]}:00\n"
+            f"🕐 Trading hours: 24/7 (all sessions)\n"
             f"📡 Markets: {', '.join(m.replace('_',' ') for m in MARKETS)}\n"
             f"🧭 Strategy: Z-Score v5 | MA{MA_PERIOD}/STD{STD_PERIOD} | ATR{ATR_SHORT}/{ATR_LONG}x{ATR_EXPANSION_MULT}\n"
             f"⛔ Stop after: {MAX_CONSEC_LOSSES} consecutive losses\n"
@@ -936,7 +965,7 @@ async def start_cmd(u:Update,c:ContextTypes.DEFAULT_TYPE):
         f"📡 Markets: R50, R75, R100 (R10 removed)\n"
         f"⛔ Stops after {MAX_CONSEC_LOSSES} consecutive losses\n"
         f"⏱ Adaptive expiry: {EXPIRY_NORMAL_MIN}m / {EXPIRY_STRONG_MIN}m\n"
-        f"🕐 Trading hours (UTC): {ALLOWED_HOURS_UTC[0]}:00 — {ALLOWED_HOURS_UTC[1]}:00\n"
+        f"🕐 Trading hours: 24/7 (all sessions)\n"
         f"📲 Commands: /setstake /setmarkets /pause /resume /stats\n",
         reply_markup=main_keyboard()
     )
