@@ -61,9 +61,6 @@ RSI_PUT_MAX = 60
 # Body ratio — relaxed
 BODY_RATIO_MIN = 0.40
 
-# Spike blocker
-SPIKE_MULT = 1.5
-
 # Chop filter
 CHOP_CROSS_LIMIT = 4
 
@@ -594,11 +591,6 @@ class DerivVWAPBot:
                 bull_candle=m1_close_now>m1_open_now
                 bear_candle=m1_close_now<m1_open_now
 
-                # Spike blocker
-                recent_bodies=[abs(float(m1_closes[i])-float(candles_m1[i]["o"])) for i in range(-22,-2)]
-                avg_body=float(np.mean(recent_bodies)) if recent_bodies else 0.0
-                spike=avg_body>0 and c_body>SPIKE_MULT*avg_body
-
                 # Chop detection
                 chop=vwap_crosses>=CHOP_CROSS_LIMIT
                 if chop and mkt_ok:
@@ -624,9 +616,7 @@ class DerivVWAPBot:
                 # ===== SINGLE RELAXED SIGNAL =====
                 signal=None; reason="No entry"
 
-                if spike:
-                    reason=f"Spike blocked — body {body_ratio:.2f}x avg"
-                elif chop:
+                if chop:
                     reason=f"Chop blocked — {vwap_crosses} VWAP crosses"
                 elif m5_trend is None:
                     reason="No M5 trend — price between VWAP and EMA50"
@@ -677,7 +667,7 @@ class DerivVWAPBot:
                     "m5_atr":round(m5_atr,5),
                     "m1_vwap":round(m1_vwap,5),"m1_rsi":round(m1_rsi,1) if m1_rsi else None,
                     "near_ema20":near_ema20,
-                    "body_ratio":round(body_ratio,2),"spike":spike,"chop":chop,
+                    "body_ratio":round(body_ratio,2),"chop":chop,
                     "vwap_crosses":vwap_crosses,
                     "mkt_losses":self.market_losses_today.get(symbol,0),
                     "mkt_trades":self.market_trades_today.get(symbol,0),
@@ -905,7 +895,7 @@ def format_market_detail(sym,d):
     ema50_rising=d.get("ema50_rising",False); ema50_falling=d.get("ema50_falling",False)
     slope_str="↑ Rising" if ema50_rising else ("↓ Falling" if ema50_falling else "→ Flat")
     near_ema20=d.get("near_ema20",False)
-    body_ratio=d.get("body_ratio",0); spike=d.get("spike",False); chop=d.get("chop",False)
+    body_ratio=d.get("body_ratio",0); chop=d.get("chop",False)
     m1_rsi=d.get("m1_rsi","—")
     mkt_losses=d.get("mkt_losses",0); mkt_trades=d.get("mkt_trades",0)
     return (
@@ -917,7 +907,7 @@ def format_market_detail(sym,d):
         f"📊 ADX: {adx:.1f} {'✅' if adx_ok else '❌'}\n"
         f"📉 EMA50 slope: {slope_str} ({ema50_slope:.4f})\n"
         f"📐 EMA20 pullback: {'✅' if near_ema20 else '❌'}\n"
-        f"🕯 Body: {body_ratio:.2f} | Spike: {'⚠️' if spike else '✅'} | Chop: {'⚠️' if chop else '✅'}\n"
+        f"🕯 Body: {body_ratio:.2f} | Chop: {'⚠️' if chop else '✅'}\n"
         f"📉 RSI: {m1_rsi}\n"
         f"Signal: {signal}\n"
         f"Why: {why[0] if why else '—'}\n"
