@@ -605,12 +605,9 @@ class DerivVWAPBot:
                     self.market_chop_until[symbol]=time.time()+CHOP_PAUSE_SEC
                     logger.info(f"⚠️ {symbol} chop — pausing {CHOP_PAUSE_SEC//60}min")
 
-                # Pullback zones
-                vwap_dist=abs(m1_close_now-m1_vwap)
-                pullback_zone=PULLBACK_ZONE_MULT*m5_atr
-                in_vwap_zone=vwap_dist<=pullback_zone
+                # Pullback zone — EMA20 only
                 near_ema20=(m1_ema20 is not None and abs(m1_close_now-m1_ema20)<=(0.25*m5_atr))
-                in_pullback=in_vwap_zone or near_ema20   # either zone is enough
+                in_pullback=near_ema20
 
                 # ===== M5 TREND DIRECTION =====
                 if m5_close_now>m5_vwap and m5_close_now>m5_ema50:
@@ -636,7 +633,7 @@ class DerivVWAPBot:
                 elif not adx_ok:
                     reason=f"ADX too low — {adx_val:.1f} < {ADX_MIN}"
                 elif not in_pullback:
-                    reason=f"No pullback — not near EMA20 or VWAP"
+                    reason=f"No pullback — price not near EMA20 (within 0.25×ATR)"
                 elif m5_trend=="CALL" and m1_uptrend and bull_candle:
                     rsi_ok=RSI_CALL_MIN<=m1_rsi<=RSI_CALL_MAX
                     body_ok=body_ratio>=BODY_RATIO_MIN
@@ -679,7 +676,7 @@ class DerivVWAPBot:
                     "adx":round(adx_val,1),"adx_ok":adx_ok,
                     "m5_atr":round(m5_atr,5),
                     "m1_vwap":round(m1_vwap,5),"m1_rsi":round(m1_rsi,1) if m1_rsi else None,
-                    "in_vwap_zone":in_vwap_zone,"near_ema20":near_ema20,
+                    "near_ema20":near_ema20,
                     "body_ratio":round(body_ratio,2),"spike":spike,"chop":chop,
                     "vwap_crosses":vwap_crosses,
                     "mkt_losses":self.market_losses_today.get(symbol,0),
@@ -907,7 +904,7 @@ def format_market_detail(sym,d):
     ema50_slope=d.get("ema50_slope",0)
     ema50_rising=d.get("ema50_rising",False); ema50_falling=d.get("ema50_falling",False)
     slope_str="↑ Rising" if ema50_rising else ("↓ Falling" if ema50_falling else "→ Flat")
-    in_vwap_zone=d.get("in_vwap_zone",False); near_ema20=d.get("near_ema20",False)
+    near_ema20=d.get("near_ema20",False)
     body_ratio=d.get("body_ratio",0); spike=d.get("spike",False); chop=d.get("chop",False)
     m1_rsi=d.get("m1_rsi","—")
     mkt_losses=d.get("mkt_losses",0); mkt_trades=d.get("mkt_trades",0)
@@ -919,7 +916,7 @@ def format_market_detail(sym,d):
         f"📈 M5: {m5_trend} | M1: {m1_trend_str}\n"
         f"📊 ADX: {adx:.1f} {'✅' if adx_ok else '❌'}\n"
         f"📉 EMA50 slope: {slope_str} ({ema50_slope:.4f})\n"
-        f"📐 VWAP zone: {'✅' if in_vwap_zone else '❌'} | EMA20 zone: {'✅' if near_ema20 else '❌'}\n"
+        f"📐 EMA20 pullback: {'✅' if near_ema20 else '❌'}\n"
         f"🕯 Body: {body_ratio:.2f} | Spike: {'⚠️' if spike else '✅'} | Chop: {'⚠️' if chop else '✅'}\n"
         f"📉 RSI: {m1_rsi}\n"
         f"Signal: {signal}\n"
