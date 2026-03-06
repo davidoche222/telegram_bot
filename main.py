@@ -610,15 +610,7 @@ class DerivVWAPBot:
                 pullback_zone=PULLBACK_ZONE_MULT*m5_atr
                 in_vwap_zone=vwap_dist<=pullback_zone
                 near_ema20=(m1_ema20 is not None and abs(m1_close_now-m1_ema20)<=(0.25*m5_atr))
-                in_pullback=in_vwap_zone or near_ema20   # EITHER is enough for T2/T3
-
-                # EMA20+VWAP confluence (tight — for Tier 1)
-                ema_vwap_dist=abs(m1_ema20-m1_vwap) if m1_ema20 else float("inf")
-                confluence=ema_vwap_dist<=(T1_EMA_VWAP_DIST_MULT*m5_atr)
-
-                # Breakout check
-                broke_prev_high=m1_prev_high is not None and m1_close_now>m1_prev_high
-                broke_prev_low=m1_prev_low is not None and m1_close_now<m1_prev_low
+                in_pullback=in_vwap_zone or near_ema20   # either zone is enough
 
                 # ===== M5 TREND DIRECTION =====
                 if m5_close_now>m5_vwap and m5_close_now>m5_ema50:
