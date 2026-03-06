@@ -51,25 +51,15 @@ ATR_SMA_PERIOD = 20
 # VWAP pullback zone
 PULLBACK_ZONE_MULT = 0.30   # relaxed — price within 0.30*ATR of VWAP
 
-# RSI settings (relaxed for Tier 2/3)
+# RSI settings — relaxed single tier
 RSI_PERIOD = 14
 RSI_CALL_MIN = 40
 RSI_CALL_MAX = 72
 RSI_PUT_MIN = 28
 RSI_PUT_MAX = 60
 
-# Tier 1 stricter RSI + body
-T1_RSI_CALL_MIN = 48
-T1_RSI_CALL_MAX = 65
-T1_RSI_PUT_MIN = 35
-T1_RSI_PUT_MAX = 52
-T1_BODY_RATIO = 0.55
-T1_EMA_VWAP_DIST_MULT = 0.20  # EMA20 and VWAP within 0.20*ATR for confluence
-
-# Body ratio per tier
-BODY_RATIO_T1 = 0.55
-BODY_RATIO_T2 = 0.40
-BODY_RATIO_T3 = 0.30
+# Body ratio — relaxed
+BODY_RATIO_MIN = 0.40
 
 # Spike blocker
 SPIKE_MULT = 1.5
@@ -642,81 +632,64 @@ class DerivVWAPBot:
                 m1_uptrend=(m1_ema20 and m1_ema50 and m1_ema20>m1_ema50)
                 m1_downtrend=(m1_ema20 and m1_ema50 and m1_ema20<m1_ema50)
 
-                # ===== 3-TIER SIGNAL CLASSIFICATION =====
-                signal=None; tier=0; reason="No entry"
+                # ===== SINGLE RELAXED SIGNAL =====
+                signal=None; reason="No entry"
 
                 if spike:
-                    reason=f"Spike candle blocked — body {body_ratio:.2f}x avg"
+                    reason=f"Spike blocked — body {body_ratio:.2f}x avg"
                 elif chop:
                     reason=f"Chop blocked — {vwap_crosses} VWAP crosses"
                 elif m5_trend is None:
                     reason="No M5 trend — price between VWAP and EMA50"
                 elif not adx_ok:
-                    reason=f"ADX too low — {adx_val:.1f} < {ADX_MIN} (no strong trend)"
+                    reason=f"ADX too low — {adx_val:.1f} < {ADX_MIN}"
                 elif not in_pullback:
-                    reason=f"No pullback — price not near EMA20 or VWAP zone"
+                    reason=f"No pullback — not near EMA20 or VWAP"
                 elif m5_trend=="CALL" and m1_uptrend and bull_candle:
-                    # Check tiers from highest to lowest
-                    t1_rsi_ok=T1_RSI_CALL_MIN<=m1_rsi<=T1_RSI_CALL_MAX
-                    t2_rsi_ok=RSI_CALL_MIN<=m1_rsi<=RSI_CALL_MAX
-                    t3_rsi_ok=m1_rsi>=RSI_CALL_MIN-5
-
-                    if (ema50_rising and confluence and in_vwap_zone and near_ema20
-                            and t1_rsi_ok and body_ratio>=BODY_RATIO_T1 and broke_prev_high):
-                        signal="CALL"; tier=1
-                        reason=f"T1 CALL: confluence+breakout | ADX={adx_val:.1f} | RSI={m1_rsi:.1f} | slope={ema50_slope:.4f}"
-                    elif (ema50_rising and in_pullback and t2_rsi_ok and body_ratio>=BODY_RATIO_T2):
-                        signal="CALL"; tier=2
-                        reason=f"T2 CALL: EMA pullback | ADX={adx_val:.1f} | RSI={m1_rsi:.1f} | slope={ema50_slope:.4f}"
-                    elif (in_pullback and t3_rsi_ok and body_ratio>=BODY_RATIO_T3):
-                        signal="CALL"; tier=3
-                        reason=f"T3 CALL: basic pullback | ADX={adx_val:.1f} | RSI={m1_rsi:.1f}"
+                    rsi_ok=RSI_CALL_MIN<=m1_rsi<=RSI_CALL_MAX
+                    body_ok=body_ratio>=BODY_RATIO_MIN
+                    slope_ok_call=ema50_slope>EMA_SLOPE_MIN
+                    if slope_ok_call and rsi_ok and body_ok:
+                        signal="CALL"
+                        reason=f"CALL ✅ | ADX={adx_val:.1f} | RSI={m1_rsi:.1f} | slope={ema50_slope:.4f} | body={body_ratio:.2f}"
                     else:
                         parts=[]
-                        if not ema50_rising: parts.append(f"EMA50 slope flat ({ema50_slope:.4f})")
-                        if not t2_rsi_ok: parts.append(f"RSI={m1_rsi:.1f} out of range")
-                        if body_ratio<BODY_RATIO_T3: parts.append(f"Weak candle ({body_ratio:.2f})")
+                        if not slope_ok_call: parts.append(f"slope flat ({ema50_slope:.4f})")
+                        if not rsi_ok: parts.append(f"RSI={m1_rsi:.1f} out of 40-72")
+                        if not body_ok: parts.append(f"weak candle ({body_ratio:.2f})")
                         reason="CALL waiting: "+", ".join(parts)
                 elif m5_trend=="PUT" and m1_downtrend and bear_candle:
-                    t1_rsi_ok=T1_RSI_PUT_MIN<=m1_rsi<=T1_RSI_PUT_MAX
-                    t2_rsi_ok=RSI_PUT_MIN<=m1_rsi<=RSI_PUT_MAX
-                    t3_rsi_ok=m1_rsi<=RSI_PUT_MAX+5
-
-                    if (ema50_falling and confluence and in_vwap_zone and near_ema20
-                            and t1_rsi_ok and body_ratio>=BODY_RATIO_T1 and broke_prev_low):
-                        signal="PUT"; tier=1
-                        reason=f"T1 PUT: confluence+breakdown | ADX={adx_val:.1f} | RSI={m1_rsi:.1f} | slope={ema50_slope:.4f}"
-                    elif (ema50_falling and in_pullback and t2_rsi_ok and body_ratio>=BODY_RATIO_T2):
-                        signal="PUT"; tier=2
-                        reason=f"T2 PUT: EMA pullback | ADX={adx_val:.1f} | RSI={m1_rsi:.1f} | slope={ema50_slope:.4f}"
-                    elif (in_pullback and t3_rsi_ok and body_ratio>=BODY_RATIO_T3):
-                        signal="PUT"; tier=3
-                        reason=f"T3 PUT: basic pullback | ADX={adx_val:.1f} | RSI={m1_rsi:.1f}"
+                    rsi_ok=RSI_PUT_MIN<=m1_rsi<=RSI_PUT_MAX
+                    body_ok=body_ratio>=BODY_RATIO_MIN
+                    slope_ok_put=ema50_slope<-EMA_SLOPE_MIN
+                    if slope_ok_put and rsi_ok and body_ok:
+                        signal="PUT"
+                        reason=f"PUT ✅ | ADX={adx_val:.1f} | RSI={m1_rsi:.1f} | slope={ema50_slope:.4f} | body={body_ratio:.2f}"
                     else:
                         parts=[]
-                        if not ema50_falling: parts.append(f"EMA50 slope flat ({ema50_slope:.4f})")
-                        if not t2_rsi_ok: parts.append(f"RSI={m1_rsi:.1f} out of range")
-                        if body_ratio<BODY_RATIO_T3: parts.append(f"Weak candle ({body_ratio:.2f})")
+                        if not slope_ok_put: parts.append(f"slope flat ({ema50_slope:.4f})")
+                        if not rsi_ok: parts.append(f"RSI={m1_rsi:.1f} out of 28-60")
+                        if not body_ok: parts.append(f"weak candle ({body_ratio:.2f})")
                         reason="PUT waiting: "+", ".join(parts)
                 else:
-                    reason=f"M5={m5_trend} but M1 EMA or candle direction not aligned"
+                    reason=f"M5={m5_trend} but M1 trend or candle not aligned"
 
                 _,_,stake_mult=self._equity_ok()
 
                 self.market_debug[symbol]={
                     "time":time.time(),"gate":gate,"mkt_msg":mkt_msg,
-                    "last_closed":confirm_t0,"signal":signal,"tier":tier,
+                    "last_closed":confirm_t0,"signal":signal,
                     "m5_trend":m5_trend,"m1_uptrend":m1_uptrend,"m1_downtrend":m1_downtrend,
                     "m5_vwap":round(m5_vwap,5),"m5_ema50":round(m5_ema50,5) if m5_ema50 else None,
                     "m1_ema20":round(m1_ema20,5) if m1_ema20 else None,
                     "m1_ema50":round(m1_ema50,5) if m1_ema50 else None,
                     "ema50_slope":round(ema50_slope,4),"ema50_rising":ema50_rising,"ema50_falling":ema50_falling,
                     "adx":round(adx_val,1),"adx_ok":adx_ok,
-                    "m5_atr":round(m5_atr,5),"m5_atr_sma":round(m5_atr_sma,5),
+                    "m5_atr":round(m5_atr,5),
                     "m1_vwap":round(m1_vwap,5),"m1_rsi":round(m1_rsi,1) if m1_rsi else None,
-                    "in_vwap_zone":in_vwap_zone,"near_ema20":near_ema20,"confluence":confluence,
+                    "in_vwap_zone":in_vwap_zone,"near_ema20":near_ema20,
                     "body_ratio":round(body_ratio,2),"spike":spike,"chop":chop,
-                    "vwap_crosses":vwap_crosses,"broke_prev_high":broke_prev_high,"broke_prev_low":broke_prev_low,
+                    "vwap_crosses":vwap_crosses,
                     "mkt_losses":self.market_losses_today.get(symbol,0),
                     "mkt_trades":self.market_trades_today.get(symbol,0),
                     "stake_mult":stake_mult,"why":[reason]
@@ -728,11 +701,11 @@ class DerivVWAPBot:
                 if signal=="CALL":
                     await self.execute_trade("CALL",symbol,source="AUTO",
                         rsi=m1_rsi,atr=m5_atr,vwap_dist=vwap_dist,
-                        m5_trend=m5_trend,stake_mult=stake_mult,tier=tier)
+                        m5_trend=m5_trend,stake_mult=stake_mult)
                 elif signal=="PUT":
                     await self.execute_trade("PUT",symbol,source="AUTO",
                         rsi=m1_rsi,atr=m5_atr,vwap_dist=vwap_dist,
-                        m5_trend=m5_trend,stake_mult=stake_mult,tier=tier)
+                        m5_trend=m5_trend,stake_mult=stake_mult)
 
             except asyncio.CancelledError: break
             except Exception as e:
@@ -745,7 +718,7 @@ class DerivVWAPBot:
             await asyncio.sleep(0.05)
 
     async def execute_trade(self,side,symbol,reason="MANUAL",source="MANUAL",
-                             rsi=0,atr=0,vwap_dist=0,m5_trend="—",stake_mult=1.0,tier=1):
+                             rsi=0,atr=0,vwap_dist=0,m5_trend="—",stake_mult=1.0):
         if not self.api or self.active_trade_info: return
         async with self.trade_lock:
             ok,_gate=self.can_auto_trade()
@@ -753,14 +726,9 @@ class DerivVWAPBot:
             if source=="AUTO" and (not ok or not mkt_ok or self._pending_buy): return
             if source=="MANUAL" and (not ok or self._pending_buy): return
 
-            # Tier martingale cap — protect lower quality signals from high steps
-            # Tier 1: full 5 steps | Tier 2: max step 3 | Tier 3: max step 2
-            tier_max_step={1:MARTINGALE_MAX_STEPS, 2:3, 3:2}.get(int(tier), MARTINGALE_MAX_STEPS)
-            effective_step=min(self.martingale_step, tier_max_step)
-
             self._pending_buy=True
             try:
-                base_payout=money2(max(float(MIN_PAYOUT),money2(max(0.01,float(PAYOUT_TARGET)*(float(MARTINGALE_MULT)**int(effective_step))))))
+                base_payout=money2(max(float(MIN_PAYOUT),money2(max(0.01,float(PAYOUT_TARGET)*(float(MARTINGALE_MULT)**int(self.martingale_step))))))
                 payout=money2(base_payout*stake_mult)
                 payout=max(float(MIN_PAYOUT),payout)
                 prop=await self.safe_deriv_call("proposal",{"proposal":1,"amount":payout,"basis":"payout","contract_type":side,"currency":"USD","duration":int(EXPIRY_MIN),"duration_unit":"m","symbol":symbol},retries=6)
@@ -784,17 +752,15 @@ class DerivVWAPBot:
                 if source=="AUTO":
                     self.trades_today+=1
                     self.market_trades_today[symbol]=self.market_trades_today.get(symbol,0)+1
-                tier_stars="⭐⭐⭐" if tier==1 else "⭐⭐" if tier==2 else "⭐"
                 await self.safe_send_tg(
                     f"🚀 {side} TRADE OPENED\n"
-                    f"🏆 Tier {tier} {tier_stars}\n"
                     f"🛒 Market: {symbol.replace('_',' ')}\n"
                     f"⏱ Expiry: {EXPIRY_MIN}m\n"
                     f"🎁 Payout: ${payout:.2f} | Stake: ${ask_price:.2f}{' (halved)' if stake_mult<1 else ''}\n"
                     f"📈 M5 Trend: {m5_trend}\n"
                     f"📊 RSI: {rsi:.1f} | ATR: {atr:.5f}\n"
                     f"📐 VWAP dist: {vwap_dist:.5f}\n"
-                    f"🎲 Step: {effective_step}/{tier_max_step} (global {self.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
+                    f"🎲 Martingale step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
                     f"🕓 Session: {session_bucket(self.trade_start_time)}\n"
                     f"🤖 Source: {source}\n"
                     f"📉 {symbol.replace('_',' ')} losses: {self.market_losses_today.get(symbol,0)}/{MAX_LOSSES_PER_MARKET}\n"
@@ -940,34 +906,31 @@ def format_market_detail(sym,d):
     if not d: return f"📍 {sym.replace('_',' ')}\n⏳ No scan data yet"
     age=int(time.time()-d.get("time",time.time()))
     signal=d.get("signal") or "—"
-    tier=d.get("tier",0)
     why=d.get("why",[]); gate=d.get("gate","—"); mkt_msg=d.get("mkt_msg","OK")
     last_closed=d.get("last_closed",0)
     m5_trend=d.get("m5_trend","—")
     m1_uptrend=d.get("m1_uptrend",False); m1_downtrend=d.get("m1_downtrend",False)
-    m1_trend_str="↑ UPTREND" if m1_uptrend else ("↓ DOWNTREND" if m1_downtrend else "— SIDEWAYS")
+    m1_trend_str="↑ UP" if m1_uptrend else ("↓ DOWN" if m1_downtrend else "— FLAT")
     adx=d.get("adx",0); adx_ok=d.get("adx_ok",False)
-    ema50_slope=d.get("ema50_slope",0); ema50_rising=d.get("ema50_rising",False); ema50_falling=d.get("ema50_falling",False)
+    ema50_slope=d.get("ema50_slope",0)
+    ema50_rising=d.get("ema50_rising",False); ema50_falling=d.get("ema50_falling",False)
     slope_str="↑ Rising" if ema50_rising else ("↓ Falling" if ema50_falling else "→ Flat")
     in_vwap_zone=d.get("in_vwap_zone",False); near_ema20=d.get("near_ema20",False)
-    confluence=d.get("confluence",False)
     body_ratio=d.get("body_ratio",0); spike=d.get("spike",False); chop=d.get("chop",False)
     m1_rsi=d.get("m1_rsi","—")
     mkt_losses=d.get("mkt_losses",0); mkt_trades=d.get("mkt_trades",0)
-    tier_str=f"⭐⭐⭐ Tier 1" if tier==1 else ("⭐⭐ Tier 2" if tier==2 else ("⭐ Tier 3" if tier==3 else "—"))
     return (
         f"📍 {sym.replace('_',' ')} ({age}s ago)\n"
-        f"Gate: {gate}\n"
         f"Market: {mkt_msg} | {mkt_trades}/{MAX_TRADES_PER_MARKET} | {mkt_losses}/{MAX_LOSSES_PER_MARKET} losses\n"
         f"Last M1: {fmt_time_hhmmss(last_closed)}\n"
         f"────────────────\n"
-        f"📈 M5 Trend: {m5_trend} | M1: {m1_trend_str}\n"
-        f"📊 ADX: {adx:.1f} {'✅' if adx_ok else '❌ (need 20+)'}\n"
-        f"📉 EMA50 Slope: {slope_str} ({ema50_slope:.4f})\n"
-        f"📐 VWAP zone: {'✅' if in_vwap_zone else '❌'} | Near EMA20: {'✅' if near_ema20 else '❌'} | Confluence: {'✅' if confluence else '❌'}\n"
-        f"🕯 Body ratio: {body_ratio:.2f} | Spike: {'⚠️' if spike else '✅'} | Chop: {'⚠️' if chop else '✅'}\n"
+        f"📈 M5: {m5_trend} | M1: {m1_trend_str}\n"
+        f"📊 ADX: {adx:.1f} {'✅' if adx_ok else '❌'}\n"
+        f"📉 EMA50 slope: {slope_str} ({ema50_slope:.4f})\n"
+        f"📐 VWAP zone: {'✅' if in_vwap_zone else '❌'} | EMA20 zone: {'✅' if near_ema20 else '❌'}\n"
+        f"🕯 Body: {body_ratio:.2f} | Spike: {'⚠️' if spike else '✅'} | Chop: {'⚠️' if chop else '✅'}\n"
         f"📉 RSI: {m1_rsi}\n"
-        f"Signal: {signal} {tier_str}\n"
+        f"Signal: {signal}\n"
         f"Why: {why[0] if why else '—'}\n"
     )
 
@@ -1008,23 +971,27 @@ async def btn_handler(u:Update,c:ContextTypes.DEFAULT_TYPE):
     elif q.data=="STATUS":
         now=time.time()
         if now<bot_logic.status_cooldown_until:
-            await _safe_edit(q,f"⏳ Cooldown: {int(bot_logic.status_cooldown_until-now)}s",reply_markup=main_keyboard()); return
+            await _safe_edit(q,f"⏳ Cooldown {int(bot_logic.status_cooldown_until-now)}s",reply_markup=main_keyboard()); return
         bot_logic.status_cooldown_until=now+STATUS_REFRESH_COOLDOWN_SEC
-        await bot_logic.fetch_balance()
+
+        # Fast balance fetch with short timeout
+        try:
+            await asyncio.wait_for(bot_logic.fetch_balance(),timeout=3.0)
+        except: pass
+
         now_time=datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
         _ok,gate=bot_logic.can_auto_trade()
+
+        # Use cached trade info — no live API call to avoid timeout
         trade_status="No Active Trade"
-        if bot_logic.active_trade_info and bot_logic.api:
-            try:
-                res=await bot_logic.safe_deriv_call("proposal_open_contract",{"proposal_open_contract":1,"contract_id":bot_logic.active_trade_info},retries=4)
-                pnl=float(res["proposal_open_contract"].get("profit",0))
-                rem=max(0,int(EXPIRY_MIN*60)-int(time.time()-bot_logic.trade_start_time))
-                icon="✅ PROFIT" if pnl>0 else "❌ LOSS" if pnl<0 else "➖ FLAT"
-                trade_status=f"🚀 Active Trade ({bot_logic.active_market.replace('_',' ')})\n🕓 Session: {session_bucket(bot_logic.trade_start_time)}\n📈 PnL: {icon} ({pnl:+.2f})\n⏳ Left: {rem}s"
-            except: trade_status="🚀 Active Trade: Syncing..."
+        if bot_logic.active_trade_info:
+            rem=max(0,int(EXPIRY_MIN*60)-int(time.time()-bot_logic.trade_start_time))
+            trade_status=f"🚀 Active Trade ({bot_logic.active_market.replace('_',' ')})\n🕓 Session: {session_bucket(bot_logic.trade_start_time)}\n⏳ Left: ~{rem}s"
+
         pause_line="⏸ Paused until 12:00am WAT\n" if time.time()<bot_logic.pause_until else ""
         next_payout=money2(float(PAYOUT_TARGET)*(float(MARTINGALE_MULT)**int(bot_logic.martingale_step)))
         by_mkt,by_sess,wr=bot_logic.stats_30d()
+
         def fmt_stats(title,items):
             rows=[(k,wr(v),v["trades"],v["wins"]) for k,v in items.items()]
             rows.sort(key=lambda x:(x[1],x[2]),reverse=True)
@@ -1032,7 +999,9 @@ async def btn_handler(u:Update,c:ContextTypes.DEFAULT_TYPE):
             if not rows: lines.append("— No trades yet"); return "\n".join(lines)
             for k,wrr,t,w in rows: lines.append(f"- {k.replace('_',' ')}: {wrr:.1f}% ({w}/{t})")
             return "\n".join(lines)
+
         stats_block="📈 PERFORMANCE\n"+fmt_stats("Markets",by_mkt)+"\n"+fmt_stats("Sessions",by_sess)+"\n"
+
         mkt_lines=["🛡 Market Status:"]
         for m in MARKETS:
             ml=bot_logic.market_losses_today.get(m,0)
@@ -1041,49 +1010,46 @@ async def btn_handler(u:Update,c:ContextTypes.DEFAULT_TYPE):
             mp=bot_logic.market_pause_until.get(m,0)
             mc=bot_logic.market_chop_until.get(m,0)
             status="🚫 BLOCKED" if mb else ("⏸ PAUSED" if time.time()<mp else ("🌀 CHOP" if time.time()<mc else "✅"))
-            mkt_lines.append(f"{status} {m.replace('_',' ')}: {mt}/{MAX_TRADES_PER_MARKET} trades | {ml}/{MAX_LOSSES_PER_MARKET} losses")
+            mkt_lines.append(f"{status} {m.replace('_',' ')}: {mt}/{MAX_TRADES_PER_MARKET} | {ml}/{MAX_LOSSES_PER_MARKET} losses")
         mkt_block="\n".join(mkt_lines)+"\n"
+
         _,_,stake_mult=bot_logic._equity_ok()
         eq_ratio=bot_logic._get_current_balance_float()/bot_logic.starting_balance if bot_logic.starting_balance>0 else 1.0
+
         header=(
-            f"🕒 Time (WAT): {now_time}\n"
-            f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
+            f"🕒 {now_time}\n"
+            f"🤖 {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
             f"{pause_line}"
             f"🎁 Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
-            f"🧯 Max stake: ${MAX_STAKE_ALLOWED:.2f} | Stake mult: {stake_mult:.1f}x\n"
-            f"💰 Equity: {eq_ratio:.0%} of starting balance\n"
-            f"🔒 Profit lock: {'ACTIVE (floor +${:.2f})'.format(PROFIT_LOCK_FLOOR) if bot_logic.profit_lock_active else 'OFF'}\n"
-            f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} | Loss Limit: ${DAILY_LOSS_LIMIT:.2f}\n"
+            f"🧯 Max stake: ${MAX_STAKE_ALLOWED:.2f} | Mult: {stake_mult:.1f}x\n"
+            f"💰 Equity: {eq_ratio:.0%} | 🔒 Lock: {'ON +${:.2f}'.format(PROFIT_LOCK_FLOOR) if bot_logic.profit_lock_active else 'OFF'}\n"
+            f"🎯 Target: +${DAILY_PROFIT_TARGET:.2f} | Limit: ${DAILY_LOSS_LIMIT:.2f}\n"
             f"📡 Markets: {', '.join(m.replace('_',' ') for m in MARKETS)}\n"
-            f"🧭 Strategy: VWAP Pullback Trend | M5+M1 | EMA{EMA_PERIOD} | RSI{RSI_PERIOD}\n"
-            f"⏱ Expiry: {EXPIRY_MIN}m | Cooldown: {COOLDOWN_SEC//60}m after trade\n"
-            f"⛔ Stop after: {MAX_CONSEC_LOSSES} consecutive losses\n"
+            f"🧭 EMA Pullback+VWAP | ADX | M5+M1 | {EXPIRY_MIN}m expiry\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
             f"{stats_block}{mkt_block}"
-            f"💵 Today PnL: {bot_logic.total_profit_today:+.2f}\n"
-            f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
-            f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | Max: {bot_logic.max_loss_streak_today}\n"
+            f"💵 PnL: {bot_logic.total_profit_today:+.2f} | Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY}\n"
+            f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | Losses: {bot_logic.total_losses_today}\n"
             f"🚦 Gate: {gate}\n"
             f"💰 Balance: {bot_logic.balance}\n"
-            f"\nCommands: /setstake /setmarkets /pause /resume /stats /unblock"
+            f"\n/setstake /setmarkets /pause /resume /stats /unblock"
         )
         details="\n\n📌 LIVE SCAN\n\n"+"\n\n".join([format_market_detail(sym,bot_logic.market_debug.get(sym,{})) for sym in MARKETS])
         await _safe_edit(q,header+details,reply_markup=main_keyboard())
 
 async def start_cmd(u:Update,c:ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        "💎 Deriv Combined Strategy Bot\n"
-        f"🧭 Strategy: EMA Pullback + VWAP Confluence (3-Tier)\n"
+        "💎 Deriv EMA + VWAP Strategy Bot\n"
+        f"🧭 EMA Pullback + VWAP Confluence (Relaxed)\n"
         f"📐 M5 trend (VWAP+EMA50) + M1 entry (EMA20+EMA50+ADX+RSI)\n"
-        f"🏆 Tier 1 ⭐⭐⭐ — Full confluence | Steps 1-5\n"
-        f"🥈 Tier 2 ⭐⭐ — EMA pullback | Steps 1-3\n"
-        f"🥉 Tier 3 ⭐ — Basic pullback | Steps 1-2\n"
-        f"🛡 ADX filter | EMA slope | Spike blocker | Chop filter\n"
-        f"💰 Equity protection | Profit lock | Per-market blocking\n"
-        f"🎲 Martingale: {MARTINGALE_MAX_STEPS} steps × {MARTINGALE_MULT}x (tier-capped)\n"
+        f"✅ Never relaxed: M5 trend | EMA crossover | ADX | Pullback zone\n"
+        f"⚡ Relaxed: EMA slope | RSI range | Body ratio\n"
+        f"🛡 ADX≥20 | Spike blocker | Chop filter | Per-market blocking\n"
+        f"💰 Equity protection | Profit lock\n"
+        f"🎲 Martingale: {MARTINGALE_MAX_STEPS} steps × {MARTINGALE_MULT}x\n"
         f"⏱ Expiry: {EXPIRY_MIN}m | Cooldown: {COOLDOWN_SEC//60}m\n"
         f"📡 Markets: R10, R25, R50, R75, R100\n"
-        f"📲 Commands: /setstake /setmarkets /pause /resume /stats /unblock\n",
+        f"📲 /setstake /setmarkets /pause /resume /stats /unblock\n",
         reply_markup=main_keyboard()
     )
 
