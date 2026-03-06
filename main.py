@@ -521,8 +521,8 @@ class DerivVWAPBot:
 
                 self._rate_limit_strikes[symbol]=0
 
-                if len(candles_m5)<EMA_PERIOD+5 or len(candles_m1)<RSI_PERIOD+5:
-                    self.market_debug[symbol]={"time":time.time(),"gate":gate,"why":[f"Warming up M5:{len(candles_m5)} M1:{len(candles_m1)}"]}
+                if len(candles_m5)<EMA50_PERIOD+5 or len(candles_m1)<EMA50_PERIOD+5:
+                    self.market_debug[symbol]={"time":time.time(),"gate":gate,"why":[f"Warming up — M5:{len(candles_m5)} M1:{len(candles_m1)} candles"]}
                     self._next_poll_epoch[symbol]=time.time()+15; continue
 
                 # Poll on M1 closed candle
