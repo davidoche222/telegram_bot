@@ -339,7 +339,26 @@ class StructureBreakBot:
         def wr(v): return round(100 * v["wins"] / v["trades"], 1) if v["trades"] > 0 else 0.0
         return by_mkt, by_sess, wr
 
-    async def fetch_balance(self):
+    async def connect(self):
+        try:
+            token = DEMO_TOKEN if self.account_type == "DEMO" else REAL_TOKEN
+            self.api = DerivAPI(app_id=APP_ID)
+            auth = await asyncio.wait_for(self.api.authorize({"authorize": token}), timeout=10.0)
+            self.account_type = "DEMO" if auth.get("authorize", {}).get("is_virtual") else "LIVE"
+            await self.fetch_balance()
+            if self.starting_balance <= 0:
+                self.starting_balance = self._get_current_balance_float()
+            logger.info(f"Connected — {self.account_type} | {self.balance}")
+            return True
+        except Exception as e:
+            logger.error(f"Connect failed: {e}")
+            self.api = None
+            return False
+
+    async def start_scanning(self):
+        self.is_scanning = True
+        tasks = [asyncio.create_task(self.scan_market(s)) for s in MARKETS]
+        await asyncio.gather(*tasks)
         try:
             res = await asyncio.wait_for(self.api.balance({"balance": 1, "subscribe": 0}), timeout=5.0)
             bal = res.get("balance", {})
@@ -724,12 +743,16 @@ bot_logic = StructureBreakBot()
 
 def main_keyboard():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ START", callback_data="START_SCAN"),
+         InlineKeyboardButton("⏹️ STOP", callback_data="STOP_SCAN")],
         [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"),
-         InlineKeyboardButton("⏸ PAUSE", callback_data="PAUSE"),
-         InlineKeyboardButton("▶️ RESUME", callback_data="RESUME")],
-        [InlineKeyboardButton("🔁 DEMO/REAL", callback_data="TOGGLE"),
-         InlineKeyboardButton("🔓 UNBLOCK ALL", callback_data="UNBLOCK"),
-         InlineKeyboardButton("📈 STATS", callback_data="STATS")]
+         InlineKeyboardButton("🔄 REFRESH", callback_data="STATUS")],
+        [InlineKeyboardButton("🧪 TEST BUY", callback_data="TEST_BUY")],
+        [InlineKeyboardButton("🧪 DEMO", callback_data="SET_DEMO"),
+         InlineKeyboardButton("💰 LIVE", callback_data="SET_REAL")],
+        [InlineKeyboardButton("⏸ PAUSE", callback_data="PAUSE"),
+         InlineKeyboardButton("▶️ RESUME", callback_data="RESUME"),
+         InlineKeyboardButton("🔓 UNBLOCK", callback_data="UNBLOCK")],
     ])
 
 def format_market_detail(sym, d):
@@ -780,8 +803,43 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_logic._known_chat_ids = getattr(bot_logic, "_known_chat_ids", set())
     bot_logic._known_chat_ids.add(q.message.chat_id)
     await _safe_answer(q)
+    await _safe_edit(q, "⏳ Working...", reply_markup=main_keyboard())
 
-    if q.data == "PAUSE":
+    if q.data == "SET_DEMO":
+        bot_logic.account_type = "DEMO"
+        ok = await bot_logic.connect()
+        await _safe_edit(q, "✅ Connected to DEMO" if ok else "❌ DEMO connection failed", reply_markup=main_keyboard())
+
+    elif q.data == "SET_REAL":
+        bot_logic.account_type = "LIVE"
+        ok = await bot_logic.connect()
+        await _safe_edit(q, "✅ LIVE CONNECTED" if ok else "❌ LIVE connection failed", reply_markup=main_keyboard())
+
+    elif q.data == "START_SCAN":
+        if not bot_logic.api:
+            await _safe_edit(q, "❌ Connect first — press DEMO or LIVE.", reply_markup=main_keyboard()); return
+        bot_logic.is_scanning = True
+        for sym in MARKETS:
+            asyncio.create_task(bot_logic.scan_market(sym))
+        await _safe_edit(q,
+            "🔍 SCANNER ACTIVE\n"
+            "✅ Structure Break strategy running\n"
+            "📡 EURUSD GBPUSD USDJPY AUDUSD GBPJPY",
+            reply_markup=main_keyboard())
+
+    elif q.data == "STOP_SCAN":
+        bot_logic.is_scanning = False
+        await _safe_edit(q, "⏹️ Scanner stopped.", reply_markup=main_keyboard())
+
+    elif q.data == "TEST_BUY":
+        if not bot_logic.api:
+            await _safe_edit(q, "❌ Connect first.", reply_markup=main_keyboard()); return
+        test_symbol = MARKETS[0]
+        asyncio.create_task(bot_logic.execute_trade("CALL", test_symbol,
+            rsi=55.0, body=0.45, level=0.0, ema50=0.0))
+        await _safe_edit(q, f"🧪 Test CALL on {test_symbol.replace('frx','')}.", reply_markup=main_keyboard())
+
+    elif q.data == "PAUSE":
         bot_logic.pause_until = time.time() + 86400
         await _safe_edit(q, "⏸ Bot paused until midnight WAT.", reply_markup=main_keyboard())
 
@@ -795,24 +853,6 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_logic.market_pause_until[m] = 0
             bot_logic.market_losses_today[m] = 0
         await _safe_edit(q, "🔓 All pairs unblocked.", reply_markup=main_keyboard())
-
-    elif q.data == "TOGGLE":
-        bot_logic.account_type = "REAL" if bot_logic.account_type == "DEMO" else "DEMO"
-        bot_logic.is_scanning = False
-        await _safe_edit(q, f"🔁 Switching to {bot_logic.account_type}...", reply_markup=main_keyboard())
-
-    elif q.data == "STATS":
-        by_mkt, by_sess, wr = bot_logic.stats_30d()
-        def fmt(title, items):
-            rows = [(k, wr(v), v["trades"], v["wins"]) for k, v in items.items()]
-            rows.sort(key=lambda x: (x[1], x[2]), reverse=True)
-            lines = [f"{title} (last {STATS_DAYS}d):"]
-            if not rows: lines.append("— No trades yet"); return "\n".join(lines)
-            for k, wrr, t, w in rows: lines.append(f"- {k}: {wrr:.1f}% ({w}/{t})")
-            return "\n".join(lines)
-        msg = f"📈 PERFORMANCE\n{fmt('Pairs', by_mkt)}\n{fmt('Sessions', by_sess)}\n"
-        msg += f"Today: {bot_logic.total_profit_today:+.2f} | Trades: {bot_logic.trades_today}"
-        await _safe_edit(q, msg, reply_markup=main_keyboard())
 
     elif q.data == "STATUS":
         now = time.time()
@@ -866,7 +906,7 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | Losses: {bot_logic.total_losses_today}\n"
             f"🚦 Gate: {gate}\n"
             f"💰 Balance: {bot_logic.balance}\n"
-            f"\n/setstake /setmarkets /pause /resume /stats /unblock"
+            f"\n/pause /resume /unblock /stats"
         )
         details = "\n\n📌 LIVE SCAN\n\n" + "\n\n".join([
             format_market_detail(sym, bot_logic.market_debug.get(sym, {})) for sym in MARKETS
