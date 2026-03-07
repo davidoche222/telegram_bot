@@ -39,12 +39,10 @@ MAX_CONSEC_LOSSES       = 5      # global stop
 COOLDOWN_SEC            = 180    # 3 min after every trade
 
 # ===== STRATEGY =====
-TF_M5_SEC           = 300
 TF_M1_SEC           = 60
-CANDLES_M5          = 150        # need more candles for swing detection
-CANDLES_M1          = 50
-EXPIRY_MIN          = 5          # 5 min expiry for forex
-EMA_PERIOD          = 50         # EMA50 on M5
+CANDLES_M1          = 150        # need more candles for swing detection
+EXPIRY_MIN          = 3          # 3 min expiry for M1 structure breaks
+EMA_PERIOD          = 50         # EMA50 on M1
 ATR_PERIOD          = 14
 ATR_SMA_PERIOD      = 20
 RSI_PERIOD          = 14
@@ -246,7 +244,7 @@ class StructureBreakBot:
 
         # debug
         self.market_debug = {}
-        self.last_processed_m5_t0 = {}
+        self.last_processed_m1_t0 = {}
 
         # trade history
         self.trade_history = []
@@ -544,72 +542,68 @@ class StructureBreakBot:
                 ok_gate, gate = self.can_auto_trade()
                 mkt_ok, mkt_msg = self._is_market_available(symbol)
 
-                # Fetch candles
-                m5_task = asyncio.create_task(self.fetch_candles_with_timeout(symbol, TF_M5_SEC, CANDLES_M5))
-                m1_task = asyncio.create_task(self.fetch_candles_with_timeout(symbol, TF_M1_SEC, CANDLES_M1))
-                candles_m5, candles_m1 = await asyncio.gather(m5_task, m1_task)
+                # Fetch M1 candles only
+                candles_m1 = await self.fetch_candles_with_timeout(symbol, TF_M1_SEC, CANDLES_M1)
 
-                if len(candles_m5) < EMA_PERIOD + SWING_LOOKBACK + 10 or len(candles_m1) < RSI_PERIOD + 5:
+                if len(candles_m1) < EMA_PERIOD + SWING_LOOKBACK + 10:
                     self.market_debug[symbol] = {"time": time.time(), "gate": gate,
-                        "why": [f"Warming up M5:{len(candles_m5)} M1:{len(candles_m1)}"]}
+                        "why": [f"Warming up M1:{len(candles_m1)}"]}
                     continue
 
                 # Use confirmed closed candles only
-                m5_confirmed = candles_m5[:-1]
                 m1_confirmed = candles_m1[:-1]
 
-                if len(m5_confirmed) < EMA_PERIOD + SWING_LOOKBACK + 5:
+                if len(m1_confirmed) < EMA_PERIOD + SWING_LOOKBACK + 5:
                     continue
 
-                # Extract M5 OHLC
-                m5_opens  = [c["open"]  for c in m5_confirmed]
-                m5_highs  = [c["high"]  for c in m5_confirmed]
-                m5_lows   = [c["low"]   for c in m5_confirmed]
-                m5_closes = [c["close"] for c in m5_confirmed]
-
-                # Extract M1 data (last 2 confirmed candles)
+                # Extract M1 OHLC
+                m1_opens  = [c["open"]  for c in m1_confirmed]
+                m1_highs  = [c["high"]  for c in m1_confirmed]
+                m1_lows   = [c["low"]   for c in m1_confirmed]
                 m1_closes = [c["close"] for c in m1_confirmed]
+
+                # M1 OHLC all extracted above
                 m1_prev   = m1_confirmed[-2] if len(m1_confirmed) >= 2 else None
                 m1_last   = m1_confirmed[-1]
 
                 # ── INDICATORS ──────────────────────────────────────
-                m5_ema50_series = calculate_ema_series(m5_closes, EMA_PERIOD)
-                m5_ema50 = m5_ema50_series[-1] if m5_ema50_series else None
-                m5_ema50_prev = m5_ema50_series[-2] if m5_ema50_series and len(m5_ema50_series) >= 2 else None
+                m1_ema50_series = calculate_ema_series(m1_closes, EMA_PERIOD)
+                m1_ema50 = m1_ema50_series[-1] if m1_ema50_series else None
+                m1_ema50_prev = m1_ema50_series[-2] if m1_ema50_series and len(m1_ema50_series) >= 2 else None
 
-                m5_atrs = calculate_atr(m5_highs, m5_lows, m5_closes, ATR_PERIOD)
-                m5_atr = float(m5_atrs[-1]) if m5_atrs else None
-                m5_atr_sma = float(np.mean([x for x in m5_atrs[-ATR_SMA_PERIOD-1:-1] if x])) if m5_atrs else None
+                m1_atrs = calculate_atr(m1_highs, m1_lows, m1_closes, ATR_PERIOD)
+                m1_atr = float(m1_atrs[-1]) if m1_atrs else None
+                m1_atr_sma = float(np.mean([x for x in m1_atrs[-ATR_SMA_PERIOD-1:-1] if x])) if m1_atrs else None
 
                 # (ADX removed — structure break itself confirms momentum)
                 m1_rsi = calculate_rsi(m1_closes, RSI_PERIOD)
 
-                if any(v is None for v in [m5_ema50, m5_ema50_prev, m5_atr, m5_atr_sma, m1_rsi]):
+                if any(v is None for v in [m1_ema50, m1_ema50_prev, m1_atr, m1_atr_sma, m1_rsi]):
                     self.market_debug[symbol] = {"time": time.time(), "gate": gate,
                         "why": ["Indicators warming up"]}
                     continue
 
                 # ── STRUCTURE LEVELS ─────────────────────────────────
-                last_swing_high, last_swing_low = get_structure_levels(m5_highs, m5_lows, SWING_LOOKBACK)
+                last_swing_high, last_swing_low = get_structure_levels(m1_highs, m1_lows, SWING_LOOKBACK)
 
                 if last_swing_high is None or last_swing_low is None:
                     self.market_debug[symbol] = {"time": time.time(), "gate": gate,
                         "why": ["Not enough swing points yet"]}
                     continue
 
-                # Current M5 candle (last confirmed)
-                cur_open  = m5_opens[-1]
-                cur_close = m5_closes[-1]
-                cur_high  = m5_highs[-1]
-                cur_low   = m5_lows[-1]
-                confirm_t0 = m5_confirmed[-1]["epoch"]
+                # Current M1 candle (last confirmed)
+                cur_open  = m1_opens[-1]
+                cur_close = m1_closes[-1]
+                cur_high  = m1_highs[-1]
+                cur_low   = m1_lows[-1]
+                confirm_t0 = m1_confirmed[-1]["epoch"]
 
                 # Skip if already processed this candle
-                if self.last_processed_m5_t0.get(symbol) == confirm_t0:
+                if self.last_processed_m1_t0.get(symbol) == confirm_t0:
                     continue
 
                 # ── VOLATILITY ───────────────────────────────────────
-                vol_ok = m5_atr > m5_atr_sma
+                vol_ok = m1_atr > m1_atr_sma
 
                 # ── BODY RATIO ───────────────────────────────────────
                 candle_body = body_ratio(cur_open, cur_close, cur_high, cur_low)
@@ -617,18 +611,18 @@ class StructureBreakBot:
 
                 # ── EMA50 CROSS DETECTION ─────────────────────────────
                 # Previous candle was on one side, current candle crossed to other side
-                prev_close = m5_closes[-2] if len(m5_closes) >= 2 else None
+                prev_close = m1_closes[-2] if len(m1_closes) >= 2 else None
                 ema50_bullish_cross = (
                     prev_close is not None and
-                    m5_ema50_prev is not None and
-                    prev_close < m5_ema50_prev and   # previous candle was BELOW EMA50
-                    cur_close > m5_ema50              # current candle is ABOVE EMA50
+                    m1_ema50_prev is not None and
+                    prev_close < m1_ema50_prev and
+                    cur_close > m1_ema50
                 )
                 ema50_bearish_cross = (
                     prev_close is not None and
-                    m5_ema50_prev is not None and
-                    prev_close > m5_ema50_prev and   # previous candle was ABOVE EMA50
-                    cur_close < m5_ema50              # current candle is BELOW EMA50
+                    m1_ema50_prev is not None and
+                    prev_close > m1_ema50_prev and
+                    cur_close < m1_ema50
                 )
 
                 # ── STRUCTURE BREAK DETECTION ────────────────────────
@@ -660,7 +654,7 @@ class StructureBreakBot:
                 reason = "Scanning..."
 
                 if not vol_ok:
-                    reason = f"Volatility too low — ATR({m5_atr:.5f}) < SMA({m5_atr_sma:.5f})"
+                    reason = f"Volatility too low — ATR({m1_atr:.5f}) < SMA({m1_atr_sma:.5f})"
                 elif bullish_break:
                     if not body_ok:
                         reason = f"Weak break candle — body ratio {candle_body:.2f} < {BODY_RATIO_MIN}"
@@ -688,7 +682,7 @@ class StructureBreakBot:
                 self.market_debug[symbol] = {
                     "time": time.time(), "gate": gate, "mkt_msg": mkt_msg,
                     "last_m5": confirm_t0, "signal": signal,
-                    "m5_ema50": round(m5_ema50, 5) if m5_ema50 else None,
+                    "m1_ema50": round(m1_ema50, 5) if m1_ema50 else None,
                     "swing_high": round(last_swing_high, 5),
                     "swing_low": round(last_swing_low, 5),
                     "vol_ok": vol_ok,
@@ -702,18 +696,18 @@ class StructureBreakBot:
                     "why": [reason]
                 }
 
-                self.last_processed_m5_t0[symbol] = confirm_t0
+                self.last_processed_m1_t0[symbol] = confirm_t0
                 if not ok_gate or not mkt_ok: continue
                 if signal is None: continue
 
                 if signal == "CALL":
                     await self.execute_trade("CALL", symbol,
                         rsi=round(m1_rsi, 1), body=round(candle_body, 2),
-                        level=round(last_swing_high, 5), ema50=round(m5_ema50, 5))
+                        level=round(last_swing_high, 5), ema50=round(m1_ema50, 5))
                 elif signal == "PUT":
                     await self.execute_trade("PUT", symbol,
                         rsi=round(m1_rsi, 1), body=round(candle_body, 2),
-                        level=round(last_swing_low, 5), ema50=round(m5_ema50, 5))
+                        level=round(last_swing_low, 5), ema50=round(m1_ema50, 5))
 
             except Exception as e:
                 logger.error(f"Scan error {symbol}: {e}")
@@ -755,7 +749,7 @@ def format_market_detail(sym, d):
     body = d.get("body", "—"); body_ok = d.get("body_ok", False)
     m1_rsi = d.get("m1_rsi", "—")
     swing_high = d.get("swing_high", "—"); swing_low = d.get("swing_low", "—")
-    ema50 = d.get("m5_ema50", "—")
+    ema50 = d.get("m1_ema50", "—")
     bullish = d.get("bullish_break", False); bearish = d.get("bearish_break", False)
     ema50_bull = d.get("ema50_bull_cross", False); ema50_bear = d.get("ema50_bear_cross", False)
     mkt_losses = d.get("mkt_losses", 0); mkt_trades = d.get("mkt_trades", 0)
@@ -890,7 +884,7 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 Equity: {eq_ratio:.0%} | 🔒 Lock: {'ON +${:.2f}'.format(PROFIT_LOCK_FLOOR) if bot_logic.profit_lock_active else 'OFF'}\n"
             f"🎯 Target: +${DAILY_PROFIT_TARGET:.2f} | Limit: ${DAILY_LOSS_LIMIT:.2f}\n"
             f"📡 Pairs: EURUSD GBPUSD USDJPY AUDUSD GBPJPY\n"
-            f"🧭 Structure Break + EMA50 Cross | M5 | {EXPIRY_MIN}m expiry\n"
+            f"🧭 Structure Break + EMA50 Cross | M1 | {EXPIRY_MIN}m expiry\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
             f"{stats_block}{mkt_block}"
             f"💵 PnL: {bot_logic.total_profit_today:+.2f} | Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY}\n"
