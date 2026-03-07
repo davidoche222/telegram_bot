@@ -342,16 +342,20 @@ class StructureBreakBot:
     async def connect(self):
         try:
             token = DEMO_TOKEN if self.account_type == "DEMO" else REAL_TOKEN
+            if self.api:
+                try: await self.api.disconnect()
+                except: pass
             self.api = DerivAPI(app_id=APP_ID)
-            auth = await asyncio.wait_for(self.api.authorize({"authorize": token}), timeout=10.0)
-            self.account_type = "DEMO" if auth.get("authorize", {}).get("is_virtual") else "LIVE"
+            await self.api.authorize(token)
             await self.fetch_balance()
-            if self.starting_balance <= 0:
-                self.starting_balance = self._get_current_balance_float()
+            try:
+                bal_val = float(str(self.balance).split()[0])
+                if self.starting_balance == 0.0: self.starting_balance = bal_val
+            except: pass
             logger.info(f"Connected — {self.account_type} | {self.balance}")
             return True
         except Exception as e:
-            logger.error(f"Connect failed: {e}")
+            logger.error(f"Connect error: {e}")
             self.api = None
             return False
 
@@ -709,30 +713,10 @@ class StructureBreakBot:
                 await asyncio.sleep(10)
 
     async def run(self):
+        """Simple keepalive — connect and scan controlled by Telegram buttons"""
+        logger.info("Bot started — press DEMO or LIVE in Telegram to connect, then START to scan")
         while True:
-            try:
-                logger.info("Connecting to Deriv...")
-                token = DEMO_TOKEN if self.account_type == "DEMO" else REAL_TOKEN
-                self.api = DerivAPI(app_id=APP_ID)
-                auth = await self.api.authorize({"authorize": token})
-                self.account_type = "DEMO" if auth.get("authorize", {}).get("is_virtual") else "REAL"
-                await self.fetch_balance()
-                logger.info(f"Connected — {self.account_type} | {self.balance}")
-                self.is_scanning = True
-                await self.safe_send_tg(
-                    f"🟢 Structure Break Bot ONLINE\n"
-                    f"Account: {self.account_type} | Balance: {self.balance}\n"
-                    f"Pairs: EURUSD GBPUSD USDJPY AUDUSD GBPJPY\n"
-                    f"Strategy: Structure Break + EMA50 Cross\n"
-                    f"Expiry: {EXPIRY_MIN}m | Martingale: {MARTINGALE_MAX_STEPS} steps"
-                )
-                tasks = [asyncio.create_task(self.scan_market(s)) for s in MARKETS]
-                await asyncio.gather(*tasks)
-            except Exception as e:
-                logger.error(f"Connection error: {e}")
-                self.is_scanning = False
-                self.api = None
-                await asyncio.sleep(15)
+            await asyncio.sleep(60)
 
 
 bot_logic = StructureBreakBot()
