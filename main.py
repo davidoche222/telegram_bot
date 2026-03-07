@@ -359,6 +359,13 @@ class StructureBreakBot:
             self.api = None
             return False
 
+    async def fetch_balance(self):
+        if not self.api: return
+        try:
+            bal = await self.safe_deriv_call("balance", {"balance": 1}, retries=4)
+            self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
+        except: pass
+
     async def start_scanning(self):
         self.is_scanning = True
         tasks = [asyncio.create_task(self.scan_market(s)) for s in MARKETS]
