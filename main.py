@@ -1,1002 +1,931 @@
-# ⚠️ SECURITY NOTE: Do NOT post tokens publicly. Paste them only on your local machine.
+"""
+Deriv Forex Binary Options Bot
+Strategy: Structure Break + EMA50 Confirmation
+Markets: EURUSD, GBPUSD, USDJPY, AUDUSD, GBPJPY
 
-import asyncio, logging, random, time, json, os, math
-from datetime import datetime, timedelta
+Entry Logic:
+- Detect swing highs/lows on M5 (structure levels)
+- Enter when price CLOSES beyond structure AND EMA50
+- Confirm with RSI cross 50, ATR momentum, body ratio, next candle
+- EMA50 cross confirms institutional bias shift
+"""
+
+import asyncio, time, logging, json, os
+from datetime import datetime
 from zoneinfo import ZoneInfo
 import numpy as np
 from deriv_api import DerivAPI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# ===== CONFIG =====
-DEMO_TOKEN = "tIrfitLjqeBxCOM"
-REAL_TOKEN = "ZkOFWOlPtwnjqTS"
-APP_ID = 1089
-MARKETS = ["frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "frxGBPJPY"]
-COOLDOWN_SEC = 180          # 3 minutes after every trade
-MAX_TRADES_PER_DAY = 30     # 6 per index × 5 indices
-MAX_TRADES_PER_MARKET = 6   # max per index per day
-MAX_LOSSES_PER_MARKET = 3   # stop index for day after 3 losses
-CONSEC_LOSS_PAUSE_SEC = 1800  # 30 min pause after 2 consecutive losses per market
-CHOP_PAUSE_SEC = 1200       # 20 min pause after chop detected
-MAX_CONSEC_LOSSES = 5       # global stop
-TELEGRAM_TOKEN = "8589420556:AAHmB6YE9KIEu0tBIgWdd9baBDt0eDh5FY8"
-TELEGRAM_CHAT_ID = "7634818949"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# ===== CREDENTIALS =====
+APP_ID       = 1089
+DEMO_TOKEN   = "tIrfitLjqeBxCOM"
+REAL_TOKEN   = "ZkOFWOlPtwnjqTS"
+TELEGRAM_TOKEN = "8589420556:AAHmB6YE9KIEu0tBIgWdd9baBDt0eDh5FY8"
+
+# ===== MARKETS =====
+MARKETS = ["frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "frxGBPJPY"]
+
+# ===== LIMITS =====
+MAX_TRADES_PER_DAY      = 30
+MAX_TRADES_PER_MARKET   = 6
+MAX_LOSSES_PER_MARKET   = 3
+CONSEC_LOSS_PAUSE_SEC   = 1800   # 30 min after 2 consecutive losses
+MAX_CONSEC_LOSSES       = 5      # global stop
+COOLDOWN_SEC            = 180    # 3 min after every trade
+
 # ===== STRATEGY =====
-TF_M5_SEC = 300             # M5 candles
-TF_M1_SEC = 60              # M1 candles
-CANDLES_M5 = 60             # fetch 60 M5 candles
-CANDLES_M1 = 30             # fetch 30 M1 candles
-EXPIRY_MIN = 5              # 5 minute expiry (forex needs more time)
-EMA_PERIOD = 50             # EMA50 on M5
-ATR_PERIOD = 14             # ATR14 on M5
-ATR_SMA_PERIOD = 20         # SMA of ATR on M5
-RSI_PERIOD = 14             # RSI14 on M1
-PULLBACK_ZONE_MULT = 0.20   # slightly wider zone for forex (was 0.15 on synthetics)
-RSI_CALL_MIN = 52           # RSI must be above this for CALL
-RSI_PUT_MAX = 48            # RSI must be below this for PUT
-CHOP_CROSS_LIMIT = 4        # max VWAP crosses in last 10 M1 candles
+TF_M5_SEC           = 300
+TF_M1_SEC           = 60
+CANDLES_M5          = 150        # need more candles for swing detection
+CANDLES_M1          = 50
+EXPIRY_MIN          = 5          # 5 min expiry for forex
+EMA_PERIOD          = 50         # EMA50 on M5
+ATR_PERIOD          = 14
+ATR_SMA_PERIOD      = 20
+RSI_PERIOD          = 14
+SWING_LOOKBACK      = 5          # candles left and right to identify swing point
+BODY_RATIO_MIN      = 0.35       # breaking candle must have genuine body (not a pure wick spike)
+CONFIRM_NEXT_CANDLE = True       # wait for next candle to confirm break
 
-# ===== CHOP PROTECTION =====
-ADX_PERIOD = 14
-ADX_MIN = 20.0              # minimum trend strength — blocks choppy markets
-
-# ===== FOREX SESSIONS =====
-# Session gate disabled — trading all hours to collect data across all sessions
-# Re-enable after 100+ trades to filter best sessions per pair
-FOREX_WEEKEND_BLOCK = True   # still block weekends (market actually closed)
+# Weekend block only — trading all sessions to collect data
+FOREX_WEEKEND_BLOCK = True
 
 # ===== MARTINGALE =====
-MARTINGALE_MULT = 2
+MARTINGALE_MULT      = 2
 MARTINGALE_MAX_STEPS = 5
+PAYOUT_TARGET        = 1.00
+MIN_PAYOUT           = 0.35
+MAX_STAKE_ALLOWED    = 10.00
 
-# ===== PAYOUT / STAKE =====
-PAYOUT_TARGET = 1.00
-MIN_PAYOUT = 0.35
-MAX_STAKE_ALLOWED = 10.00
-
-# ===== DAILY TARGETS =====
+# ===== RISK =====
 DAILY_PROFIT_TARGET = 10.0
-DAILY_LOSS_LIMIT = -20.0    # covers 5-step martingale worst case ($15.50)
-
-# ===== EQUITY PROTECTION =====
-EQUITY_HALF_STAKE_PCT = 0.80
-EQUITY_STOP_PCT = 0.60
-
-# ===== PROFIT LOCK =====
+DAILY_LOSS_LIMIT    = -20.0
+EQUITY_STOP_PCT     = 0.60
 PROFIT_LOCK_TRIGGER = 5.0
-PROFIT_LOCK_FLOOR = 2.0
+PROFIT_LOCK_FLOOR   = 2.0
 
 # ===== MISC =====
-TICKS_GLOBAL_MIN_INTERVAL = 0.35
-RATE_LIMIT_BACKOFF_BASE = 20
+STATS_DAYS               = 30
 STATUS_REFRESH_COOLDOWN_SEC = 10
-STATS_DAYS = 30
-TRADE_LOG_FILE = "vwap_trade_log.jsonl"
-SESSION_BUCKETS = [("ASIA",0,6),("LONDON",7,11),("OVERLAP",12,15),("NEWYORK",16,20),("LATE_NY",21,23)]
+TRADE_LOG_FILE           = "structure_trades.json"
+SCAN_INTERVAL_SEC        = 20
 
-
-# ===== INDICATORS =====
+# ============================================================
+# INDICATORS
+# ============================================================
 
 def calculate_ema(closes, period):
     closes = np.array(closes, dtype=float)
     if len(closes) < period: return None
     k = 2.0 / (period + 1)
-    ema = np.mean(closes[:period])
-    for price in closes[period:]:
-        ema = price * k + ema * (1 - k)
-    return float(ema)
+    ema = float(np.mean(closes[:period]))
+    for c in closes[period:]:
+        ema = c * k + ema * (1 - k)
+    return ema
 
-def calculate_atr(highs, lows, closes, period=14):
-    highs=np.array(highs,dtype=float); lows=np.array(lows,dtype=float); closes=np.array(closes,dtype=float)
-    n=len(closes)
-    if n < period+2: return np.array([])
-    pc=np.roll(closes,1); pc[0]=closes[0]
-    tr=np.maximum(highs-lows,np.maximum(np.abs(highs-pc),np.abs(lows-pc)))
-    atr=np.full(n,np.nan,dtype=float)
-    atr[period]=np.mean(tr[1:period+1])
-    for i in range(period+1,n):
-        atr[i]=(atr[i-1]*(period-1)+tr[i])/period
-    return atr
-
-def calculate_vwap(highs, lows, closes):
-    """VWAP without real volume — uses equal weight (price average)"""
-    highs=np.array(highs,dtype=float)
-    lows=np.array(lows,dtype=float)
-    closes=np.array(closes,dtype=float)
-    typical = (highs + lows + closes) / 3.0
-    # cumulative average as proxy for VWAP on synthetic indices
-    return float(np.mean(typical))
+def calculate_ema_series(closes, period):
+    """Returns full EMA array"""
+    closes = np.array(closes, dtype=float)
+    if len(closes) < period: return None
+    k = 2.0 / (period + 1)
+    ema = [float(np.mean(closes[:period]))]
+    for c in closes[period:]:
+        ema.append(c * k + ema[-1] * (1 - k))
+    # pad front with None
+    result = [None] * (period - 1) + ema
+    return result
 
 def calculate_rsi(closes, period=14):
     closes = np.array(closes, dtype=float)
-    if len(closes) < period+1: return None
+    if len(closes) < period + 1: return None
     deltas = np.diff(closes)
     gains = np.where(deltas > 0, deltas, 0.0)
     losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = np.mean(gains[:period])
-    avg_loss = np.mean(losses[:period])
+    avg_gain = float(np.mean(gains[:period]))
+    avg_loss = float(np.mean(losses[:period]))
     for i in range(period, len(gains)):
-        avg_gain = (avg_gain*(period-1)+gains[i])/period
-        avg_loss = (avg_loss*(period-1)+losses[i])/period
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
     if avg_loss == 0: return 100.0
     rs = avg_gain / avg_loss
-    return float(100 - (100/(1+rs)))
+    return round(100.0 - (100.0 / (1 + rs)), 2)
 
-def calculate_adx(highs, lows, closes, period=14):
-    """Returns latest ADX value"""
-    highs=np.array(highs,dtype=float); lows=np.array(lows,dtype=float); closes=np.array(closes,dtype=float)
-    n=len(closes)
-    if n < period*2+2: return None
-    up_move=highs[1:]-highs[:-1]; down_move=lows[:-1]-lows[1:]
-    plus_dm=np.where((up_move>down_move)&(up_move>0),up_move,0.0)
-    minus_dm=np.where((down_move>up_move)&(down_move>0),down_move,0.0)
-    prev_c=closes[:-1]
-    tr=np.maximum(highs[1:]-lows[1:],np.maximum(np.abs(highs[1:]-prev_c),np.abs(lows[1:]-prev_c)))
-    tr_s=np.zeros_like(tr); plus_s=np.zeros_like(plus_dm); minus_s=np.zeros_like(minus_dm)
-    tr_s[period-1]=np.sum(tr[:period]); plus_s[period-1]=np.sum(plus_dm[:period]); minus_s[period-1]=np.sum(minus_dm[:period])
-    for i in range(period,len(tr)):
-        tr_s[i]=tr_s[i-1]-(tr_s[i-1]/period)+tr[i]
-        plus_s[i]=plus_s[i-1]-(plus_s[i-1]/period)+plus_dm[i]
-        minus_s[i]=minus_s[i-1]-(minus_s[i-1]/period)+minus_dm[i]
-    plus_di=100.0*(plus_s/(tr_s+1e-12)); minus_di=100.0*(minus_s/(tr_s+1e-12))
-    dx=100.0*(np.abs(plus_di-minus_di)/(plus_di+minus_di+1e-12))
-    adx_arr=np.full(len(tr),np.nan,dtype=float)
-    start=period*2-1
-    if start>=len(dx): return None
-    adx_arr[start]=np.nanmean(dx[period-1:start+1])
-    for i in range(start+1,len(dx)):
-        if not np.isnan(adx_arr[i-1]) and not np.isnan(dx[i]):
-            adx_arr[i]=(adx_arr[i-1]*(period-1)+dx[i])/period
-    valid=[v for v in adx_arr if not np.isnan(v)]
-    return float(valid[-1]) if valid else None
+def calculate_atr(highs, lows, closes, period=14):
+    highs = np.array(highs, dtype=float)
+    lows = np.array(lows, dtype=float)
+    closes = np.array(closes, dtype=float)
+    if len(closes) < period + 1: return None
+    tr = np.maximum(highs[1:] - lows[1:],
+         np.maximum(np.abs(highs[1:] - closes[:-1]),
+                    np.abs(lows[1:] - closes[:-1])))
+    atrs = [float(np.mean(tr[:period]))]
+    for t in tr[period:]:
+        atrs.append((atrs[-1] * (period - 1) + t) / period)
+    return atrs
 
-def count_vwap_crosses(m1_closes, m1_highs, m1_lows, lookback=10):
-    """Count how many times price crossed VWAP in last N candles"""
-    if len(m1_closes) < lookback+1: return 0
-    recent_c = m1_closes[-lookback:]
-    recent_h = m1_highs[-lookback:]
-    recent_l = m1_lows[-lookback:]
-    vwap = calculate_vwap(recent_h, recent_l, recent_c)
-    crosses = 0
-    for i in range(1, len(recent_c)):
-        prev_above = recent_c[i-1] > vwap
-        curr_above = recent_c[i] > vwap
-        if prev_above != curr_above:
-            crosses += 1
-    return crosses
 
-def build_candles_from_deriv(raw):
-    return [{"t0":int(x.get("epoch",0)),"o":float(x.get("open",0)),"h":float(x.get("high",0)),"l":float(x.get("low",0)),"c":float(x.get("close",0))} for x in raw]
+def find_swing_highs(highs, lookback=5):
+    """Returns list of (index, value) for swing highs"""
+    swings = []
+    for i in range(lookback, len(highs) - lookback):
+        if all(highs[i] >= highs[i-j] for j in range(1, lookback+1)) and \
+           all(highs[i] >= highs[i+j] for j in range(1, lookback+1)):
+            swings.append((i, highs[i]))
+    return swings
 
-def fmt_time_hhmmss(epoch):
-    try: return datetime.fromtimestamp(epoch,ZoneInfo("Africa/Lagos")).strftime("%H:%M:%S")
-    except: return "—"
+def find_swing_lows(lows, lookback=5):
+    """Returns list of (index, value) for swing lows"""
+    swings = []
+    for i in range(lookback, len(lows) - lookback):
+        if all(lows[i] <= lows[i-j] for j in range(1, lookback+1)) and \
+           all(lows[i] <= lows[i+j] for j in range(1, lookback+1)):
+            swings.append((i, lows[i]))
+    return swings
+
+def get_structure_levels(highs, lows, lookback=5):
+    """
+    Returns last significant swing high and swing low
+    These are the structure levels to watch for breaks
+    """
+    swing_highs = find_swing_highs(list(highs), lookback)
+    swing_lows = find_swing_lows(list(lows), lookback)
+    last_high = swing_highs[-1][1] if swing_highs else None
+    last_low = swing_lows[-1][1] if swing_lows else None
+    return last_high, last_low
+
+def body_ratio(open_, close, high, low):
+    candle_range = abs(high - low)
+    if candle_range == 0: return 0
+    return abs(close - open_) / candle_range
 
 def is_forex_market_open():
-    """Block weekends only — trading all sessions for data collection"""
     now_utc = datetime.now(ZoneInfo("UTC"))
-    weekday = now_utc.weekday()  # 0=Monday, 6=Sunday
+    weekday = now_utc.weekday()
     hour_utc = now_utc.hour
     if FOREX_WEEKEND_BLOCK:
-        if weekday == 5:
-            return False, "Weekend — market closed (Saturday)"
-        if weekday == 6:
-            return False, "Weekend — market closed (Sunday)"
-        if weekday == 4 and hour_utc >= 21:
-            return False, "Weekend — market closing (Friday 9pm+ UTC)"
+        if weekday == 5: return False, "Weekend — market closed (Saturday)"
+        if weekday == 6: return False, "Weekend — market closed (Sunday)"
+        if weekday == 4 and hour_utc >= 21: return False, "Weekend — market closing (Friday 9pm+ UTC)"
     return True, "OK"
 
-def fmt_hhmm(epoch):
-    try: return datetime.fromtimestamp(epoch,ZoneInfo("Africa/Lagos")).strftime("%H:%M")
+def fmt_time_hhmmss(epoch):
+    try: return datetime.fromtimestamp(epoch, ZoneInfo("Africa/Lagos")).strftime("%H:%M:%S")
     except: return "—"
 
 def money2(x):
-    return math.ceil(float(x)*100.0)/100.0
+    return round(float(x), 2)
 
 def session_bucket(ts):
-    h=datetime.fromtimestamp(ts,ZoneInfo("UTC")).hour
-    for name,s,e in SESSION_BUCKETS:
-        if s<=h<=e: return name
-    return "UNKNOWN"
+    h = datetime.fromtimestamp(ts, ZoneInfo("UTC")).hour
+    if 7 <= h < 12: return "London"
+    elif 12 <= h < 17: return "NY Overlap"
+    elif 17 <= h < 21: return "Late NY"
+    else: return "Asian"
 
+def build_candles_from_deriv(raw):
+    candles = []
+    for c in raw:
+        candles.append({
+            "epoch": int(c.get("epoch", 0)),
+            "open":  float(c.get("open", 0)),
+            "high":  float(c.get("high", 0)),
+            "low":   float(c.get("low", 0)),
+            "close": float(c.get("close", 0)),
+        })
+    candles.sort(key=lambda x: x["epoch"])
+    return candles
 
-# ===== BOT =====
-class DerivVWAPBot:
+# ============================================================
+# BOT LOGIC
+# ============================================================
+
+class StructureBreakBot:
     def __init__(self):
-        self.api=None; self.app=None; self.active_token=None; self.account_type="None"
-        self.is_scanning=False; self.scanner_task=None; self.market_tasks={}
-        self.active_trade_info=None; self.active_market="None"
-        self.trade_start_time=0.0; self.active_trade_meta=None
-        self.cooldown_until=0.0
-        self.trades_today=0; self.total_losses_today=0
-        self.consecutive_losses=0; self.total_profit_today=0.0
-        self.balance="0.00"; self.starting_balance=0.0
-        self.max_loss_streak_today=0; self.hit_max_losses_today=False
-        self.current_stake=0.0; self.martingale_step=0; self.martingale_halt=False
-        self.trade_lock=asyncio.Lock(); self._pending_buy=False
-        self.profit_lock_active=False
-        self.tz=ZoneInfo("Africa/Lagos")
-        self.current_day=datetime.now(self.tz).date()
-        self.pause_until=0.0
+        self.api = None
+        self.app = None
+        self.account_type = "DEMO"
+        self.balance = "0.00 USD"
+        self.starting_balance = 0.0
+        self.is_scanning = False
 
-        # Per-market state
-        self.market_trades_today={m:0 for m in MARKETS}
-        self.market_losses_today={m:0 for m in MARKETS}
-        self.market_consec_losses={m:0 for m in MARKETS}
-        self.market_blocked={m:False for m in MARKETS}       # blocked for the day (3 losses)
-        self.market_pause_until={m:0.0 for m in MARKETS}    # paused 30min (2 consec losses)
-        self.market_chop_until={m:0.0 for m in MARKETS}     # paused 20min (chop detected)
-        self.market_debug={m:{} for m in MARKETS}
-        self.last_processed_m1_t0={m:0 for m in MARKETS}
+        # martingale
+        self.martingale_step = 0
+        self.martingale_halt = False
 
-        self._ticks_lock=asyncio.Lock(); self._last_ticks_ts=0.0
-        self._next_poll_epoch={m:0.0 for m in MARKETS}
-        self._rate_limit_strikes={m:0 for m in MARKETS}
-        self.status_cooldown_until=0.0
-        self.trade_log_path=os.path.abspath(TRADE_LOG_FILE)
-        self.trade_records=[]; self._load_trade_log()
-        self.session_losses={}
+        # daily tracking
+        self.trades_today = 0
+        self.total_profit_today = 0.0
+        self.total_losses_today = 0
+        self.consecutive_losses = 0
+        self.max_loss_streak_today = 0
+        self.last_reset_date = None
 
-    def _load_trade_log(self):
-        self.trade_records=[]
-        if not os.path.exists(self.trade_log_path): return
+        # per market
+        self.market_trades_today = {m: 0 for m in MARKETS}
+        self.market_losses_today = {m: 0 for m in MARKETS}
+        self.market_blocked = {m: False for m in MARKETS}
+        self.market_pause_until = {m: 0 for m in MARKETS}
+
+        # active trade
+        self.active_trade_info = None
+        self.active_market = None
+        self.trade_start_time = 0
+
+        # cooldown
+        self.cooldown_until = 0
+        self.pause_until = 0
+        self.status_cooldown_until = 0
+
+        # profit lock
+        self.profit_lock_active = False
+
+        # debug
+        self.market_debug = {}
+        self.last_processed_m5_t0 = {}
+
+        # trade history
+        self.trade_history = []
+        self._load_trade_history()
+
+    def _load_trade_history(self):
         try:
-            with open(self.trade_log_path,"r",encoding="utf-8") as f:
-                for line in f:
-                    line=line.strip()
-                    if not line: continue
-                    try:
-                        rec=json.loads(line)
-                        if isinstance(rec,dict) and "t" in rec: self.trade_records.append(rec)
-                    except: continue
-            self._prune_trade_records()
-        except Exception as e: logger.warning(f"Failed to load trade log: {e}")
+            if os.path.exists(TRADE_LOG_FILE):
+                with open(TRADE_LOG_FILE, "r") as f:
+                    self.trade_history = json.load(f)
+        except: self.trade_history = []
 
-    def _append_trade_log(self,rec):
+    def _save_trade(self, record):
+        self.trade_history.append(record)
         try:
-            with open(self.trade_log_path,"a",encoding="utf-8") as f:
-                f.write(json.dumps(rec,ensure_ascii=False)+"\n")
-        except Exception as e: logger.warning(f"Failed to write trade log: {e}")
+            with open(TRADE_LOG_FILE, "w") as f:
+                json.dump(self.trade_history[-500:], f)
+        except: pass
 
-    def _prune_trade_records(self):
-        cutoff=time.time()-(STATS_DAYS*24*3600)
-        self.trade_records=[r for r in self.trade_records if float(r.get("t",0))>=cutoff]
-
-    def record_trade_result(self,symbol,open_epoch,profit,direction,rsi,atr,vwap_dist,m5_trend):
-        sess=session_bucket(open_epoch); win=1 if profit>0 else 0
-        rec={
-            "t":float(open_epoch),"symbol":str(symbol),"session":str(sess),
-            "win":int(win),"profit":float(profit),"direction":direction,
-            "rsi":round(float(rsi),2) if rsi else 0,
-            "atr":round(float(atr),5) if atr else 0,
-            "vwap_dist":round(float(vwap_dist),5) if vwap_dist else 0,
-            "m5_trend":str(m5_trend)
-        }
-        self.trade_records.append(rec); self._append_trade_log(rec); self._prune_trade_records()
-
-    def stats_30d(self):
-        self._prune_trade_records()
-        by_market={}; by_session={}
-        for r in self.trade_records:
-            sym=r.get("symbol","—"); sess=r.get("session","—"); win=int(r.get("win",0))
-            by_market.setdefault(sym,{"wins":0,"losses":0,"trades":0})
-            by_session.setdefault(sess,{"wins":0,"losses":0,"trades":0})
-            by_market[sym]["trades"]+=1; by_session[sess]["trades"]+=1
-            if win==1: by_market[sym]["wins"]+=1; by_session[sess]["wins"]+=1
-            else: by_market[sym]["losses"]+=1; by_session[sess]["losses"]+=1
-        def wr(d): t=d["trades"]; return (100.0*d["wins"]/t) if t>0 else 0.0
-        return by_market,by_session,wr
-
-    def _update_market_loss_state(self,symbol,profit):
-        if profit<=0:
-            self.market_losses_today[symbol]=self.market_losses_today.get(symbol,0)+1
-            self.market_consec_losses[symbol]=self.market_consec_losses.get(symbol,0)+1
-            # Block market for day after 3 losses
-            if self.market_losses_today[symbol]>=MAX_LOSSES_PER_MARKET:
-                self.market_blocked[symbol]=True
-                logger.info(f"🚫 {symbol} BLOCKED for today — {self.market_losses_today[symbol]} losses")
-            # Pause market 30min after 2 consecutive losses
-            if self.market_consec_losses[symbol]>=2:
-                self.market_pause_until[symbol]=time.time()+CONSEC_LOSS_PAUSE_SEC
-                logger.info(f"⏸ {symbol} paused 30min — 2 consecutive losses")
-        else:
-            self.market_consec_losses[symbol]=0
-
-    def _is_market_available(self,symbol):
-        now=time.time()
-        if self.market_blocked.get(symbol,False):
-            return False,f"Blocked for today ({self.market_losses_today.get(symbol,0)} losses)"
-        if now<self.market_pause_until.get(symbol,0):
-            rem=int(self.market_pause_until[symbol]-now)
-            return False,f"Paused {rem}s (2 consec losses)"
-        if now<self.market_chop_until.get(symbol,0):
-            rem=int(self.market_chop_until[symbol]-now)
-            return False,f"Chop pause {rem}s"
-        if self.market_trades_today.get(symbol,0)>=MAX_TRADES_PER_MARKET:
-            return False,f"Max {MAX_TRADES_PER_MARKET} trades reached today"
-        return True,"OK"
-
-    def _reset_daily(self):
-        self.trades_today=0; self.total_losses_today=0
-        self.consecutive_losses=0; self.total_profit_today=0.0
-        self.cooldown_until=0.0; self.pause_until=0.0
-        self.martingale_step=0; self.current_stake=0.0; self.martingale_halt=False
-        self.max_loss_streak_today=0; self.hit_max_losses_today=False
-        self.profit_lock_active=False; self.session_losses={}
-        self.market_trades_today={m:0 for m in MARKETS}
-        self.market_losses_today={m:0 for m in MARKETS}
-        self.market_consec_losses={m:0 for m in MARKETS}
-        self.market_blocked={m:False for m in MARKETS}
-        self.market_pause_until={m:0.0 for m in MARKETS}
-        self.market_chop_until={m:0.0 for m in MARKETS}
-        self.last_processed_m1_t0={m:0 for m in MARKETS}
-        self.starting_balance=self._get_current_balance_float()
-
-    def _daily_reset_if_needed(self):
-        today=datetime.now(self.tz).date()
-        if today!=self.current_day:
-            self.current_day=today
-            self._reset_daily()
-
-    def _equity_ok(self):
-        if self.starting_balance<=0: return True,"OK",1.0
-        current=self._get_current_balance_float()
-        ratio=current/self.starting_balance
-        if ratio<=EQUITY_STOP_PCT:
-            return False,f"Equity stop: {ratio:.0%} of starting balance",1.0
-        if ratio<=EQUITY_HALF_STAKE_PCT:
-            return True,f"Equity warning: {ratio:.0%} — stake halved",0.5
-        return True,"OK",1.0
-
-    def can_auto_trade(self):
-        self._daily_reset_if_needed()
-        eq_ok,eq_msg,_=self._equity_ok()
-        if not eq_ok: return False,eq_msg
-        if self.martingale_halt: return False,f"Stopped: Martingale {MARTINGALE_MAX_STEPS} steps completed"
-        if time.time()<self.pause_until:
-            return False,f"Paused until 12:00am WAT ({int(self.pause_until-time.time())}s)"
-        if self.total_profit_today>=DAILY_PROFIT_TARGET:
-            self.pause_until=self._next_midnight_epoch()
-            return False,f"Daily target reached (+${self.total_profit_today:.2f})"
-        if self.total_profit_today<=DAILY_LOSS_LIMIT:
-            self.pause_until=self._next_midnight_epoch()
-            return False,f"Daily loss limit reached (${self.total_profit_today:.2f})"
-        if self.profit_lock_active and self.total_profit_today<=PROFIT_LOCK_FLOOR:
-            return False,f"Profit lock: protecting +${PROFIT_LOCK_FLOOR:.2f}"
-        if self.consecutive_losses>=MAX_CONSEC_LOSSES:
-            return False,f"Stopped: {MAX_CONSEC_LOSSES} consecutive losses"
-        if self.trades_today>=MAX_TRADES_PER_DAY:
-            return False,"Daily trade limit reached"
-        if time.time()<self.cooldown_until:
-            return False,f"Cooldown {int(self.cooldown_until-time.time())}s"
-        if self.active_trade_info: return False,"Trade in progress"
-        if self._pending_buy: return False,"Trade in progress (pending)"
-        if not self.api: return False,"Not connected"
-        return True,"OK"
-
-    @staticmethod
-    def _is_gatewayish_error(msg):
-        m=(msg or "").lower()
-        return any(k in m for k in ["gateway","bad gateway","502","503","504","timeout","timed out","temporarily unavailable","connection","websocket","not connected","disconnect","internal server error","service unavailable"])
-
-    @staticmethod
-    def _is_rate_limit_error(msg):
-        m=(msg or "").lower()
-        return ("rate limit" in m) or ("reached the rate limit" in m) or ("too many requests" in m) or ("429" in m)
-
-    async def safe_send_tg(self,text,retries=5):
-        if not self.app: return
-        for i in range(1,retries+1):
-            try: await self.app.bot.send_message(TELEGRAM_CHAT_ID,text); return
-            except Exception as e:
-                if self._is_gatewayish_error(str(e)): await asyncio.sleep(0.8*i+random.random()*0.4)
-                else: await asyncio.sleep(0.4*i)
-
-    def _next_midnight_epoch(self):
-        return (datetime.now(self.tz)+timedelta(days=1)).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
+    def _reset_daily_if_needed(self):
+        today = datetime.now(ZoneInfo("Africa/Lagos")).date()
+        if self.last_reset_date != today:
+            self.last_reset_date = today
+            self.trades_today = 0
+            self.total_profit_today = 0.0
+            self.total_losses_today = 0
+            self.consecutive_losses = 0
+            self.max_loss_streak_today = 0
+            self.martingale_step = 0
+            self.martingale_halt = False
+            self.profit_lock_active = False
+            self.market_trades_today = {m: 0 for m in MARKETS}
+            self.market_losses_today = {m: 0 for m in MARKETS}
+            self.market_blocked = {m: False for m in MARKETS}
+            self.market_pause_until = {m: 0 for m in MARKETS}
 
     def _get_current_balance_float(self):
-        try: return float(self.balance.split()[0])
-        except: return 0.0
+        try: return float(str(self.balance).replace(" USD", "").replace(",", ""))
+        except: return self.starting_balance
 
-    async def connect(self):
-        try:
-            if not self.active_token: return False
-            self.api=DerivAPI(app_id=APP_ID)
-            await self.api.authorize(self.active_token)
-            await self.fetch_balance()
-            try:
-                bal_val=float(self.balance.split()[0])
-                if self.starting_balance==0.0: self.starting_balance=bal_val
-            except: pass
-            return True
-        except Exception as e: logger.error(f"Connect error: {e}"); return False
+    def _equity_ok(self):
+        if self.starting_balance <= 0: return True, "OK", 1.0
+        ratio = self._get_current_balance_float() / self.starting_balance
+        if ratio <= EQUITY_STOP_PCT: return False, f"Equity stop — {ratio:.0%} of starting", 0.0
+        if ratio >= 1.0: return True, "OK", 1.0
+        if ratio >= 0.90: return True, "OK", 0.75
+        if ratio >= 0.80: return True, "OK", 0.50
+        return True, "OK", 0.25
 
-    async def safe_reconnect(self):
-        try:
-            if self.api:
-                try: await self.api.disconnect()
-                except: pass
-        except: pass
-        self.api=None; return await self.connect()
+    def _is_market_available(self, symbol):
+        if self.market_blocked.get(symbol): return False, "Blocked for day"
+        if time.time() < self.market_pause_until.get(symbol, 0):
+            rem = int(self.market_pause_until[symbol] - time.time())
+            return False, f"Paused {rem}s"
+        if self.market_trades_today.get(symbol, 0) >= MAX_TRADES_PER_MARKET:
+            return False, f"Max {MAX_TRADES_PER_MARKET} trades today"
+        return True, "OK"
 
-    async def safe_deriv_call(self,fn_name,payload,retries=6):
-        last_err=None
-        for attempt in range(1,retries+1):
-            try:
-                if not self.api:
-                    ok=await self.safe_reconnect()
-                    if not ok: raise RuntimeError("Reconnect failed")
-                return await getattr(self.api,fn_name)(payload)
-            except Exception as e:
-                last_err=e; msg=str(e)
-                if self._is_gatewayish_error(msg): await self.safe_reconnect()
-                if self._is_rate_limit_error(msg): await asyncio.sleep(min(20.0,2.5*attempt+random.random()))
-                else: await asyncio.sleep(min(8.0,0.6*attempt+random.random()*0.5))
-        raise last_err
+    def can_auto_trade(self):
+        self._reset_daily_if_needed()
+        if self.active_trade_info: return False, "Trade active"
+        if time.time() < self.cooldown_until:
+            return False, f"Cooldown {int(self.cooldown_until - time.time())}s"
+        if time.time() < self.pause_until: return False, "Paused"
+        eq_ok, eq_msg, _ = self._equity_ok()
+        if not eq_ok: return False, eq_msg
+        if self.martingale_halt: return False, f"Martingale {MARTINGALE_MAX_STEPS} steps done"
+        if self.total_profit_today >= DAILY_PROFIT_TARGET:
+            return False, f"Daily target +${DAILY_PROFIT_TARGET:.2f} reached"
+        if self.total_profit_today <= DAILY_LOSS_LIMIT:
+            return False, f"Daily loss limit ${DAILY_LOSS_LIMIT:.2f} hit"
+        if self.profit_lock_active and self.total_profit_today <= PROFIT_LOCK_FLOOR:
+            return False, f"Profit lock protecting +${PROFIT_LOCK_FLOOR:.2f}"
+        if self.consecutive_losses >= MAX_CONSEC_LOSSES:
+            return False, f"Stopped: {MAX_CONSEC_LOSSES} consecutive losses"
+        if self.trades_today >= MAX_TRADES_PER_DAY:
+            return False, f"Max {MAX_TRADES_PER_DAY} trades today"
+        return True, "OK"
 
-    async def safe_ticks_history(self,payload,retries=4):
-        async with self._ticks_lock:
-            now=time.time(); gap=(self._last_ticks_ts+TICKS_GLOBAL_MIN_INTERVAL)-now
-            if gap>0: await asyncio.sleep(gap)
-            self._last_ticks_ts=time.time()
-        return await self.safe_deriv_call("ticks_history",payload,retries=retries)
-
-    async def fetch_candles(self,symbol,granularity_sec,count):
-        data=await self.safe_ticks_history({"ticks_history":symbol,"end":"latest","count":int(count),"style":"candles","granularity":int(granularity_sec)},retries=4)
-        return build_candles_from_deriv(data.get("candles",[]))
-
-    async def fetch_candles_with_timeout(self,symbol,granularity_sec,count,timeout_sec=15.0):
-        try:
-            return await asyncio.wait_for(self.fetch_candles(symbol,granularity_sec,count),timeout=timeout_sec)
-        except asyncio.TimeoutError:
-            logger.warning(f"fetch_candles TIMEOUT ({symbol} {granularity_sec}s)")
-            asyncio.create_task(self.safe_reconnect()); return []
-        except Exception as e:
-            logger.warning(f"fetch_candles ERROR ({symbol}): {e}")
-            if self._is_gatewayish_error(str(e)): asyncio.create_task(self.safe_reconnect())
-            return []
+    def stats_30d(self):
+        cutoff = time.time() - (STATS_DAYS * 24 * 3600)
+        by_mkt = {}; by_sess = {}
+        for t in self.trade_history:
+            if t.get("time", 0) < cutoff: continue
+            m = t.get("market", "?"); s = t.get("session", "?")
+            w = 1 if t.get("result") == "WIN" else 0
+            for d, k in [(by_mkt, m), (by_sess, s)]:
+                if k not in d: d[k] = {"trades": 0, "wins": 0}
+                d[k]["trades"] += 1; d[k]["wins"] += w
+        def wr(v): return round(100 * v["wins"] / v["trades"], 1) if v["trades"] > 0 else 0.0
+        return by_mkt, by_sess, wr
 
     async def fetch_balance(self):
-        if not self.api: return
         try:
-            bal=await self.safe_deriv_call("balance",{"balance":1},retries=4)
-            self.balance=f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
-        except: pass
+            res = await asyncio.wait_for(self.api.balance({"balance": 1, "subscribe": 0}), timeout=5.0)
+            bal = res.get("balance", {})
+            self.balance = f"{float(bal.get('balance', 0)):.2f} {bal.get('currency', 'USD')}"
+            if self.starting_balance <= 0:
+                self.starting_balance = float(bal.get("balance", 0))
+        except Exception as e:
+            logger.warning(f"Balance fetch failed: {e}")
 
-    async def background_scanner(self):
-        if not self.api: return
-        self.market_tasks={sym:asyncio.create_task(self.scan_market(sym)) for sym in MARKETS}
+    async def safe_deriv_call(self, method, params, retries=3):
+        for attempt in range(retries):
+            try:
+                fn = getattr(self.api, method)
+                return await asyncio.wait_for(fn(params), timeout=15.0)
+            except Exception as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    raise
+
+    async def safe_send_tg(self, text, parse_mode=None):
+        if not self.app: return
         try:
-            while self.is_scanning:
-                if self.active_trade_info and (time.time()-self.trade_start_time>(EXPIRY_MIN*60+90)):
-                    self.active_trade_info=None; self.active_trade_meta=None
-                await asyncio.sleep(1)
+            chat_id = TELEGRAM_TOKEN.split(":")[0]
+            # get chat id from first update — fallback to owner
+            for uid in getattr(self, "_known_chat_ids", []):
+                try:
+                    kwargs = {"chat_id": uid, "text": text[:4000]}
+                    if parse_mode: kwargs["parse_mode"] = parse_mode
+                    await self.app.bot.send_message(**kwargs)
+                    return
+                except: pass
+        except Exception as e:
+            logger.warning(f"TG send failed: {e}")
+
+    async def fetch_candles_with_timeout(self, symbol, tf_sec, count):
+        try:
+            res = await asyncio.wait_for(
+                self.safe_deriv_call("ticks_history", {
+                    "ticks_history": symbol, "style": "candles",
+                    "granularity": tf_sec, "count": count, "end": "latest"
+                }), timeout=15.0)
+            return build_candles_from_deriv(res.get("candles", []))
+        except Exception as e:
+            logger.warning(f"Candles failed {symbol} tf={tf_sec}: {e}")
+            return []
+
+    async def execute_trade(self, side, symbol, **kwargs):
+        _, _, stake_mult = self._equity_ok()
+        base_payout = money2(max(float(MIN_PAYOUT),
+            money2(max(0.01, float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step))))))
+        try:
+            prop = await self.safe_deriv_call("proposal", {
+                "proposal": 1, "amount": base_payout, "basis": "payout",
+                "contract_type": side, "currency": "USD",
+                "duration": int(EXPIRY_MIN), "duration_unit": "m",
+                "symbol": symbol
+            }, retries=6)
+            if "error" in prop:
+                await self.safe_send_tg(f"⚠️ Proposal error {symbol}: {prop['error'].get('message','?')}")
+                self.cooldown_until = time.time() + COOLDOWN_SEC; return
+            ask_price = float(prop.get("proposal", {}).get("ask_price", 0))
+            proposal_id = prop.get("proposal", {}).get("id")
+            if ask_price > float(MAX_STAKE_ALLOWED):
+                await self.safe_send_tg(f"⛔️ Skipped: stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}")
+                self.cooldown_until = time.time() + COOLDOWN_SEC; return
+            buy = await self.safe_deriv_call("buy", {"buy": proposal_id, "price": float(MAX_STAKE_ALLOWED)}, retries=1)
+            if "error" in buy:
+                await self.safe_send_tg(f"⚠️ Buy error {symbol}: {buy['error'].get('message','?')}")
+                self.cooldown_until = time.time() + COOLDOWN_SEC; return
+            contract_id = buy.get("buy", {}).get("contract_id")
+            self.active_trade_info = contract_id
+            self.active_market = symbol
+            self.trade_start_time = time.time()
+            pair = symbol.replace("frx", "")
+            icon = "📈" if side == "CALL" else "📉"
+            await self.safe_send_tg(
+                f"{icon} STRUCTURE BREAK — {side}\n"
+                f"Pair: {pair}\n"
+                f"Stake: ${ask_price:.2f} → Payout: ${base_payout:.2f}\n"
+                f"Step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
+                f"Expiry: {EXPIRY_MIN}m\n"
+                f"Session: {session_bucket(time.time())}\n"
+                f"RSI: {kwargs.get('rsi','?')} | Body: {kwargs.get('body','?')}\n"
+                f"Structure level: {kwargs.get('level','?')}\n"
+                f"EMA50: {kwargs.get('ema50','?')}"
+            )
+            # wait for result
+            await asyncio.sleep(EXPIRY_MIN * 60 + 10)
+            await self._check_result(contract_id, symbol, side, ask_price, base_payout, kwargs)
+        except Exception as e:
+            logger.error(f"Trade execution error: {e}")
+            self.active_trade_info = None
+            self.cooldown_until = time.time() + COOLDOWN_SEC
+
+    async def _check_result(self, contract_id, symbol, side, stake, payout, kwargs):
+        try:
+            res = await self.safe_deriv_call("profit_table", {
+                "profit_table": 1, "description": 1, "limit": 5
+            }, retries=3)
+            contracts = res.get("profit_table", {}).get("transactions", [])
+            profit = None
+            for c in contracts:
+                if c.get("contract_id") == contract_id:
+                    profit = float(c.get("sell_price", 0)) - float(c.get("buy_price", 0))
+                    break
+            if profit is None:
+                profit = payout - stake  # fallback estimate
+            won = profit > 0
+            self.total_profit_today = round(self.total_profit_today + profit, 2)
+            self.trades_today += 1
+            self.market_trades_today[symbol] = self.market_trades_today.get(symbol, 0) + 1
+
+            if won:
+                self.consecutive_losses = 0
+                self.martingale_step = 0
+                result_str = "WIN"
+                icon = "✅"
+                if self.total_profit_today >= PROFIT_LOCK_TRIGGER:
+                    self.profit_lock_active = True
+            else:
+                self.consecutive_losses += 1
+                self.total_losses_today += 1
+                self.max_loss_streak_today = max(self.max_loss_streak_today, self.consecutive_losses)
+                self.market_losses_today[symbol] = self.market_losses_today.get(symbol, 0) + 1
+                result_str = "LOSS"
+                icon = "❌"
+                if self.martingale_step < MARTINGALE_MAX_STEPS:
+                    self.martingale_step += 1
+                else:
+                    self.martingale_halt = True
+                if self.market_losses_today.get(symbol, 0) >= MAX_LOSSES_PER_MARKET:
+                    self.market_blocked[symbol] = True
+                if self.consecutive_losses >= 2:
+                    self.market_pause_until[symbol] = time.time() + CONSEC_LOSS_PAUSE_SEC
+
+            pair = symbol.replace("frx", "")
+            self._save_trade({
+                "time": time.time(), "market": pair, "side": side,
+                "stake": stake, "payout": payout, "profit": profit,
+                "result": result_str, "session": session_bucket(time.time()),
+                "rsi": kwargs.get("rsi"), "body": kwargs.get("body"),
+            })
+
+            await self.safe_send_tg(
+                f"{icon} {result_str} — {pair} {side}\n"
+                f"P/L: {profit:+.2f} | Today: {self.total_profit_today:+.2f}\n"
+                f"Streak: {self.consecutive_losses} | Step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
+                f"Balance: {self.balance}"
+            )
+        except Exception as e:
+            logger.error(f"Result check error: {e}")
         finally:
-            for t in self.market_tasks.values(): t.cancel()
-            self.market_tasks.clear()
+            self.active_trade_info = None
+            self.active_market = None
+            self.cooldown_until = time.time() + COOLDOWN_SEC
 
-    async def scan_market(self,symbol):
-        self._next_poll_epoch[symbol]=time.time()+random.random()*2.0
-
+    async def scan_market(self, symbol):
         while self.is_scanning:
             try:
-                now=time.time(); nxt=float(self._next_poll_epoch.get(symbol,0.0))
-                if now<nxt:
-                    await asyncio.sleep(min(1.0,nxt-now)); continue
+                await asyncio.sleep(SCAN_INTERVAL_SEC)
+                self._reset_daily_if_needed()
+                if self.active_trade_info:
+                    continue
 
-                if self.consecutive_losses>=MAX_CONSEC_LOSSES or self.trades_today>=MAX_TRADES_PER_DAY:
-                    self.is_scanning=False; break
-
-                ok_gate,gate=self.can_auto_trade()
-                mkt_ok,mkt_msg=self._is_market_available(symbol)
-
-                # Forex session gate — block weekends and outside London/NY
-                forex_open,forex_reason=is_forex_market_open()
+                # Weekend/session gate
+                forex_open, forex_reason = is_forex_market_open()
                 if not forex_open:
-                    self.market_debug[symbol]={"time":time.time(),"gate":gate,"why":[forex_reason]}
-                    self._next_poll_epoch[symbol]=time.time()+60; continue
+                    self.market_debug[symbol] = {"time": time.time(), "why": [forex_reason]}
+                    continue
 
-                # Fetch M5 and M1 candles simultaneously
-                m5_task=asyncio.create_task(self.fetch_candles_with_timeout(symbol,TF_M5_SEC,CANDLES_M5))
-                m1_task=asyncio.create_task(self.fetch_candles_with_timeout(symbol,TF_M1_SEC,CANDLES_M1))
-                candles_m5,candles_m1=await asyncio.gather(m5_task,m1_task)
+                ok_gate, gate = self.can_auto_trade()
+                mkt_ok, mkt_msg = self._is_market_available(symbol)
 
-                if not candles_m5 or not candles_m1:
-                    self.market_debug[symbol]={"time":time.time(),"gate":gate,"why":["Candle fetch failed — retrying in 10s"]}
-                    self._next_poll_epoch[symbol]=time.time()+10; continue
+                # Fetch candles
+                m5_task = asyncio.create_task(self.fetch_candles_with_timeout(symbol, TF_M5_SEC, CANDLES_M5))
+                m1_task = asyncio.create_task(self.fetch_candles_with_timeout(symbol, TF_M1_SEC, CANDLES_M1))
+                candles_m5, candles_m1 = await asyncio.gather(m5_task, m1_task)
 
-                self._rate_limit_strikes[symbol]=0
+                if len(candles_m5) < EMA_PERIOD + SWING_LOOKBACK + 10 or len(candles_m1) < RSI_PERIOD + 5:
+                    self.market_debug[symbol] = {"time": time.time(), "gate": gate,
+                        "why": [f"Warming up M5:{len(candles_m5)} M1:{len(candles_m1)}"]}
+                    continue
 
-                if len(candles_m5)<EMA_PERIOD+5 or len(candles_m1)<RSI_PERIOD+5:
-                    self.market_debug[symbol]={"time":time.time(),"gate":gate,"why":[f"Warming up M5:{len(candles_m5)} M1:{len(candles_m1)}"]}
-                    self._next_poll_epoch[symbol]=time.time()+15; continue
+                # Use confirmed closed candles only
+                m5_confirmed = candles_m5[:-1]
+                m1_confirmed = candles_m1[:-1]
 
-                # Poll on M1 closed candle
-                confirm_m1=candles_m1[-2]; confirm_t0=int(confirm_m1["t0"])
-                self._next_poll_epoch[symbol]=float(confirm_t0+TF_M1_SEC+2.5)
-                if self.last_processed_m1_t0[symbol]==confirm_t0: continue
+                if len(m5_confirmed) < EMA_PERIOD + SWING_LOOKBACK + 5:
+                    continue
 
-                # ===== EXTRACT DATA =====
-                m5_closes=[x["c"] for x in candles_m5[:-1]]
-                m5_highs=[x["h"] for x in candles_m5[:-1]]
-                m5_lows=[x["l"] for x in candles_m5[:-1]]
-                m1_closes=[x["c"] for x in candles_m1[:-1]]
-                m1_highs=[x["h"] for x in candles_m1[:-1]]
-                m1_lows=[x["l"] for x in candles_m1[:-1]]
+                # Extract M5 OHLC
+                m5_opens  = [c["open"]  for c in m5_confirmed]
+                m5_highs  = [c["high"]  for c in m5_confirmed]
+                m5_lows   = [c["low"]   for c in m5_confirmed]
+                m5_closes = [c["close"] for c in m5_confirmed]
 
-                m5_close_now=m5_closes[-1]
-                m1_close_now=m1_closes[-1]
-                m1_open_now=candles_m1[-2]["o"]
-                m1_prev_high=candles_m1[-3]["h"] if len(candles_m1)>=3 else None
-                m1_prev_low=candles_m1[-3]["l"] if len(candles_m1)>=3 else None
+                # Extract M1 data (last 2 confirmed candles)
+                m1_closes = [c["close"] for c in m1_confirmed]
+                m1_prev   = m1_confirmed[-2] if len(m1_confirmed) >= 2 else None
+                m1_last   = m1_confirmed[-1]
 
-                # ===== CALCULATE INDICATORS =====
-                # M5 indicators
-                m5_ema50=calculate_ema(m5_closes,EMA_PERIOD)
-                m5_vwap=calculate_vwap(m5_highs,m5_lows,m5_closes)
-                m5_atrs=calculate_atr(m5_highs,m5_lows,m5_closes,ATR_PERIOD)
-                m5_atr=float(m5_atrs[-2]) if len(m5_atrs)>=2 and not np.isnan(m5_atrs[-2]) else None
-                m5_atr_sma=float(np.mean([x for x in m5_atrs[-ATR_SMA_PERIOD-1:-1] if not np.isnan(x)])) if m5_atr else None
+                # ── INDICATORS ──────────────────────────────────────
+                m5_ema50_series = calculate_ema_series(m5_closes, EMA_PERIOD)
+                m5_ema50 = m5_ema50_series[-1] if m5_ema50_series else None
+                m5_ema50_prev = m5_ema50_series[-2] if m5_ema50_series and len(m5_ema50_series) >= 2 else None
 
-                # M1 indicators
-                m1_vwap=calculate_vwap(m1_highs,m1_lows,m1_closes)
-                m1_rsi=calculate_rsi(m1_closes,RSI_PERIOD)
-                vwap_crosses=count_vwap_crosses(m1_closes,m1_highs,m1_lows,lookback=10)
-                m1_adx=calculate_adx(m1_highs,m1_lows,m1_closes,ADX_PERIOD)
+                m5_atrs = calculate_atr(m5_highs, m5_lows, m5_closes, ATR_PERIOD)
+                m5_atr = float(m5_atrs[-1]) if m5_atrs else None
+                m5_atr_sma = float(np.mean([x for x in m5_atrs[-ATR_SMA_PERIOD-1:-1] if x])) if m5_atrs else None
 
-                if m5_ema50 is None or m5_atr is None or m5_atr_sma is None or m1_rsi is None:
-                    self.market_debug[symbol]={"time":time.time(),"gate":gate,"why":["Indicators not ready"]}
-                    self.last_processed_m1_t0[symbol]=confirm_t0; continue
+                # (ADX removed — structure break itself confirms momentum)
+                m1_rsi = calculate_rsi(m1_closes, RSI_PERIOD)
 
-                # ===== STRATEGY LOGIC =====
-                signal=None
-                reason="No entry"
-                vwap_dist=abs(m1_close_now-m1_vwap)
-                pullback_zone=PULLBACK_ZONE_MULT*m5_atr
+                if any(v is None for v in [m5_ema50, m5_ema50_prev, m5_atr, m5_atr_sma, m1_rsi]):
+                    self.market_debug[symbol] = {"time": time.time(), "gate": gate,
+                        "why": ["Indicators warming up"]}
+                    continue
 
-                # 1. M5 TREND DIRECTION
-                if m5_close_now>m5_vwap and m5_close_now>m5_ema50:
-                    m5_trend="CALL"
-                elif m5_close_now<m5_vwap and m5_close_now<m5_ema50:
-                    m5_trend="PUT"
-                else:
-                    m5_trend=None
+                # ── STRUCTURE LEVELS ─────────────────────────────────
+                last_swing_high, last_swing_low = get_structure_levels(m5_highs, m5_lows, SWING_LOOKBACK)
 
-                # 2. VOLATILITY FILTER
-                vol_ok=m5_atr>m5_atr_sma
+                if last_swing_high is None or last_swing_low is None:
+                    self.market_debug[symbol] = {"time": time.time(), "gate": gate,
+                        "why": ["Not enough swing points yet"]}
+                    continue
 
-                # 3. CHOP FILTER
-                chop=vwap_crosses>=CHOP_CROSS_LIMIT
-                if chop and mkt_ok:
-                    self.market_chop_until[symbol]=time.time()+CHOP_PAUSE_SEC
-                    logger.info(f"⚠️ {symbol} chop detected — pausing {CHOP_PAUSE_SEC//60}min")
+                # Current M5 candle (last confirmed)
+                cur_open  = m5_opens[-1]
+                cur_close = m5_closes[-1]
+                cur_high  = m5_highs[-1]
+                cur_low   = m5_lows[-1]
+                confirm_t0 = m5_confirmed[-1]["epoch"]
 
-                # 4. ADX TREND STRENGTH
-                adx_ok=m1_adx is not None and m1_adx>=ADX_MIN
+                # Skip if already processed this candle
+                if self.last_processed_m5_t0.get(symbol) == confirm_t0:
+                    continue
 
-                # 5. PULLBACK ZONE
-                in_zone=vwap_dist<=pullback_zone
+                # ── VOLATILITY ───────────────────────────────────────
+                vol_ok = m5_atr > m5_atr_sma
 
-                # 6. ENTRY CONDITIONS
-                if m5_trend is None:
-                    reason="No M5 trend — price between VWAP and EMA50"
-                elif not vol_ok:
-                    reason=f"Volatility too low — ATR({m5_atr:.5f}) < SMA({m5_atr_sma:.5f})"
-                elif chop:
-                    reason=f"Choppy market — {vwap_crosses} VWAP crosses in last 10 candles"
-                elif not adx_ok:
-                    reason=f"ADX too low — {m1_adx:.1f if m1_adx else 'N/A'} < {ADX_MIN} (no trend strength)"
-                elif not in_zone:
-                    reason=f"Not in pullback zone — dist={vwap_dist:.5f} > zone={pullback_zone:.5f}"
-                elif m5_trend=="CALL":
-                    bull_candle=m1_close_now>m1_open_now
-                    rsi_ok=m1_rsi>RSI_CALL_MIN
-                    breakout=m1_prev_high is not None and m1_close_now>m1_prev_high
-                    if rsi_ok and bull_candle and breakout:
-                        signal="CALL"
-                        reason=f"CALL: trend=UP | RSI={m1_rsi:.1f} | bull candle | broke prev high"
-                    else:
-                        parts=[]
-                        if not rsi_ok: parts.append(f"RSI={m1_rsi:.1f} < {RSI_CALL_MIN}")
-                        if not bull_candle: parts.append("candle not bullish")
-                        if not breakout: parts.append("no breakout above prev high")
-                        reason="CALL setup waiting: "+", ".join(parts)
-                elif m5_trend=="PUT":
-                    bear_candle=m1_close_now<m1_open_now
-                    rsi_ok=m1_rsi<RSI_PUT_MAX
-                    breakdown=m1_prev_low is not None and m1_close_now<m1_prev_low
-                    if rsi_ok and bear_candle and breakdown:
-                        signal="PUT"
-                        reason=f"PUT: trend=DOWN | RSI={m1_rsi:.1f} | bear candle | broke prev low"
-                    else:
-                        parts=[]
-                        if not rsi_ok: parts.append(f"RSI={m1_rsi:.1f} > {RSI_PUT_MAX}")
-                        if not bear_candle: parts.append("candle not bearish")
-                        if not breakdown: parts.append("no breakdown below prev low")
-                        reason="PUT setup waiting: "+", ".join(parts)
+                # ── BODY RATIO ───────────────────────────────────────
+                candle_body = body_ratio(cur_open, cur_close, cur_high, cur_low)
+                body_ok = candle_body >= BODY_RATIO_MIN
 
-                _,_,stake_mult=self._equity_ok()
-
-                self.market_debug[symbol]={
-                    "time":time.time(),"gate":gate,"mkt_msg":mkt_msg,
-                    "last_closed":confirm_t0,"signal":signal,
-                    "m5_trend":m5_trend,"m5_vwap":round(m5_vwap,5),
-                    "m5_ema50":round(m5_ema50,5) if m5_ema50 else None,
-                    "m5_atr":round(m5_atr,5),"m5_atr_sma":round(m5_atr_sma,5),
-                    "vol_ok":vol_ok,"in_zone":in_zone,"chop":chop,
-                    "adx":round(m1_adx,1) if m1_adx else None,"adx_ok":adx_ok,
-                    "vwap_crosses":vwap_crosses,"vwap_dist":round(vwap_dist,5),
-                    "pullback_zone":round(pullback_zone,5),
-                    "m1_vwap":round(m1_vwap,5),"m1_rsi":round(m1_rsi,1) if m1_rsi else None,
-                    "m1_close":round(m1_close_now,5),
-                    "mkt_losses":self.market_losses_today.get(symbol,0),
-                    "mkt_trades":self.market_trades_today.get(symbol,0),
-                    "stake_mult":stake_mult,"why":[reason]
-                }
-
-                self.last_processed_m1_t0[symbol]=confirm_t0
-                if not ok_gate or not mkt_ok: continue
-
-                if signal=="CALL":
-                    await self.execute_trade("CALL",symbol,source="AUTO",
-                        rsi=m1_rsi,atr=m5_atr,vwap_dist=vwap_dist,
-                        m5_trend=m5_trend,stake_mult=stake_mult)
-                elif signal=="PUT":
-                    await self.execute_trade("PUT",symbol,source="AUTO",
-                        rsi=m1_rsi,atr=m5_atr,vwap_dist=vwap_dist,
-                        m5_trend=m5_trend,stake_mult=stake_mult)
-
-            except asyncio.CancelledError: break
-            except Exception as e:
-                msg=str(e); logger.error(f"Scanner Error ({symbol}): {msg}")
-                if self._is_rate_limit_error(msg):
-                    self._rate_limit_strikes[symbol]=int(self._rate_limit_strikes.get(symbol,0))+1
-                    self._next_poll_epoch[symbol]=time.time()+min(180,RATE_LIMIT_BACKOFF_BASE*self._rate_limit_strikes[symbol])
-                else:
-                    await asyncio.sleep(2 if not self._is_gatewayish_error(msg) else 5)
-            await asyncio.sleep(0.05)
-
-    async def execute_trade(self,side,symbol,reason="MANUAL",source="MANUAL",
-                             rsi=0,atr=0,vwap_dist=0,m5_trend="—",stake_mult=1.0):
-        if not self.api or self.active_trade_info: return
-        async with self.trade_lock:
-            ok,_gate=self.can_auto_trade()
-            mkt_ok,_=self._is_market_available(symbol)
-            if source=="AUTO" and (not ok or not mkt_ok or self._pending_buy): return
-            if source=="MANUAL" and (not ok or self._pending_buy): return
-            self._pending_buy=True
-            try:
-                base_payout=money2(max(float(MIN_PAYOUT),money2(max(0.01,float(PAYOUT_TARGET)*(float(MARTINGALE_MULT)**int(self.martingale_step))))))
-                payout=money2(base_payout*stake_mult)
-                payout=max(float(MIN_PAYOUT),payout)
-                prop=await self.safe_deriv_call("proposal",{"proposal":1,"amount":payout,"basis":"payout","contract_type":side,"currency":"USD","duration":int(EXPIRY_MIN),"duration_unit":"m","symbol":symbol},retries=6)
-                if "error" in prop:
-                    await self.safe_send_tg(f"❌ Proposal Error:\n{prop['error'].get('message','')}"); return
-                p=prop["proposal"]; proposal_id=p["id"]; ask_price=float(p.get("ask_price",0))
-                if ask_price<=0:
-                    await self.safe_send_tg("❌ Invalid ask_price."); return
-                if ask_price>float(MAX_STAKE_ALLOWED):
-                    await self.safe_send_tg(f"⛔️ Skipped: stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}")
-                    self.cooldown_until=time.time()+COOLDOWN_SEC; return
-                buy=await self.safe_deriv_call("buy",{"buy":proposal_id,"price":float(MAX_STAKE_ALLOWED)},retries=1)
-                if "error" in buy:
-                    await self.safe_send_tg(f"❌ Trade Refused:\n{buy['error'].get('message','')}"); return
-                self.active_trade_info=int(buy["buy"]["contract_id"])
-                self.active_market=symbol; self.trade_start_time=time.time(); self.current_stake=ask_price
-                self.active_trade_meta={
-                    "symbol":symbol,"side":side,"open_epoch":float(self.trade_start_time),
-                    "source":source,"rsi":rsi,"atr":atr,"vwap_dist":vwap_dist,"m5_trend":m5_trend
-                }
-                if source=="AUTO":
-                    self.trades_today+=1
-                    self.market_trades_today[symbol]=self.market_trades_today.get(symbol,0)+1
-                await self.safe_send_tg(
-                    f"🚀 {side} TRADE OPENED\n"
-                    f"🛒 Market: {symbol.replace('_',' ')}\n"
-                    f"⏱ Expiry: {EXPIRY_MIN}m\n"
-                    f"🎁 Payout: ${payout:.2f} | Stake: ${ask_price:.2f}{' (halved)' if stake_mult<1 else ''}\n"
-                    f"📈 M5 Trend: {m5_trend}\n"
-                    f"📊 RSI: {rsi:.1f} | ATR: {atr:.5f}\n"
-                    f"📐 VWAP dist: {vwap_dist:.5f}\n"
-                    f"🎲 Martingale step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
-                    f"🕓 Session: {session_bucket(self.trade_start_time)}\n"
-                    f"🤖 Source: {source}\n"
-                    f"📉 {symbol.replace('_',' ')} losses today: {self.market_losses_today.get(symbol,0)}/{MAX_LOSSES_PER_MARKET}\n"
-                    f"🔒 Profit lock: {'ACTIVE' if self.profit_lock_active else 'OFF'}\n"
-                    f"🎯 Today PnL: {self.total_profit_today:+.2f}/+{DAILY_PROFIT_TARGET:.2f}"
+                # ── EMA50 CROSS DETECTION ─────────────────────────────
+                # Previous candle was on one side, current candle crossed to other side
+                prev_close = m5_closes[-2] if len(m5_closes) >= 2 else None
+                ema50_bullish_cross = (
+                    prev_close is not None and
+                    m5_ema50_prev is not None and
+                    prev_close < m5_ema50_prev and   # previous candle was BELOW EMA50
+                    cur_close > m5_ema50              # current candle is ABOVE EMA50
                 )
-                asyncio.create_task(self.check_result(self.active_trade_info,source,side,rsi,atr,vwap_dist,m5_trend))
-            except Exception as e:
-                logger.error(f"Trade error: {e}")
-                await self.safe_send_tg(f"⚠️ Trade error:\n{e}")
-            finally:
-                self._pending_buy=False
+                ema50_bearish_cross = (
+                    prev_close is not None and
+                    m5_ema50_prev is not None and
+                    prev_close > m5_ema50_prev and   # previous candle was ABOVE EMA50
+                    cur_close < m5_ema50              # current candle is BELOW EMA50
+                )
 
-    async def check_result(self,cid,source,side,rsi,atr,vwap_dist,m5_trend):
-        await asyncio.sleep(EXPIRY_MIN*60+5)
-        try:
-            res=await self.safe_deriv_call("proposal_open_contract",{"proposal_open_contract":1,"contract_id":cid},retries=6)
-            profit=float(res["proposal_open_contract"].get("profit",0))
-            traded_symbol="—"
-            if source=="AUTO" and self.active_trade_meta:
-                traded_symbol=self.active_trade_meta.get("symbol","—")
-                self.record_trade_result(traded_symbol,float(self.active_trade_meta.get("open_epoch",time.time())),profit,side,rsi,atr,vwap_dist,m5_trend)
-            if source=="AUTO":
-                self.total_profit_today+=profit
-                sess=session_bucket(time.time())
-                self.session_losses[sess]=self.session_losses.get(sess,0.0)+profit
-                if traded_symbol in MARKETS:
-                    self._update_market_loss_state(traded_symbol,profit)
-                if profit<=0:
-                    self.consecutive_losses+=1; self.total_losses_today+=1
-                    if self.consecutive_losses>self.max_loss_streak_today:
-                        self.max_loss_streak_today=self.consecutive_losses
-                    if self.consecutive_losses>=MAX_CONSEC_LOSSES and not self.hit_max_losses_today:
-                        self.hit_max_losses_today=True; self.is_scanning=False
-                        await self.safe_send_tg(f"⛔ STOPPED: {MAX_CONSEC_LOSSES} consecutive losses. Bot paused until tomorrow.")
-                    if self.martingale_step<MARTINGALE_MAX_STEPS: self.martingale_step+=1
-                    else: self.martingale_halt=True; self.is_scanning=False
+                # ── STRUCTURE BREAK DETECTION ────────────────────────
+                # BULLISH break: close above last swing high AND crossed EMA50 upward
+                bullish_break = (
+                    cur_close > last_swing_high and
+                    cur_open < last_swing_high and    # started below = genuine break
+                    ema50_bullish_cross               # EMA50 crossed same candle
+                )
+
+                # BEARISH break: close below last swing low AND crossed EMA50 downward
+                bearish_break = (
+                    cur_close < last_swing_low and
+                    cur_open > last_swing_low and     # started above = genuine break
+                    ema50_bearish_cross               # EMA50 crossed same candle
+                )
+
+                # ── RSI CONFIRMATION ──────────────────────────────────
+                rsi_call_ok = m1_rsi > 50
+                rsi_put_ok  = m1_rsi < 50
+
+                # ── NEXT CANDLE CONFIRMATION ──────────────────────────
+                # Check M1 last candle continues in break direction
+                m1_bullish = m1_last["close"] > m1_last["open"]
+                m1_bearish = m1_last["close"] < m1_last["open"]
+
+                # ── SIGNAL ───────────────────────────────────────────
+                signal = None
+                reason = "Scanning..."
+
+                if not vol_ok:
+                    reason = f"Volatility too low — ATR({m5_atr:.5f}) < SMA({m5_atr_sma:.5f})"
+                elif bullish_break:
+                    if not body_ok:
+                        reason = f"Weak break candle — body ratio {candle_body:.2f} < {BODY_RATIO_MIN}"
+                    elif not rsi_call_ok:
+                        reason = f"RSI not confirming CALL — {m1_rsi:.1f} < 50"
+                    elif not m1_bullish:
+                        reason = "M1 candle not bullish — waiting for confirmation"
+                    else:
+                        signal = "CALL"
+                        reason = f"✅ Bullish structure break — closed above {last_swing_high:.5f} + EMA50"
+                elif bearish_break:
+                    if not body_ok:
+                        reason = f"Weak break candle — body ratio {candle_body:.2f} < {BODY_RATIO_MIN}"
+                    elif not rsi_put_ok:
+                        reason = f"RSI not confirming PUT — {m1_rsi:.1f} > 50"
+                    elif not m1_bearish:
+                        reason = "M1 candle not bearish — waiting for confirmation"
+                    else:
+                        signal = "PUT"
+                        reason = f"✅ Bearish structure break — closed below {last_swing_low:.5f} + EMA50"
                 else:
-                    self.consecutive_losses=0; self.martingale_step=0; self.martingale_halt=False
-                if self.total_profit_today>=PROFIT_LOCK_TRIGGER and not self.profit_lock_active:
-                    self.profit_lock_active=True
-                    await self.safe_send_tg(f"🔒 PROFIT LOCK at +${self.total_profit_today:.2f} — floor +${PROFIT_LOCK_FLOOR:.2f}")
-                if self.total_profit_today>=DAILY_PROFIT_TARGET:
-                    self.pause_until=self._next_midnight_epoch()
-            await self.fetch_balance()
-            next_payout=money2(float(PAYOUT_TARGET)*(float(MARTINGALE_MULT)**int(self.martingale_step)))
-            mkt_losses_after=self.market_losses_today.get(traded_symbol,0)
-            mkt_blocked_after=self.market_blocked.get(traded_symbol,False)
-            mkt_note=f"\n🚫 {traded_symbol.replace('_',' ')} BLOCKED for today" if mkt_blocked_after else f"\n📊 {traded_symbol.replace('_',' ')} losses today: {mkt_losses_after}/{MAX_LOSSES_PER_MARKET}"
-            pause_note="\n⏸ Paused until 12:00am WAT" if time.time()<self.pause_until else ""
-            halt_note="\n🛑 Martingale stopped" if self.martingale_halt else ""
-            lock_note=f"\n🔒 Profit lock active (floor +${PROFIT_LOCK_FLOOR:.2f})" if self.profit_lock_active else ""
-            await self.safe_send_tg(
-                f"🏁 FINISH: {'WIN ✅' if profit>0 else 'LOSS ❌'} ({profit:+.2f})\n"
-                f"📈 M5 Trend was: {m5_trend} | RSI: {rsi:.1f}\n"
-                f"📊 Today: {self.trades_today}/{MAX_TRADES_PER_DAY} | Losses: {self.total_losses_today} | Streak: {self.consecutive_losses}/{MAX_CONSEC_LOSSES}\n"
-                f"📌 Max streak: {self.max_loss_streak_today}\n"
-                f"💵 Today PnL: {self.total_profit_today:+.2f}/+{DAILY_PROFIT_TARGET:.2f}\n"
-                f"🎁 Next payout: ${next_payout:.2f} (step {self.martingale_step}/{MARTINGALE_MAX_STEPS})\n"
-                f"💰 Balance: {self.balance}"
-                f"{mkt_note}{lock_note}{pause_note}{halt_note}"
-            )
-            now_dt=datetime.now(self.tz)
-            if now_dt.hour==23 and now_dt.minute>=55:
-                await self._send_daily_report()
-        finally:
-            self.active_trade_info=None; self.active_trade_meta=None
-            self.cooldown_until=time.time()+COOLDOWN_SEC
+                    reason = f"No structure break — watching High:{last_swing_high:.5f} Low:{last_swing_low:.5f}"
 
-    async def _send_daily_report(self):
-        by_mkt,by_sess,wr=self.stats_30d()
-        lines=["📊 DAILY REPORT — VWAP Bot\n"]
-        lines.append(f"Date: {datetime.now(self.tz).strftime('%Y-%m-%d')}")
-        lines.append(f"Total trades: {self.trades_today}")
-        lines.append(f"Total PnL: {self.total_profit_today:+.2f}")
-        lines.append(f"Max loss streak: {self.max_loss_streak_today}")
-        lines.append(f"Balance: {self.balance}\n")
-        lines.append("📈 30-Day Market Win Rates:")
-        for m,d in sorted(by_mkt.items(),key=lambda x:wr(x[1]),reverse=True):
-            lines.append(f"  {m.replace('_',' ')}: {wr(d):.1f}% ({d['wins']}/{d['trades']})")
-        lines.append("\n🕓 30-Day Session Win Rates:")
-        for s,d in sorted(by_sess.items(),key=lambda x:wr(x[1]),reverse=True):
-            lines.append(f"  {s}: {wr(d):.1f}% ({d['wins']}/{d['trades']})")
-        await self.safe_send_tg("\n".join(lines))
+                # ── DEBUG ─────────────────────────────────────────────
+                self.market_debug[symbol] = {
+                    "time": time.time(), "gate": gate, "mkt_msg": mkt_msg,
+                    "last_m5": confirm_t0, "signal": signal,
+                    "m5_ema50": round(m5_ema50, 5) if m5_ema50 else None,
+                    "swing_high": round(last_swing_high, 5),
+                    "swing_low": round(last_swing_low, 5),
+                    "vol_ok": vol_ok,
+                    "ema50_bull_cross": ema50_bullish_cross,
+                    "ema50_bear_cross": ema50_bearish_cross,
+                    "body": round(candle_body, 2), "body_ok": body_ok,
+                    "m1_rsi": round(m1_rsi, 1),
+                    "bullish_break": bullish_break, "bearish_break": bearish_break,
+                    "mkt_losses": self.market_losses_today.get(symbol, 0),
+                    "mkt_trades": self.market_trades_today.get(symbol, 0),
+                    "why": [reason]
+                }
 
+                self.last_processed_m5_t0[symbol] = confirm_t0
+                if not ok_gate or not mkt_ok: continue
+                if signal is None: continue
 
-# ===== TELEGRAM COMMANDS =====
-async def cmd_setstake(u:Update,c:ContextTypes.DEFAULT_TYPE):
-    global PAYOUT_TARGET
-    try:
-        val=float(c.args[0]); PAYOUT_TARGET=val
-        await u.message.reply_text(f"✅ Base payout set to ${val:.2f}")
-    except: await u.message.reply_text("Usage: /setstake 1.00")
+                if signal == "CALL":
+                    await self.execute_trade("CALL", symbol,
+                        rsi=round(m1_rsi, 1), body=round(candle_body, 2),
+                        level=round(last_swing_high, 5), ema50=round(m5_ema50, 5))
+                elif signal == "PUT":
+                    await self.execute_trade("PUT", symbol,
+                        rsi=round(m1_rsi, 1), body=round(candle_body, 2),
+                        level=round(last_swing_low, 5), ema50=round(m5_ema50, 5))
 
-async def cmd_setmarkets(u:Update,c:ContextTypes.DEFAULT_TYPE):
-    global MARKETS
-    valid=["R_10","R_25","R_50","R_75","R_100"]
-    try:
-        new_markets=[m.upper().replace("R","R_") if not m.startswith("R_") else m.upper() for m in c.args]
-        new_markets=[m for m in new_markets if m in valid]
-        if not new_markets:
-            await u.message.reply_text(f"No valid markets. Use: {', '.join(valid)}"); return
-        MARKETS=new_markets
-        await u.message.reply_text(f"✅ Markets: {', '.join(MARKETS)}")
-    except: await u.message.reply_text("Usage: /setmarkets R_50 R_75")
+            except Exception as e:
+                logger.error(f"Scan error {symbol}: {e}")
+                await asyncio.sleep(10)
 
-async def cmd_pause(u:Update,c:ContextTypes.DEFAULT_TYPE):
-    try:
-        minutes=int(c.args[0]); bot_logic.pause_until=time.time()+minutes*60
-        await u.message.reply_text(f"⏸ Bot paused for {minutes} minutes.")
-    except: await u.message.reply_text("Usage: /pause 30")
-
-async def cmd_resume(u:Update,c:ContextTypes.DEFAULT_TYPE):
-    bot_logic.pause_until=0.0
-    for m in MARKETS:
-        bot_logic.market_pause_until[m]=0.0
-        bot_logic.market_chop_until[m]=0.0
-    await u.message.reply_text("▶️ Bot and all markets resumed.")
-
-async def cmd_stats(u:Update,c:ContextTypes.DEFAULT_TYPE):
-    await bot_logic._send_daily_report()
-
-async def cmd_unblock(u:Update,c:ContextTypes.DEFAULT_TYPE):
-    for m in MARKETS:
-        bot_logic.market_blocked[m]=False
-        bot_logic.market_losses_today[m]=0
-        bot_logic.market_pause_until[m]=0.0
-    await u.message.reply_text("✅ All markets unblocked.")
+    async def run(self):
+        while True:
+            try:
+                logger.info("Connecting to Deriv...")
+                token = DEMO_TOKEN if self.account_type == "DEMO" else REAL_TOKEN
+                self.api = DerivAPI(app_id=APP_ID)
+                auth = await self.api.authorize({"authorize": token})
+                self.account_type = "DEMO" if auth.get("authorize", {}).get("is_virtual") else "REAL"
+                await self.fetch_balance()
+                logger.info(f"Connected — {self.account_type} | {self.balance}")
+                self.is_scanning = True
+                await self.safe_send_tg(
+                    f"🟢 Structure Break Bot ONLINE\n"
+                    f"Account: {self.account_type} | Balance: {self.balance}\n"
+                    f"Pairs: EURUSD GBPUSD USDJPY AUDUSD GBPJPY\n"
+                    f"Strategy: Structure Break + EMA50 Cross\n"
+                    f"Expiry: {EXPIRY_MIN}m | Martingale: {MARTINGALE_MAX_STEPS} steps"
+                )
+                tasks = [asyncio.create_task(self.scan_market(s)) for s in MARKETS]
+                await asyncio.gather(*tasks)
+            except Exception as e:
+                logger.error(f"Connection error: {e}")
+                self.is_scanning = False
+                self.api = None
+                await asyncio.sleep(15)
 
 
-# ===== UI =====
-bot_logic=DerivVWAPBot()
+bot_logic = StructureBreakBot()
+
+# ============================================================
+# TELEGRAM UI
+# ============================================================
 
 def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ START",callback_data="START_SCAN"),InlineKeyboardButton("⏹️ STOP",callback_data="STOP_SCAN")],
-        [InlineKeyboardButton("📊 STATUS",callback_data="STATUS"),InlineKeyboardButton("🔄 REFRESH",callback_data="STATUS")],
-        [InlineKeyboardButton("🧪 TEST BUY",callback_data="TEST_BUY")],
-        [InlineKeyboardButton("🧪 DEMO",callback_data="SET_DEMO"),InlineKeyboardButton("💰 LIVE",callback_data="SET_REAL")],
+        [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"),
+         InlineKeyboardButton("⏸ PAUSE", callback_data="PAUSE"),
+         InlineKeyboardButton("▶️ RESUME", callback_data="RESUME")],
+        [InlineKeyboardButton("🔁 DEMO/REAL", callback_data="TOGGLE"),
+         InlineKeyboardButton("🔓 UNBLOCK ALL", callback_data="UNBLOCK"),
+         InlineKeyboardButton("📈 STATS", callback_data="STATS")]
     ])
 
-def format_market_detail(sym,d):
-    if not d: return f"📍 {sym.replace('frx','').replace('_',' ')}\n⏳ No scan data yet"
-    age=int(time.time()-d.get("time",time.time()))
-    signal=d.get("signal") or "—"
-    why=d.get("why",[]); gate=d.get("gate","—"); mkt_msg=d.get("mkt_msg","OK")
-    m5_trend=d.get("m5_trend","—"); vol_ok=d.get("vol_ok",False)
-    in_zone=d.get("in_zone",False); chop=d.get("chop",False)
-    adx=d.get("adx",None); adx_ok=d.get("adx_ok",False)
-    m1_rsi=d.get("m1_rsi","—"); vwap_dist=d.get("vwap_dist","—")
-    mkt_losses=d.get("mkt_losses",0); mkt_trades=d.get("mkt_trades",0)
-    last_closed=d.get("last_closed",0)
-    adx_str=f"{adx:.1f} {'✅' if adx_ok else '❌'}" if adx is not None else "Warming up"
+def format_market_detail(sym, d):
+    if not d: return f"📍 {sym.replace('frx','')}\n⏳ No scan data yet"
+    age = int(time.time() - d.get("time", time.time()))
+    signal = d.get("signal") or "—"
+    why = d.get("why", [])
+    vol_ok = d.get("vol_ok", False)
+    body = d.get("body", "—"); body_ok = d.get("body_ok", False)
+    m1_rsi = d.get("m1_rsi", "—")
+    swing_high = d.get("swing_high", "—"); swing_low = d.get("swing_low", "—")
+    ema50 = d.get("m5_ema50", "—")
+    bullish = d.get("bullish_break", False); bearish = d.get("bearish_break", False)
+    ema50_bull = d.get("ema50_bull_cross", False); ema50_bear = d.get("ema50_bear_cross", False)
+    mkt_losses = d.get("mkt_losses", 0); mkt_trades = d.get("mkt_trades", 0)
+    last_m5 = d.get("last_m5", 0)
+    ema50_cross_str = "📈 Crossed UP ✅" if ema50_bull else ("📉 Crossed DOWN ✅" if ema50_bear else "— No cross yet")
+    break_str = "📈 BULLISH BREAK" if bullish else ("📉 BEARISH BREAK" if bearish else "— No break")
     return (
         f"📍 {sym.replace('frx','')} ({age}s ago)\n"
-        f"Market: {mkt_msg} | {mkt_trades}/{MAX_TRADES_PER_MARKET} | {mkt_losses}/{MAX_LOSSES_PER_MARKET} losses\n"
-        f"Last M1: {fmt_time_hhmmss(last_closed)}\n"
+        f"Market: {d.get('mkt_msg','OK')} | {mkt_trades}/{MAX_TRADES_PER_MARKET} | {mkt_losses}/{MAX_LOSSES_PER_MARKET} losses\n"
+        f"Last M5: {fmt_time_hhmmss(last_m5)}\n"
         f"────────────────\n"
-        f"📈 M5 Trend: {m5_trend}\n"
+        f"🏗 Structure: High {swing_high} | Low {swing_low}\n"
+        f"📊 EMA50: {ema50} | Cross: {ema50_cross_str}\n"
         f"📊 Volatility: {'✅ OK' if vol_ok else '❌ Low'}\n"
-        f"💪 ADX: {adx_str}\n"
-        f"🌀 Chop: {'⚠️ YES' if chop else '✅ NO'}\n"
-        f"📐 VWAP pullback: {'✅ IN ZONE' if in_zone else '❌ Out'}\n"
+        f"🕯 Body: {body} {'✅' if body_ok else '❌'}\n"
         f"📉 RSI: {m1_rsi}\n"
+        f"{break_str}\n"
         f"Signal: {signal}\n"
         f"Why: {why[0] if why else '—'}\n"
     )
 
-async def _safe_answer(q,text=None,show_alert=False):
-    try: await q.answer(text=text,show_alert=show_alert)
+async def _safe_answer(q, text=None, show_alert=False):
+    try: await q.answer(text=text, show_alert=show_alert)
     except Exception as e: logger.warning(f"Callback answer: {e}")
 
-async def _safe_edit(q,text,reply_markup=None):
-    try: await q.edit_message_text(text,reply_markup=reply_markup)
+async def _safe_edit(q, text, reply_markup=None):
+    try:
+        kwargs = {"text": text[:4000]}
+        if reply_markup: kwargs["reply_markup"] = reply_markup
+        await q.edit_message_text(**kwargs)
     except Exception as e: logger.warning(f"Edit failed: {e}")
 
-async def btn_handler(u:Update,c:ContextTypes.DEFAULT_TYPE):
-    q=u.callback_query; await _safe_answer(q)
-    await _safe_edit(q,"⏳ Working...",reply_markup=main_keyboard())
+async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q: return
+    bot_logic._known_chat_ids = getattr(bot_logic, "_known_chat_ids", set())
+    bot_logic._known_chat_ids.add(q.message.chat_id)
+    await _safe_answer(q)
 
-    if q.data=="SET_DEMO":
-        bot_logic.active_token,bot_logic.account_type=DEMO_TOKEN,"DEMO"
-        ok=await bot_logic.connect()
-        await _safe_edit(q,"✅ Connected to DEMO" if ok else "❌ DEMO Failed",reply_markup=main_keyboard())
-    elif q.data=="SET_REAL":
-        bot_logic.active_token,bot_logic.account_type=REAL_TOKEN,"LIVE"
-        ok=await bot_logic.connect()
-        await _safe_edit(q,"✅ LIVE CONNECTED" if ok else "❌ LIVE Failed",reply_markup=main_keyboard())
-    elif q.data=="START_SCAN":
-        if not bot_logic.api:
-            await _safe_edit(q,"❌ Connect first.",reply_markup=main_keyboard()); return
-        bot_logic.is_scanning=True
-        bot_logic.scanner_task=asyncio.create_task(bot_logic.background_scanner())
-        await _safe_edit(q,"🔍 SCANNER ACTIVE\n✅ VWAP Pullback strategy running.\n📡 All 5 markets active.",reply_markup=main_keyboard())
-    elif q.data=="STOP_SCAN":
-        bot_logic.is_scanning=False
-        if bot_logic.scanner_task and not bot_logic.scanner_task.done(): bot_logic.scanner_task.cancel()
-        await _safe_edit(q,"⏹️ Scanner stopped.",reply_markup=main_keyboard())
-    elif q.data=="TEST_BUY":
-        test_symbol=MARKETS[0] if MARKETS else "R_50"
-        asyncio.create_task(bot_logic.execute_trade("CALL",test_symbol,"Manual Test",source="MANUAL"))
-        await _safe_edit(q,f"🧪 Test CALL on {test_symbol.replace('_',' ')}.",reply_markup=main_keyboard())
-    elif q.data=="STATUS":
-        now=time.time()
-        if now<bot_logic.status_cooldown_until:
-            await _safe_edit(q,f"⏳ Cooldown: {int(bot_logic.status_cooldown_until-now)}s",reply_markup=main_keyboard()); return
-        bot_logic.status_cooldown_until=now+STATUS_REFRESH_COOLDOWN_SEC
-        try:
-            await asyncio.wait_for(bot_logic.fetch_balance(),timeout=3.0)
-        except: pass
-        now_time=datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
-        _ok,gate=bot_logic.can_auto_trade()
-        trade_status="No Active Trade"
-        if bot_logic.active_trade_info:
-            rem=max(0,int(EXPIRY_MIN*60)-int(time.time()-bot_logic.trade_start_time))
-            trade_status=f"🚀 Active Trade ({bot_logic.active_market.replace('_',' ')})\n🕓 Session: {session_bucket(bot_logic.trade_start_time)}\n⏳ Left: ~{rem}s"
-        pause_line="⏸ Paused until 12:00am WAT\n" if time.time()<bot_logic.pause_until else ""
-        next_payout=money2(float(PAYOUT_TARGET)*(float(MARTINGALE_MULT)**int(bot_logic.martingale_step)))
-        by_mkt,by_sess,wr=bot_logic.stats_30d()
-        def fmt_stats(title,items):
-            rows=[(k,wr(v),v["trades"],v["wins"]) for k,v in items.items()]
-            rows.sort(key=lambda x:(x[1],x[2]),reverse=True)
-            lines=[f"{title} (last {STATS_DAYS}d):"]
-            if not rows: lines.append("— No trades yet"); return "\n".join(lines)
-            for k,wrr,t,w in rows: lines.append(f"- {k.replace('_',' ')}: {wrr:.1f}% ({w}/{t})")
-            return "\n".join(lines)
-        stats_block="📈 PERFORMANCE\n"+fmt_stats("Markets",by_mkt)+"\n"+fmt_stats("Sessions",by_sess)+"\n"
-        mkt_lines=["🛡 Market Status:"]
+    if q.data == "PAUSE":
+        bot_logic.pause_until = time.time() + 86400
+        await _safe_edit(q, "⏸ Bot paused until midnight WAT.", reply_markup=main_keyboard())
+
+    elif q.data == "RESUME":
+        bot_logic.pause_until = 0
+        await _safe_edit(q, "▶️ Bot resumed.", reply_markup=main_keyboard())
+
+    elif q.data == "UNBLOCK":
         for m in MARKETS:
-            ml=bot_logic.market_losses_today.get(m,0)
-            mt=bot_logic.market_trades_today.get(m,0)
-            mb=bot_logic.market_blocked.get(m,False)
-            mp=bot_logic.market_pause_until.get(m,0)
-            mc=bot_logic.market_chop_until.get(m,0)
-            status="🚫 BLOCKED" if mb else ("⏸ PAUSED" if time.time()<mp else ("🌀 CHOP" if time.time()<mc else "✅"))
-            mkt_lines.append(f"{status} {m.replace('_',' ')}: {mt}/{MAX_TRADES_PER_MARKET} trades | {ml}/{MAX_LOSSES_PER_MARKET} losses")
-        mkt_block="\n".join(mkt_lines)+"\n"
-        _,_,stake_mult=bot_logic._equity_ok()
-        eq_ratio=bot_logic._get_current_balance_float()/bot_logic.starting_balance if bot_logic.starting_balance>0 else 1.0
-        header=(
-            f"🕒 Time (WAT): {now_time}\n"
-            f"🤖 Bot: {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
+            bot_logic.market_blocked[m] = False
+            bot_logic.market_pause_until[m] = 0
+            bot_logic.market_losses_today[m] = 0
+        await _safe_edit(q, "🔓 All pairs unblocked.", reply_markup=main_keyboard())
+
+    elif q.data == "TOGGLE":
+        bot_logic.account_type = "REAL" if bot_logic.account_type == "DEMO" else "DEMO"
+        bot_logic.is_scanning = False
+        await _safe_edit(q, f"🔁 Switching to {bot_logic.account_type}...", reply_markup=main_keyboard())
+
+    elif q.data == "STATS":
+        by_mkt, by_sess, wr = bot_logic.stats_30d()
+        def fmt(title, items):
+            rows = [(k, wr(v), v["trades"], v["wins"]) for k, v in items.items()]
+            rows.sort(key=lambda x: (x[1], x[2]), reverse=True)
+            lines = [f"{title} (last {STATS_DAYS}d):"]
+            if not rows: lines.append("— No trades yet"); return "\n".join(lines)
+            for k, wrr, t, w in rows: lines.append(f"- {k}: {wrr:.1f}% ({w}/{t})")
+            return "\n".join(lines)
+        msg = f"📈 PERFORMANCE\n{fmt('Pairs', by_mkt)}\n{fmt('Sessions', by_sess)}\n"
+        msg += f"Today: {bot_logic.total_profit_today:+.2f} | Trades: {bot_logic.trades_today}"
+        await _safe_edit(q, msg, reply_markup=main_keyboard())
+
+    elif q.data == "STATUS":
+        now = time.time()
+        if now < bot_logic.status_cooldown_until:
+            await _safe_edit(q, f"⏳ Cooldown: {int(bot_logic.status_cooldown_until - now)}s", reply_markup=main_keyboard()); return
+        bot_logic.status_cooldown_until = now + STATUS_REFRESH_COOLDOWN_SEC
+        try:
+            await asyncio.wait_for(bot_logic.fetch_balance(), timeout=3.0)
+        except: pass
+        now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
+        _, gate = bot_logic.can_auto_trade()
+        trade_status = "No Active Trade"
+        if bot_logic.active_trade_info:
+            rem = max(0, int(EXPIRY_MIN * 60) - int(time.time() - bot_logic.trade_start_time))
+            trade_status = f"🚀 Active Trade ({bot_logic.active_market.replace('frx','')})\n⏳ Left: ~{rem}s"
+        next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(bot_logic.martingale_step)))
+        by_mkt, by_sess, wr = bot_logic.stats_30d()
+        def fmt_stats(title, items):
+            rows = [(k, wr(v), v["trades"], v["wins"]) for k, v in items.items()]
+            rows.sort(key=lambda x: (x[1], x[2]), reverse=True)
+            lines = [f"{title} (last {STATS_DAYS}d):"]
+            if not rows: lines.append("— No trades yet"); return "\n".join(lines)
+            for k, wrr, t, w in rows: lines.append(f"- {k}: {wrr:.1f}% ({w}/{t})")
+            return "\n".join(lines)
+        stats_block = "📈 PERFORMANCE\n" + fmt_stats("Pairs", by_mkt) + "\n" + fmt_stats("Sessions", by_sess) + "\n"
+        mkt_lines = ["🛡 Pair Status:"]
+        for m in MARKETS:
+            ml = bot_logic.market_losses_today.get(m, 0)
+            mt = bot_logic.market_trades_today.get(m, 0)
+            mb = bot_logic.market_blocked.get(m, False)
+            mp = bot_logic.market_pause_until.get(m, 0)
+            status = "🚫 BLOCKED" if mb else ("⏸ PAUSED" if time.time() < mp else "✅")
+            mkt_lines.append(f"{status} {m.replace('frx','')}: {mt}/{MAX_TRADES_PER_MARKET} | {ml}/{MAX_LOSSES_PER_MARKET} losses")
+        mkt_block = "\n".join(mkt_lines) + "\n"
+        _, _, stake_mult = bot_logic._equity_ok()
+        eq_ratio = bot_logic._get_current_balance_float() / bot_logic.starting_balance if bot_logic.starting_balance > 0 else 1.0
+        pause_line = "⏸ Paused\n" if time.time() < bot_logic.pause_until else ""
+        header = (
+            f"🕒 {now_time}\n"
+            f"🤖 {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
             f"{pause_line}"
             f"🎁 Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
-            f"🧯 Max stake: ${MAX_STAKE_ALLOWED:.2f} | Stake mult: {stake_mult:.1f}x\n"
-            f"💰 Equity: {eq_ratio:.0%} of starting balance\n"
-            f"🔒 Profit lock: {'ACTIVE (floor +${:.2f})'.format(PROFIT_LOCK_FLOOR) if bot_logic.profit_lock_active else 'OFF'}\n"
-            f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f} | Loss Limit: ${DAILY_LOSS_LIMIT:.2f}\n"
-            f"📡 Markets: {', '.join(m.replace('_',' ') for m in MARKETS)}\n"
-            f"🧭 Strategy: VWAP Pullback | Forex Binary | EMA{EMA_PERIOD} | RSI{RSI_PERIOD}\n"
-            f"🌍 Pairs: EURUSD GBPUSD USDJPY AUDUSD GBPJPY\n"
-            f"🕐 Sessions: London 8am-6pm WAT | NY 1pm-10pm WAT\n"
-            f"⏱ Expiry: {EXPIRY_MIN}m | Cooldown: {COOLDOWN_SEC//60}m after trade\n"
-            f"⛔ Stop after: {MAX_CONSEC_LOSSES} consecutive losses\n"
+            f"🧯 Max stake: ${MAX_STAKE_ALLOWED:.2f} | Mult: {stake_mult:.1f}x\n"
+            f"💰 Equity: {eq_ratio:.0%} | 🔒 Lock: {'ON +${:.2f}'.format(PROFIT_LOCK_FLOOR) if bot_logic.profit_lock_active else 'OFF'}\n"
+            f"🎯 Target: +${DAILY_PROFIT_TARGET:.2f} | Limit: ${DAILY_LOSS_LIMIT:.2f}\n"
+            f"📡 Pairs: EURUSD GBPUSD USDJPY AUDUSD GBPJPY\n"
+            f"🧭 Structure Break + EMA50 Cross | M5 | {EXPIRY_MIN}m expiry\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
             f"{stats_block}{mkt_block}"
-            f"💵 Today PnL: {bot_logic.total_profit_today:+.2f}\n"
-            f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
-            f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | Max: {bot_logic.max_loss_streak_today}\n"
+            f"💵 PnL: {bot_logic.total_profit_today:+.2f} | Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY}\n"
+            f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | Losses: {bot_logic.total_losses_today}\n"
             f"🚦 Gate: {gate}\n"
             f"💰 Balance: {bot_logic.balance}\n"
-            f"\nCommands: /setstake /setmarkets /pause /resume /stats /unblock"
+            f"\n/setstake /setmarkets /pause /resume /stats /unblock"
         )
-        details="\n\n📌 LIVE SCAN\n\n"+"\n\n".join([format_market_detail(sym,bot_logic.market_debug.get(sym,{})) for sym in MARKETS])
-        await _safe_edit(q,header+details,reply_markup=main_keyboard())
+        details = "\n\n📌 LIVE SCAN\n\n" + "\n\n".join([
+            format_market_detail(sym, bot_logic.market_debug.get(sym, {})) for sym in MARKETS
+        ])
+        await _safe_edit(q, header + details, reply_markup=main_keyboard())
 
-async def start_cmd(u:Update,c:ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text(
-        "💎 Deriv Forex Binary Bot\n"
-        f"🧭 Strategy: VWAP Pullback Trend Continuation\n"
-        f"📐 M5 trend (VWAP + EMA{EMA_PERIOD}) + M1 entry (VWAP + RSI{RSI_PERIOD})\n"
-        f"🌍 Markets: EURUSD | GBPUSD | USDJPY | AUDUSD | GBPJPY\n"
-        f"🕐 Active: London 8am-6pm WAT | NY 1pm-10pm WAT\n"
-        f"🛡 Volatility filter | Chop filter | Pullback zone\n"
-        f"💰 Equity protection | Profit lock\n"
-        f"📊 Max {MAX_TRADES_PER_MARKET} trades/pair/day | Stop after {MAX_LOSSES_PER_MARKET} losses/pair\n"
-        f"⏸ 30min pause after 2 consec losses | 20min pause on chop\n"
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_logic._known_chat_ids = getattr(bot_logic, "_known_chat_ids", set())
+    bot_logic._known_chat_ids.add(update.message.chat_id)
+    await update.message.reply_text(
+        "💎 Deriv Forex Structure Break Bot\n"
+        f"🧭 Strategy: Structure Break + EMA50 Cross Confirmation\n"
+        f"🏗 Detects swing highs/lows → price must break AND cross EMA50 same candle\n"
+        f"📊 ATR volatility | RSI momentum | Body ratio | M1 confirmation\n"
+        f"🌍 Pairs: EURUSD | GBPUSD | USDJPY | AUDUSD | GBPJPY\n"
+        f"📅 Trades Mon-Fri all sessions (data collection mode)\n"
         f"🎲 Martingale: {MARTINGALE_MAX_STEPS} steps × {MARTINGALE_MULT}x\n"
         f"⏱ Expiry: {EXPIRY_MIN}m | Cooldown: {COOLDOWN_SEC//60}m\n"
-        f"📲 /setstake /setmarkets /pause /resume /stats /unblock\n",
+        f"🛡 Max {MAX_TRADES_PER_MARKET} trades/pair | Stop after {MAX_LOSSES_PER_MARKET} losses/pair\n",
         reply_markup=main_keyboard()
     )
 
-if __name__=="__main__":
-    app=Application.builder().token(TELEGRAM_TOKEN).build()
-    bot_logic.app=app
-    app.add_handler(CommandHandler("start",start_cmd))
+async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_logic.pause_until = time.time() + 86400
+    await update.message.reply_text("⏸ Bot paused.", reply_markup=main_keyboard())
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_logic.pause_until = 0
+    await update.message.reply_text("▶️ Bot resumed.", reply_markup=main_keyboard())
+
+async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for m in MARKETS:
+        bot_logic.market_blocked[m] = False
+        bot_logic.market_pause_until[m] = 0
+        bot_logic.market_losses_today[m] = 0
+    await update.message.reply_text("🔓 All pairs unblocked.", reply_markup=main_keyboard())
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    by_mkt, by_sess, wr = bot_logic.stats_30d()
+    lines = [f"📈 STATS (last {STATS_DAYS}d)\n"]
+    for k, v in sorted(by_mkt.items(), key=lambda x: -x[1]["trades"]):
+        lines.append(f"  {k}: {wr(v):.1f}% ({v['wins']}/{v['trades']})")
+    lines.append("")
+    for k, v in sorted(by_sess.items(), key=lambda x: -x[1]["trades"]):
+        lines.append(f"  {k}: {wr(v):.1f}% ({v['wins']}/{v['trades']})")
+    lines.append(f"\nToday: {bot_logic.total_profit_today:+.2f} | Trades: {bot_logic.trades_today}")
+    await update.message.reply_text("\n".join(lines), reply_markup=main_keyboard())
+
+if __name__ == "__main__":
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    bot_logic.app = app
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(btn_handler))
-    app.add_handler(CommandHandler("setstake",cmd_setstake))
-    app.add_handler(CommandHandler("setmarkets",cmd_setmarkets))
-    app.add_handler(CommandHandler("pause",cmd_pause))
-    app.add_handler(CommandHandler("resume",cmd_resume))
-    app.add_handler(CommandHandler("stats",cmd_stats))
-    app.add_handler(CommandHandler("unblock",cmd_unblock))
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(CommandHandler("pause", cmd_pause))
+    app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("unblock", cmd_unblock))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.create_task(bot_logic.run())
+    app.run_polling(close_loop=False)
