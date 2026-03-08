@@ -809,122 +809,151 @@ async def _safe_edit(q, text, reply_markup=None):
 
 async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q: return
-    bot_logic._known_chat_ids = getattr(bot_logic, "_known_chat_ids", set())
+    if not q:
+        return
+
+    # Register chat ID
+    if not hasattr(bot_logic, "_known_chat_ids"):
+        bot_logic._known_chat_ids = set()
     bot_logic._known_chat_ids.add(q.message.chat_id)
-    await _safe_answer(q)
-    await _safe_edit(q, "⏳ Working...", reply_markup=main_keyboard())
 
-    if q.data == "SET_DEMO":
-        bot_logic.account_type = "DEMO"
-        ok = await bot_logic.connect()
-        await _safe_edit(q, "✅ Connected to DEMO" if ok else "❌ DEMO connection failed", reply_markup=main_keyboard())
+    # Always answer immediately — stops button spinner
+    try:
+        await q.answer()
+    except Exception:
+        pass
 
-    elif q.data == "SET_REAL":
-        bot_logic.account_type = "LIVE"
-        ok = await bot_logic.connect()
-        await _safe_edit(q, "✅ LIVE CONNECTED" if ok else "❌ LIVE connection failed", reply_markup=main_keyboard())
+    # Show working indicator
+    try:
+        await q.edit_message_text("⏳ Working...", reply_markup=main_keyboard())
+    except Exception:
+        pass
 
-    elif q.data == "START_SCAN":
-        if not bot_logic.api:
-            await _safe_edit(q, "❌ Connect first — press DEMO or LIVE.", reply_markup=main_keyboard()); return
-        # Stop any existing scan tasks, then restart fresh
-        bot_logic.is_scanning = False
-        await asyncio.sleep(0.3)
-        bot_logic.is_scanning = True
-        for sym in MARKETS:
-            asyncio.create_task(bot_logic.scan_market(sym))
-        await _safe_edit(q,
-            "🔍 SCANNER ACTIVE\n"
-            "✅ M5 structure | M1 EMA50 cross + RSI + confirm\n"
-            "📡 EURUSD GBPUSD USDJPY AUDUSD GBPJPY",
-            reply_markup=main_keyboard())
+    try:
+        if q.data == "SET_DEMO":
+            bot_logic.account_type = "DEMO"
+            ok = await bot_logic.connect()
+            await _safe_edit(q, "✅ Connected to DEMO" if ok else "❌ DEMO connection failed", reply_markup=main_keyboard())
 
-    elif q.data == "STOP_SCAN":
-        bot_logic.is_scanning = False
-        await _safe_edit(q, "⏹️ Scanner stopped. Press START to begin again.", reply_markup=main_keyboard())
+        elif q.data == "SET_REAL":
+            bot_logic.account_type = "LIVE"
+            ok = await bot_logic.connect()
+            await _safe_edit(q, "✅ LIVE CONNECTED" if ok else "❌ LIVE connection failed", reply_markup=main_keyboard())
 
-    elif q.data == "TEST_BUY":
-        if not bot_logic.api:
-            await _safe_edit(q, "❌ Connect first.", reply_markup=main_keyboard()); return
-        test_symbol = MARKETS[0]
-        asyncio.create_task(bot_logic.execute_trade("CALL", test_symbol,
-            rsi=55.0, body=0.45, level=0.0, ema50=0.0))
-        await _safe_edit(q, f"🧪 Test CALL on {test_symbol.replace('frx','')}.", reply_markup=main_keyboard())
+        elif q.data == "START_SCAN":
+            if not bot_logic.api:
+                await _safe_edit(q, "❌ Connect first — press DEMO or LIVE.", reply_markup=main_keyboard())
+                return
+            # Stop any existing tasks then restart fresh
+            bot_logic.is_scanning = False
+            await asyncio.sleep(0.3)
+            bot_logic.is_scanning = True
+            for sym in MARKETS:
+                asyncio.create_task(bot_logic.scan_market(sym))
+            await _safe_edit(q,
+                "🔍 SCANNER ACTIVE\n"
+                "✅ M5 structure | M1 EMA50 cross + RSI + confirm\n"
+                "📡 EURUSD GBPUSD USDJPY AUDUSD GBPJPY",
+                reply_markup=main_keyboard())
 
-    elif q.data == "PAUSE":
-        bot_logic.pause_until = time.time() + 86400
-        await _safe_edit(q, "⏸ Bot paused for 24 hours.", reply_markup=main_keyboard())
+        elif q.data == "STOP_SCAN":
+            bot_logic.is_scanning = False
+            await _safe_edit(q, "⏹️ Scanner stopped. Press START to begin again.", reply_markup=main_keyboard())
 
-    elif q.data == "RESUME":
-        bot_logic.pause_until = 0
-        await _safe_edit(q, "▶️ Bot resumed.", reply_markup=main_keyboard())
+        elif q.data == "TEST_BUY":
+            if not bot_logic.api:
+                await _safe_edit(q, "❌ Connect first.", reply_markup=main_keyboard())
+                return
+            test_symbol = MARKETS[0]
+            asyncio.create_task(bot_logic.execute_trade("CALL", test_symbol,
+                rsi=55.0, body=0.45, level=0.0, ema50=0.0))
+            await _safe_edit(q, f"🧪 Test CALL on {test_symbol.replace('frx','')}.", reply_markup=main_keyboard())
 
-    elif q.data == "UNBLOCK":
-        for m in MARKETS:
-            bot_logic.market_blocked[m] = False
-            bot_logic.market_pause_until[m] = 0
-            bot_logic.market_losses_today[m] = 0
-        await _safe_edit(q, "🔓 All pairs unblocked.", reply_markup=main_keyboard())
+        elif q.data == "PAUSE":
+            bot_logic.pause_until = time.time() + 86400
+            await _safe_edit(q, "⏸ Bot paused for 24 hours.", reply_markup=main_keyboard())
 
-    elif q.data == "STATUS":
-        now = time.time()
-        if now < bot_logic.status_cooldown_until:
-            await _safe_edit(q, f"⏳ Cooldown: {int(bot_logic.status_cooldown_until - now)}s", reply_markup=main_keyboard()); return
-        bot_logic.status_cooldown_until = now + STATUS_REFRESH_COOLDOWN_SEC
+        elif q.data == "RESUME":
+            bot_logic.pause_until = 0
+            await _safe_edit(q, "▶️ Bot resumed.", reply_markup=main_keyboard())
+
+        elif q.data == "UNBLOCK":
+            for m in MARKETS:
+                bot_logic.market_blocked[m] = False
+                bot_logic.market_pause_until[m] = 0
+                bot_logic.market_losses_today[m] = 0
+            await _safe_edit(q, "🔓 All pairs unblocked.", reply_markup=main_keyboard())
+
+        elif q.data == "STATUS":
+            now = time.time()
+            if now < bot_logic.status_cooldown_until:
+                await _safe_edit(q, f"⏳ Cooldown: {int(bot_logic.status_cooldown_until - now)}s", reply_markup=main_keyboard())
+                return
+            bot_logic.status_cooldown_until = now + STATUS_REFRESH_COOLDOWN_SEC
+            try:
+                await asyncio.wait_for(bot_logic.fetch_balance(), timeout=3.0)
+            except Exception:
+                pass
+            now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
+            _, gate = bot_logic.can_auto_trade()
+            trade_status = "No Active Trade"
+            if bot_logic.active_trade_info:
+                rem = max(0, int(EXPIRY_MIN * 60) - int(time.time() - bot_logic.trade_start_time))
+                trade_status = f"🚀 Active Trade ({bot_logic.active_market.replace('frx','')})\n⏳ Left: ~{rem}s"
+            next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(bot_logic.martingale_step)))
+            by_mkt, by_sess, wr = bot_logic.stats_30d()
+            def fmt_stats(title, items):
+                rows = [(k, wr(v), v["trades"], v["wins"]) for k, v in items.items()]
+                rows.sort(key=lambda x: (x[1], x[2]), reverse=True)
+                lines_ = [f"{title} (last {STATS_DAYS}d):"]
+                if not rows:
+                    lines_.append("— No trades yet")
+                    return "\n".join(lines_)
+                for k, wrr, t, w in rows:
+                    lines_.append(f"- {k}: {wrr:.1f}% ({w}/{t})")
+                return "\n".join(lines_)
+            stats_block = "📈 PERFORMANCE\n" + fmt_stats("Pairs", by_mkt) + "\n" + fmt_stats("Sessions", by_sess) + "\n"
+            mkt_lines = ["🛡 Pair Status:"]
+            for m in MARKETS:
+                ml = bot_logic.market_losses_today.get(m, 0)
+                mt = bot_logic.market_trades_today.get(m, 0)
+                mb = bot_logic.market_blocked.get(m, False)
+                mp = bot_logic.market_pause_until.get(m, 0)
+                status = "🚫 BLOCKED" if mb else ("⏸ PAUSED" if time.time() < mp else "✅")
+                mkt_lines.append(f"{status} {m.replace('frx','')}: {mt}/{MAX_TRADES_PER_MARKET} | {ml}/{MAX_LOSSES_PER_MARKET} losses")
+            mkt_block = "\n".join(mkt_lines) + "\n"
+            _, _, stake_mult = bot_logic._equity_ok()
+            eq_ratio = bot_logic._get_current_balance_float() / bot_logic.starting_balance if bot_logic.starting_balance > 0 else 1.0
+            pause_line = "⏸ Paused\n" if time.time() < bot_logic.pause_until else ""
+            header = (
+                f"🕒 {now_time}\n"
+                f"🤖 {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
+                f"{pause_line}"
+                f"🎁 Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
+                f"🧯 Max stake: ${MAX_STAKE_ALLOWED:.2f} | Mult: {stake_mult:.1f}x\n"
+                f"💰 Equity: {eq_ratio:.0%} | 🔒 Lock: {'ON +${:.2f}'.format(PROFIT_LOCK_FLOOR) if bot_logic.profit_lock_active else 'OFF'}\n"
+                f"🎯 Target: +${DAILY_PROFIT_TARGET:.2f} | Limit: ${DAILY_LOSS_LIMIT:.2f}\n"
+                f"📡 Pairs: EURUSD GBPUSD USDJPY AUDUSD GBPJPY\n"
+                f"🧭 M5 structure levels | M1 EMA50 cross + RSI + confirm | {EXPIRY_MIN}m expiry\n"
+                f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
+                f"{stats_block}{mkt_block}"
+                f"💵 PnL: {bot_logic.total_profit_today:+.2f} | Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY}\n"
+                f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | Losses: {bot_logic.total_losses_today}\n"
+                f"🚦 Gate: {gate}\n"
+                f"💰 Balance: {bot_logic.balance}\n"
+                f"\n/pause /resume /unblock /stats"
+            )
+            details = "\n\n📌 LIVE SCAN\n\n" + "\n\n".join([
+                format_market_detail(sym, bot_logic.market_debug.get(sym, {})) for sym in MARKETS
+            ])
+            await _safe_edit(q, header + details, reply_markup=main_keyboard())
+
+    except Exception as e:
+        logger.error(f"btn_handler error: {e}")
         try:
-            await asyncio.wait_for(bot_logic.fetch_balance(), timeout=3.0)
-        except: pass
-        now_time = datetime.now(ZoneInfo("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
-        _, gate = bot_logic.can_auto_trade()
-        trade_status = "No Active Trade"
-        if bot_logic.active_trade_info:
-            rem = max(0, int(EXPIRY_MIN * 60) - int(time.time() - bot_logic.trade_start_time))
-            trade_status = f"🚀 Active Trade ({bot_logic.active_market.replace('frx','')})\n⏳ Left: ~{rem}s"
-        next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(bot_logic.martingale_step)))
-        by_mkt, by_sess, wr = bot_logic.stats_30d()
-        def fmt_stats(title, items):
-            rows = [(k, wr(v), v["trades"], v["wins"]) for k, v in items.items()]
-            rows.sort(key=lambda x: (x[1], x[2]), reverse=True)
-            lines = [f"{title} (last {STATS_DAYS}d):"]
-            if not rows: lines.append("— No trades yet"); return "\n".join(lines)
-            for k, wrr, t, w in rows: lines.append(f"- {k}: {wrr:.1f}% ({w}/{t})")
-            return "\n".join(lines)
-        stats_block = "📈 PERFORMANCE\n" + fmt_stats("Pairs", by_mkt) + "\n" + fmt_stats("Sessions", by_sess) + "\n"
-        mkt_lines = ["🛡 Pair Status:"]
-        for m in MARKETS:
-            ml = bot_logic.market_losses_today.get(m, 0)
-            mt = bot_logic.market_trades_today.get(m, 0)
-            mb = bot_logic.market_blocked.get(m, False)
-            mp = bot_logic.market_pause_until.get(m, 0)
-            status = "🚫 BLOCKED" if mb else ("⏸ PAUSED" if time.time() < mp else "✅")
-            mkt_lines.append(f"{status} {m.replace('frx','')}: {mt}/{MAX_TRADES_PER_MARKET} | {ml}/{MAX_LOSSES_PER_MARKET} losses")
-        mkt_block = "\n".join(mkt_lines) + "\n"
-        _, _, stake_mult = bot_logic._equity_ok()
-        eq_ratio = bot_logic._get_current_balance_float() / bot_logic.starting_balance if bot_logic.starting_balance > 0 else 1.0
-        pause_line = "⏸ Paused\n" if time.time() < bot_logic.pause_until else ""
-        header = (
-            f"🕒 {now_time}\n"
-            f"🤖 {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-            f"{pause_line}"
-            f"🎁 Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
-            f"🧯 Max stake: ${MAX_STAKE_ALLOWED:.2f} | Mult: {stake_mult:.1f}x\n"
-            f"💰 Equity: {eq_ratio:.0%} | 🔒 Lock: {'ON +${:.2f}'.format(PROFIT_LOCK_FLOOR) if bot_logic.profit_lock_active else 'OFF'}\n"
-            f"🎯 Target: +${DAILY_PROFIT_TARGET:.2f} | Limit: ${DAILY_LOSS_LIMIT:.2f}\n"
-            f"📡 Pairs: EURUSD GBPUSD USDJPY AUDUSD GBPJPY\n"
-            f"🧭 M5 structure levels | M1 EMA50 cross + RSI + confirm | {EXPIRY_MIN}m expiry\n"
-            f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
-            f"{stats_block}{mkt_block}"
-            f"💵 PnL: {bot_logic.total_profit_today:+.2f} | Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY}\n"
-            f"📉 Streak: {bot_logic.consecutive_losses}/{MAX_CONSEC_LOSSES} | Losses: {bot_logic.total_losses_today}\n"
-            f"🚦 Gate: {gate}\n"
-            f"💰 Balance: {bot_logic.balance}\n"
-            f"\n/pause /resume /unblock /stats"
-        )
-        details = "\n\n📌 LIVE SCAN\n\n" + "\n\n".join([
-            format_market_detail(sym, bot_logic.market_debug.get(sym, {})) for sym in MARKETS
-        ])
-        await _safe_edit(q, header + details, reply_markup=main_keyboard())
+            await q.answer("⚠️ Error occurred. Try again.")
+        except Exception:
+            pass
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_logic._known_chat_ids = getattr(bot_logic, "_known_chat_ids", set())
