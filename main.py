@@ -367,18 +367,7 @@ class StructureBreakBot:
             self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
         except: pass
 
-    async def start_scanning(self):
-        self.is_scanning = True
-        tasks = [asyncio.create_task(self.scan_market(s)) for s in MARKETS]
-        await asyncio.gather(*tasks)
-        try:
-            res = await asyncio.wait_for(self.api.balance({"balance": 1, "subscribe": 0}), timeout=5.0)
-            bal = res.get("balance", {})
-            self.balance = f"{float(bal.get('balance', 0)):.2f} {bal.get('currency', 'USD')}"
-            if self.starting_balance <= 0:
-                self.starting_balance = float(bal.get("balance", 0))
-        except Exception as e:
-            logger.warning(f"Balance fetch failed: {e}")
+    # start_scanning() removed — scanning controlled by Telegram buttons
 
     async def safe_deriv_call(self, method, params, retries=3):
         for attempt in range(retries):
@@ -839,20 +828,21 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data == "START_SCAN":
         if not bot_logic.api:
             await _safe_edit(q, "❌ Connect first — press DEMO or LIVE.", reply_markup=main_keyboard()); return
-        if bot_logic.is_scanning:
-            await _safe_edit(q, "⚠️ Already scanning. Press STOP first to restart.", reply_markup=main_keyboard()); return
+        # Stop any existing scan tasks, then restart fresh
+        bot_logic.is_scanning = False
+        await asyncio.sleep(0.3)
         bot_logic.is_scanning = True
         for sym in MARKETS:
             asyncio.create_task(bot_logic.scan_market(sym))
         await _safe_edit(q,
             "🔍 SCANNER ACTIVE\n"
-            "✅ Structure Break | M5 + M1 | EMA50 cross window 3\n"
+            "✅ M5 structure | M1 EMA50 cross + RSI + confirm\n"
             "📡 EURUSD GBPUSD USDJPY AUDUSD GBPJPY",
             reply_markup=main_keyboard())
 
     elif q.data == "STOP_SCAN":
         bot_logic.is_scanning = False
-        await _safe_edit(q, "⏹️ Scanner stopped.", reply_markup=main_keyboard())
+        await _safe_edit(q, "⏹️ Scanner stopped. Press START to begin again.", reply_markup=main_keyboard())
 
     elif q.data == "TEST_BUY":
         if not bot_logic.api:
