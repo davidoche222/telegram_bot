@@ -776,10 +776,13 @@ def format_market_detail(sym, d):
     m1_bull = d.get("m1_bullish", False); m1_bear = d.get("m1_bearish", False)
     mkt_losses = d.get("mkt_losses", 0); mkt_trades = d.get("mkt_trades", 0)
     last_m5 = d.get("last_m5", 0)
-    ema50_str = "UP ✅" if ema50_bull else ("DOWN ✅" if ema50_bear else "\u2014 No cross")
-    rsi_str = f"crossed {'UP' if rsi_bull else 'DOWN'} ✅" if (rsi_bull or rsi_bear) else f"\u2014 {m1_rsi_prev}\u2192{m1_rsi}"
-    break_str = "BULLISH BREAK" if bullish else ("BEARISH BREAK" if bearish else "\u2014 No break")
-    m1_str = "Bullish ✅" if m1_bull else ("Bearish ✅" if m1_bear else "\u2014 Doji")
+    vol_str = "OK" if vol_ok else "Low"
+    body_str = "OK" if body_ok else "weak"
+    ema50_str = "UP OK" if ema50_bull else ("DOWN OK" if ema50_bear else "-- No cross")
+    rsi_dir = "UP" if rsi_bull else "DOWN"
+    rsi_str = ("crossed " + rsi_dir + " OK") if (rsi_bull or rsi_bear) else ("-- " + str(m1_rsi_prev) + "->" + str(m1_rsi))
+    break_str = "BULLISH BREAK" if bullish else ("BEARISH BREAK" if bearish else "-- No break")
+    m1_str = "Bullish OK" if m1_bull else ("Bearish OK" if m1_bear else "-- Doji")
     return (
         f"\U0001f4cd {sym.replace('frx','')} ({age}s ago)\n"
         f"Market: {d.get('mkt_msg','OK')} | {mkt_trades}/{MAX_TRADES_PER_MARKET} | {mkt_losses}/{MAX_LOSSES_PER_MARKET} losses\n"
@@ -787,13 +790,13 @@ def format_market_detail(sym, d):
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"Structure: High {swing_high} | Low {swing_low}\n"
         f"M5 EMA50: {ema50} | Cross: {ema50_str}\n"
-        f"M5 Volatility: {'OK' if vol_ok else 'Low'}\n"
-        f"M5 Body: {body} {'OK' if body_ok else 'weak'}\n"
+        f"M5 Volatility: {vol_str}\n"
+        f"M5 Body: {body} {body_str}\n"
         f"M1 RSI cross: {rsi_str}\n"
         f"M1 candle: {m1_str}\n"
         f"{break_str}\n"
         f"Signal: {signal}\n"
-        f"Why: {why[0] if why else '\u2014'}\n"
+        f"Why: {why[0] if why else '--'}\n"
     )
 
 async def _safe_answer(q, text=None, show_alert=False):
@@ -924,14 +927,16 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mkt_block = "\n".join(mkt_lines) + "\n"
             _, _, stake_mult = bot_logic._equity_ok()
             eq_ratio = bot_logic._get_current_balance_float() / bot_logic.starting_balance if bot_logic.starting_balance > 0 else 1.0
-            pause_line = "⏸ Paused\n" if time.time() < bot_logic.pause_until else ""
+            pause_line = "Paused" if time.time() < bot_logic.pause_until else ""
+            scan_status = "ACTIVE" if bot_logic.is_scanning else "OFFLINE"
+            lock_str = ("ON +$" + f"{PROFIT_LOCK_FLOOR:.2f}") if bot_logic.profit_lock_active else "OFF"
             header = (
                 f"🕒 {now_time}\n"
-                f"🤖 {'ACTIVE' if bot_logic.is_scanning else 'OFFLINE'} ({bot_logic.account_type})\n"
-                f"{pause_line}"
+                f"🤖 {scan_status} ({bot_logic.account_type})\n"
+                f"{pause_line + chr(10) if pause_line else ""}"
                 f"🎁 Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
                 f"🧯 Max stake: ${MAX_STAKE_ALLOWED:.2f} | Mult: {stake_mult:.1f}x\n"
-                f"💰 Equity: {eq_ratio:.0%} | 🔒 Lock: {'ON +${:.2f}'.format(PROFIT_LOCK_FLOOR) if bot_logic.profit_lock_active else 'OFF'}\n"
+                f"💰 Equity: {eq_ratio:.0%} | 🔒 Lock: {lock_str}\n"
                 f"🎯 Target: +${DAILY_PROFIT_TARGET:.2f} | Limit: ${DAILY_LOSS_LIMIT:.2f}\n"
                 f"📡 Pairs: EURUSD GBPUSD USDJPY AUDUSD GBPJPY\n"
                 f"🧭 M5 structure levels | M1 EMA50 cross + RSI + confirm | {EXPIRY_MIN}m expiry\n"
