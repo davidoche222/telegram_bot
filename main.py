@@ -364,7 +364,7 @@ class StructureBreakBot:
         if not self.api: return
         try:
             bal = await self.safe_deriv_call("balance", {"balance": 1}, retries=4)
-            self.balance = f"{float(bal['balance']['balance']):.2f} {bal['balance']['currency']}"
+            self.balance = "{:.2f} {}".format(float(bal['balance']['balance']), bal['balance']['currency'])
         except: pass
 
     # start_scanning() removed — scanning controlled by Telegram buttons
@@ -595,21 +595,21 @@ class StructureBreakBot:
                         "why": ["Not enough M5 swing points yet"]}
                     continue
 
-                # Current M5 candle (last confirmed)
-                cur_open  = m5_opens[-1]
-                cur_close = m5_closes[-1]
-                cur_high  = m5_highs[-1]
-                cur_low   = m5_lows[-1]
-                confirm_t0 = m5_confirmed[-1]["epoch"]
+                # Current M1 candle (last confirmed) — break detected on M1
+                cur_open  = m1_confirmed[-1]["open"]
+                cur_close = m1_confirmed[-1]["close"]
+                cur_high  = m1_confirmed[-1]["high"]
+                cur_low   = m1_confirmed[-1]["low"]
+                confirm_t0 = m1_confirmed[-1]["epoch"]
 
-                # Skip if already processed this M5 candle
+                # Skip if already processed this M1 candle
                 if self.last_processed_m5_t0.get(symbol) == confirm_t0:
                     continue
 
                 # ── VOLATILITY (M5) ───────────────────────────────────
                 vol_ok = m5_atr > m5_atr_sma
 
-                # ── BODY RATIO (M5 break candle) ─────────────────────
+                # ── BODY RATIO (M1 break candle) ─────────────────────
                 candle_body = body_ratio(cur_open, cur_close, cur_high, cur_low)
                 body_ok = candle_body >= BODY_RATIO_MIN
 
@@ -796,7 +796,7 @@ def format_market_detail(sym, d):
         f"M1 candle: {m1_str}\n"
         f"{break_str}\n"
         f"Signal: {signal}\n"
-        f"Why: {why[0] if why else '--'}\n"
+        f"Why: {why[0] if why else chr(8212)}\n"
     )
 
 async def _safe_answer(q, text=None, show_alert=False):
@@ -996,10 +996,12 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     by_mkt, by_sess, wr = bot_logic.stats_30d()
     lines = [f"📈 STATS (last {STATS_DAYS}d)\n"]
     for k, v in sorted(by_mkt.items(), key=lambda x: -x[1]["trades"]):
-        lines.append(f"  {k}: {wr(v):.1f}% ({v['wins']}/{v['trades']})")
+        wins = v["wins"]; trades = v["trades"]
+        lines.append(f"  {k}: {wr(v):.1f}% ({wins}/{trades})")
     lines.append("")
     for k, v in sorted(by_sess.items(), key=lambda x: -x[1]["trades"]):
-        lines.append(f"  {k}: {wr(v):.1f}% ({v['wins']}/{v['trades']})")
+        wins = v["wins"]; trades = v["trades"]
+        lines.append(f"  {k}: {wr(v):.1f}% ({wins}/{trades})")
     lines.append(f"\nToday: {bot_logic.total_profit_today:+.2f} | Trades: {bot_logic.trades_today}")
     await update.message.reply_text("\n".join(lines), reply_markup=main_keyboard())
 
