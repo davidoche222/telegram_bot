@@ -600,11 +600,6 @@ class StructureBreakBot:
                 cur_close = m1_confirmed[-1]["close"]
                 cur_high  = m1_confirmed[-1]["high"]
                 cur_low   = m1_confirmed[-1]["low"]
-                confirm_t0 = m1_confirmed[-1]["epoch"]
-
-                # Skip if already processed this M1 candle
-                if self.last_processed_m5_t0.get(symbol) == confirm_t0:
-                    continue
 
                 # ── VOLATILITY (M5) ───────────────────────────────────
                 vol_ok = m5_atr > m5_atr_sma
@@ -696,7 +691,7 @@ class StructureBreakBot:
                 # ── DEBUG ─────────────────────────────────────────────
                 self.market_debug[symbol] = {
                     "time": time.time(), "gate": gate, "mkt_msg": mkt_msg,
-                    "last_m5": confirm_t0, "signal": signal,
+                    "last_m5": m1_confirmed[-1]["epoch"], "signal": signal,
                     "m1_ema50": round(m1_ema50, 5) if m1_ema50 else None,
                     "swing_high": round(last_swing_high, 5),
                     "swing_low": round(last_swing_low, 5),
@@ -716,7 +711,6 @@ class StructureBreakBot:
                     "why": [reason]
                 }
 
-                self.last_processed_m5_t0[symbol] = confirm_t0
                 if not ok_gate or not mkt_ok: continue
                 if signal is None: continue
 
