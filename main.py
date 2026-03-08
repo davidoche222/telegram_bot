@@ -928,12 +928,13 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, _, stake_mult = bot_logic._equity_ok()
             eq_ratio = bot_logic._get_current_balance_float() / bot_logic.starting_balance if bot_logic.starting_balance > 0 else 1.0
             pause_line = "Paused" if time.time() < bot_logic.pause_until else ""
+            pause_line_nl = ("⏸ Paused\n") if time.time() < bot_logic.pause_until else ""
             scan_status = "ACTIVE" if bot_logic.is_scanning else "OFFLINE"
             lock_str = ("ON +$" + f"{PROFIT_LOCK_FLOOR:.2f}") if bot_logic.profit_lock_active else "OFF"
             header = (
                 f"🕒 {now_time}\n"
                 f"🤖 {scan_status} ({bot_logic.account_type})\n"
-                f"{pause_line + chr(10) if pause_line else ""}"
+                f"{pause_line_nl}"
                 f"🎁 Next payout: ${next_payout:.2f} | Step: {bot_logic.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
                 f"🧯 Max stake: ${MAX_STAKE_ALLOWED:.2f} | Mult: {stake_mult:.1f}x\n"
                 f"💰 Equity: {eq_ratio:.0%} | 🔒 Lock: {lock_str}\n"
