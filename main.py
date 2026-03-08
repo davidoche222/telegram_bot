@@ -4,10 +4,12 @@ Strategy: Structure Break + EMA50 Confirmation
 Markets: EURUSD, GBPUSD, USDJPY, AUDUSD, GBPJPY
 
 Entry Logic:
-- Detect swing highs/lows on M5 (structure levels)
-- Enter when price CLOSES beyond structure AND EMA50
-- Confirm with RSI cross 50, ATR momentum, body ratio, next candle
-- EMA50 cross confirms institutional bias shift
+- M5: detect swing highs/lows (structure levels)
+- M5: price closes beyond structure AND crosses EMA50 same candle
+- M1: RSI genuinely crosses 50 in break direction (prev below, now above)
+- M1: next candle body confirms direction
+- ATR expansion confirms real momentum
+- Body ratio blocks spike candles
 """
 
 import asyncio, time, logging, json, os
@@ -39,19 +41,20 @@ MAX_CONSEC_LOSSES       = 5      # global stop
 COOLDOWN_SEC            = 180    # 3 min after every trade
 
 # ===== STRATEGY =====
-TF_M1_SEC           = 60
-CANDLES_M1          = 150        # need more candles for swing detection
-EXPIRY_MIN          = 3          # 3 min expiry for M1 structure breaks
-EMA_PERIOD          = 50         # EMA50 on M1
-ATR_PERIOD          = 14
-ATR_SMA_PERIOD      = 20
-RSI_PERIOD          = 14
-SWING_LOOKBACK      = 5          # candles left and right to identify swing point
-BODY_RATIO_MIN      = 0.35       # breaking candle must have genuine body (not a pure wick spike)
-CONFIRM_NEXT_CANDLE = True       # wait for next candle to confirm break
+TF_M5_SEC           = 300        # M5 for structure detection
+TF_M1_SEC           = 60         # M1 for entry confirmation
+CANDLES_M5          = 150        # enough for swing detection + EMA50
+CANDLES_M1          = 60         # enough for RSI + confirmation
+EXPIRY_MIN          = 5          # 5 min expiry — aligned with M5 structure
+EMA_PERIOD          = 50         # EMA50 on M1 (cross detection)
+ATR_PERIOD          = 14         # ATR on M5
+ATR_SMA_PERIOD      = 20         # ATR average for volatility filter
+RSI_PERIOD          = 14         # RSI on M1
+SWING_LOOKBACK      = 5          # candles each side to confirm swing point
+BODY_RATIO_MIN      = 0.35       # M5 break candle minimum body strength
 
 # Weekend block only — trading all sessions to collect data
-FOREX_WEEKEND_BLOCK = True
+FOREX_WEEKEND_BLOCK = False  # trading all days including weekends
 
 # ===== MARTINGALE =====
 MARTINGALE_MULT      = 2
@@ -244,7 +247,7 @@ class StructureBreakBot:
 
         # debug
         self.market_debug = {}
-        self.last_processed_m1_t0 = {}
+        self.last_processed_m5_t0 = {}
 
         # trade history
         self.trade_history = []
@@ -391,8 +394,6 @@ class StructureBreakBot:
     async def safe_send_tg(self, text, parse_mode=None):
         if not self.app: return
         try:
-            chat_id = TELEGRAM_TOKEN.split(":")[0]
-            # get chat id from first update — fallback to owner
             for uid in getattr(self, "_known_chat_ids", []):
                 try:
                     kwargs = {"chat_id": uid, "text": text[:4000]}
@@ -434,7 +435,7 @@ class StructureBreakBot:
             if ask_price > float(MAX_STAKE_ALLOWED):
                 await self.safe_send_tg(f"⛔️ Skipped: stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}")
                 self.cooldown_until = time.time() + COOLDOWN_SEC; return
-            buy = await self.safe_deriv_call("buy", {"buy": proposal_id, "price": float(MAX_STAKE_ALLOWED)}, retries=1)
+            buy = await self.safe_deriv_call("buy", {"buy": proposal_id, "price": ask_price}, retries=1)
             if "error" in buy:
                 await self.safe_send_tg(f"⚠️ Buy error {symbol}: {buy['error'].get('message','?')}")
                 self.cooldown_until = time.time() + COOLDOWN_SEC; return
@@ -475,7 +476,9 @@ class StructureBreakBot:
                     profit = float(c.get("sell_price", 0)) - float(c.get("buy_price", 0))
                     break
             if profit is None:
-                profit = payout - stake  # fallback estimate
+                logger.warning(f"Contract {contract_id} not found in profit_table — marking UNKNOWN")
+                await self.safe_send_tg(f"⚠️ Could not verify result for contract {contract_id}. Check manually.")
+                return
             won = profit > 0
             self.total_profit_today = round(self.total_profit_today + profit, 2)
             self.trades_today += 1
@@ -542,110 +545,133 @@ class StructureBreakBot:
                 ok_gate, gate = self.can_auto_trade()
                 mkt_ok, mkt_msg = self._is_market_available(symbol)
 
-                # Fetch M1 candles only
-                candles_m1 = await self.fetch_candles_with_timeout(symbol, TF_M1_SEC, CANDLES_M1)
+                # ── FETCH CANDLES ─────────────────────────────────────
+                m5_task = asyncio.create_task(
+                    self.fetch_candles_with_timeout(symbol, TF_M5_SEC, CANDLES_M5))
+                m1_task = asyncio.create_task(
+                    self.fetch_candles_with_timeout(symbol, TF_M1_SEC, CANDLES_M1))
+                candles_m5, candles_m1 = await asyncio.gather(m5_task, m1_task)
 
-                if len(candles_m1) < EMA_PERIOD + SWING_LOOKBACK + 10:
+                if len(candles_m5) < EMA_PERIOD + SWING_LOOKBACK + 10:
                     self.market_debug[symbol] = {"time": time.time(), "gate": gate,
-                        "why": [f"Warming up M1:{len(candles_m1)}"]}
+                        "why": [f"Warming up M5:{len(candles_m5)} M1:{len(candles_m1)}"]}
                     continue
 
-                # Use confirmed closed candles only
-                m1_confirmed = candles_m1[:-1]
+                # Confirmed closed candles only
+                m5_confirmed = candles_m5[:-1]
+                m1_confirmed = candles_m1[:-1] if len(candles_m1) > 1 else []
 
-                if len(m1_confirmed) < EMA_PERIOD + SWING_LOOKBACK + 5:
+                if len(m5_confirmed) < EMA_PERIOD + SWING_LOOKBACK + 5:
+                    continue
+                if len(m1_confirmed) < RSI_PERIOD + 3:
                     continue
 
-                # Extract M1 OHLC
-                m1_opens  = [c["open"]  for c in m1_confirmed]
+                # ── M5 OHLC ──────────────────────────────────────────
+                m5_highs  = [c["high"]  for c in m5_confirmed]
+                m5_lows   = [c["low"]   for c in m5_confirmed]
+                m5_opens  = [c["open"]  for c in m5_confirmed]
+                m5_closes = [c["close"] for c in m5_confirmed]
+
+                # ── M1 OHLC ──────────────────────────────────────────
+                m1_closes = [c["close"] for c in m1_confirmed]
                 m1_highs  = [c["high"]  for c in m1_confirmed]
                 m1_lows   = [c["low"]   for c in m1_confirmed]
-                m1_closes = [c["close"] for c in m1_confirmed]
 
-                # M1 OHLC all extracted above
-                m1_prev   = m1_confirmed[-2] if len(m1_confirmed) >= 2 else None
-                m1_last   = m1_confirmed[-1]
+                # ── M5 INDICATORS (structure + volatility only) ───────
+                m5_atrs    = calculate_atr(m5_highs, m5_lows, m5_closes, ATR_PERIOD)
+                m5_atr     = float(m5_atrs[-1]) if m5_atrs else None
+                m5_atr_sma = float(np.mean([x for x in m5_atrs[-ATR_SMA_PERIOD-1:-1] if x])) if m5_atrs else None
 
-                # ── INDICATORS ──────────────────────────────────────
+                # ── M1 INDICATORS (EMA50 cross + RSI cross) ───────────
+                # EMA50 on M1 — faster, catches trend change sooner
                 m1_ema50_series = calculate_ema_series(m1_closes, EMA_PERIOD)
-                m1_ema50 = m1_ema50_series[-1] if m1_ema50_series else None
-                m1_ema50_prev = m1_ema50_series[-2] if m1_ema50_series and len(m1_ema50_series) >= 2 else None
+                m1_ema50        = m1_ema50_series[-1] if m1_ema50_series else None
 
-                m1_atrs = calculate_atr(m1_highs, m1_lows, m1_closes, ATR_PERIOD)
-                m1_atr = float(m1_atrs[-1]) if m1_atrs else None
-                m1_atr_sma = float(np.mean([x for x in m1_atrs[-ATR_SMA_PERIOD-1:-1] if x])) if m1_atrs else None
+                # RSI — need last 2 values for genuine cross detection
+                m1_rsi_now  = calculate_rsi(m1_closes, RSI_PERIOD)
+                m1_rsi_prev = calculate_rsi(m1_closes[:-1], RSI_PERIOD)
 
-                # (ADX removed — structure break itself confirms momentum)
-                m1_rsi = calculate_rsi(m1_closes, RSI_PERIOD)
-
-                if any(v is None for v in [m1_ema50, m1_ema50_prev, m1_atr, m1_atr_sma, m1_rsi]):
+                if any(v is None for v in [m1_ema50, m5_atr, m5_atr_sma,
+                                           m1_rsi_now, m1_rsi_prev]):
                     self.market_debug[symbol] = {"time": time.time(), "gate": gate,
                         "why": ["Indicators warming up"]}
                     continue
 
-                # ── STRUCTURE LEVELS ─────────────────────────────────
-                last_swing_high, last_swing_low = get_structure_levels(m1_highs, m1_lows, SWING_LOOKBACK)
+                # ── STRUCTURE LEVELS (M5) ─────────────────────────────
+                last_swing_high, last_swing_low = get_structure_levels(
+                    m5_highs, m5_lows, SWING_LOOKBACK)
 
                 if last_swing_high is None or last_swing_low is None:
                     self.market_debug[symbol] = {"time": time.time(), "gate": gate,
-                        "why": ["Not enough swing points yet"]}
+                        "why": ["Not enough M5 swing points yet"]}
                     continue
 
-                # Current M1 candle (last confirmed)
-                cur_open  = m1_opens[-1]
-                cur_close = m1_closes[-1]
-                cur_high  = m1_highs[-1]
-                cur_low   = m1_lows[-1]
-                confirm_t0 = m1_confirmed[-1]["epoch"]
+                # Current M5 candle (last confirmed)
+                cur_open  = m5_opens[-1]
+                cur_close = m5_closes[-1]
+                cur_high  = m5_highs[-1]
+                cur_low   = m5_lows[-1]
+                confirm_t0 = m5_confirmed[-1]["epoch"]
 
-                # Skip if already processed this candle
-                if self.last_processed_m1_t0.get(symbol) == confirm_t0:
+                # Skip if already processed this M5 candle
+                if self.last_processed_m5_t0.get(symbol) == confirm_t0:
                     continue
 
-                # ── VOLATILITY ───────────────────────────────────────
-                vol_ok = m1_atr > m1_atr_sma
+                # ── VOLATILITY (M5) ───────────────────────────────────
+                vol_ok = m5_atr > m5_atr_sma
 
-                # ── BODY RATIO ───────────────────────────────────────
+                # ── BODY RATIO (M5 break candle) ─────────────────────
                 candle_body = body_ratio(cur_open, cur_close, cur_high, cur_low)
                 body_ok = candle_body >= BODY_RATIO_MIN
 
-                # ── EMA50 CROSS DETECTION ─────────────────────────────
-                # Previous candle was on one side, current candle crossed to other side
-                prev_close = m1_closes[-2] if len(m1_closes) >= 2 else None
-                ema50_bullish_cross = (
-                    prev_close is not None and
-                    m1_ema50_prev is not None and
-                    prev_close < m1_ema50_prev and
-                    cur_close > m1_ema50
-                )
-                ema50_bearish_cross = (
-                    prev_close is not None and
-                    m1_ema50_prev is not None and
-                    prev_close > m1_ema50_prev and
-                    cur_close < m1_ema50
-                )
+                # ── EMA50 CROSS WITHIN 3 M1 CANDLE WINDOW ────────────────
+                # EMA50 on M1 — cross must have happened in last 3 M1 candles
+                # Faster trend change detection vs M5 EMA cross
+                EMA_CROSS_WINDOW = 3
+                ema50_bull_cross = False
+                ema50_bear_cross = False
+                ema50_cross_candle = None  # how many M1 candles ago the cross happened
 
-                # ── STRUCTURE BREAK DETECTION ────────────────────────
-                # BULLISH break: close above last swing high AND crossed EMA50 upward
+                for lookback_i in range(min(EMA_CROSS_WINDOW + 1, len(m1_closes) - 1)):
+                    idx_cur  = -(1 + lookback_i)
+                    idx_prev = -(2 + lookback_i)
+                    if abs(idx_prev) > len(m1_closes) or abs(idx_prev) > len(m1_ema50_series): break
+                    c_cur  = m1_closes[idx_cur]
+                    c_prev = m1_closes[idx_prev]
+                    e_cur  = m1_ema50_series[idx_cur]
+                    e_prev = m1_ema50_series[idx_prev]
+                    if e_cur is None or e_prev is None: break
+                    if c_prev < e_prev and c_cur > e_cur:   # bullish cross on M1
+                        ema50_bull_cross = True
+                        ema50_cross_candle = lookback_i
+                        break
+                    if c_prev > e_prev and c_cur < e_cur:   # bearish cross on M1
+                        ema50_bear_cross = True
+                        ema50_cross_candle = lookback_i
+                        break
+
+                # ── STRUCTURE BREAK (M5) ──────────────────────────────
+                # EMA50 cross must have happened within last 3 candles
+                # Structure break = price closes beyond level in direction of recent cross
                 bullish_break = (
-                    cur_close > last_swing_high and
-                    cur_open < last_swing_high and    # started below = genuine break
-                    ema50_bullish_cross               # EMA50 crossed same candle
+                    cur_close > last_swing_high and      # closed above swing high
+                    cur_open  < last_swing_high and      # started below — genuine break
+                    ema50_bull_cross                      # EMA50 crossed bullish recently
                 )
-
-                # BEARISH break: close below last swing low AND crossed EMA50 downward
                 bearish_break = (
-                    cur_close < last_swing_low and
-                    cur_open > last_swing_low and     # started above = genuine break
-                    ema50_bearish_cross               # EMA50 crossed same candle
+                    cur_close < last_swing_low and       # closed below swing low
+                    cur_open  > last_swing_low and       # started above — genuine break
+                    ema50_bear_cross                      # EMA50 crossed bearish recently
                 )
 
-                # ── RSI CONFIRMATION ──────────────────────────────────
-                rsi_call_ok = m1_rsi > 50
-                rsi_put_ok  = m1_rsi < 50
+                # ── RSI GENUINE CROSS (M1) ────────────────────────────
+                # Previous RSI on one side of 50, current RSI crossed to other
+                rsi_bull_cross = m1_rsi_prev < 50 and m1_rsi_now >= 50
+                rsi_bear_cross = m1_rsi_prev > 50 and m1_rsi_now <= 50
 
-                # ── NEXT CANDLE CONFIRMATION ──────────────────────────
-                # Check M1 last candle continues in break direction
+                # ── NEXT M1 CANDLE CONFIRMATION ───────────────────────
+                # The last M1 confirmed candle must be moving in break direction
+                m1_last = m1_confirmed[-1]
                 m1_bullish = m1_last["close"] > m1_last["open"]
                 m1_bearish = m1_last["close"] < m1_last["open"]
 
@@ -654,29 +680,29 @@ class StructureBreakBot:
                 reason = "Scanning..."
 
                 if not vol_ok:
-                    reason = f"Volatility too low — ATR({m1_atr:.5f}) < SMA({m1_atr_sma:.5f})"
+                    reason = f"Volatility low — M5 ATR({m5_atr:.5f}) < avg({m5_atr_sma:.5f})"
                 elif bullish_break:
                     if not body_ok:
-                        reason = f"Weak break candle — body ratio {candle_body:.2f} < {BODY_RATIO_MIN}"
-                    elif not rsi_call_ok:
-                        reason = f"RSI not confirming CALL — {m1_rsi:.1f} < 50"
+                        reason = f"Weak M5 candle — body {candle_body:.2f} < {BODY_RATIO_MIN}"
+                    elif not rsi_bull_cross:
+                        reason = f"RSI no cross — prev {m1_rsi_prev:.1f} | now {m1_rsi_now:.1f} (need cross above 50)"
                     elif not m1_bullish:
-                        reason = "M1 candle not bullish — waiting for confirmation"
+                        reason = "M1 candle not bullish — waiting for M1 confirmation"
                     else:
                         signal = "CALL"
-                        reason = f"✅ Bullish structure break — closed above {last_swing_high:.5f} + EMA50"
+                        reason = f"✅ Bullish break above {last_swing_high:.5f} | EMA50 cross {ema50_cross_candle} candles ago | RSI cross | M1 confirm"
                 elif bearish_break:
                     if not body_ok:
-                        reason = f"Weak break candle — body ratio {candle_body:.2f} < {BODY_RATIO_MIN}"
-                    elif not rsi_put_ok:
-                        reason = f"RSI not confirming PUT — {m1_rsi:.1f} > 50"
+                        reason = f"Weak M5 candle — body {candle_body:.2f} < {BODY_RATIO_MIN}"
+                    elif not rsi_bear_cross:
+                        reason = f"RSI no cross — prev {m1_rsi_prev:.1f} | now {m1_rsi_now:.1f} (need cross below 50)"
                     elif not m1_bearish:
-                        reason = "M1 candle not bearish — waiting for confirmation"
+                        reason = "M1 candle not bearish — waiting for M1 confirmation"
                     else:
                         signal = "PUT"
-                        reason = f"✅ Bearish structure break — closed below {last_swing_low:.5f} + EMA50"
+                        reason = f"✅ Bearish break below {last_swing_low:.5f} | EMA50 cross {ema50_cross_candle} candles ago | RSI cross | M1 confirm"
                 else:
-                    reason = f"No structure break — watching High:{last_swing_high:.5f} Low:{last_swing_low:.5f}"
+                    reason = f"No break — M5 watching High:{last_swing_high:.5f} Low:{last_swing_low:.5f}"
 
                 # ── DEBUG ─────────────────────────────────────────────
                 self.market_debug[symbol] = {
@@ -686,27 +712,32 @@ class StructureBreakBot:
                     "swing_high": round(last_swing_high, 5),
                     "swing_low": round(last_swing_low, 5),
                     "vol_ok": vol_ok,
-                    "ema50_bull_cross": ema50_bullish_cross,
-                    "ema50_bear_cross": ema50_bearish_cross,
+                    "ema50_bull_cross": ema50_bull_cross,
+                    "ema50_bear_cross": ema50_bear_cross,
+                    "ema50_cross_candle": ema50_cross_candle,
                     "body": round(candle_body, 2), "body_ok": body_ok,
-                    "m1_rsi": round(m1_rsi, 1),
+                    "m1_rsi": round(m1_rsi_now, 1),
+                    "m1_rsi_prev": round(m1_rsi_prev, 1),
+                    "rsi_bull_cross": rsi_bull_cross,
+                    "rsi_bear_cross": rsi_bear_cross,
                     "bullish_break": bullish_break, "bearish_break": bearish_break,
+                    "m1_bullish": m1_bullish, "m1_bearish": m1_bearish,
                     "mkt_losses": self.market_losses_today.get(symbol, 0),
                     "mkt_trades": self.market_trades_today.get(symbol, 0),
                     "why": [reason]
                 }
 
-                self.last_processed_m1_t0[symbol] = confirm_t0
+                self.last_processed_m5_t0[symbol] = confirm_t0
                 if not ok_gate or not mkt_ok: continue
                 if signal is None: continue
 
                 if signal == "CALL":
                     await self.execute_trade("CALL", symbol,
-                        rsi=round(m1_rsi, 1), body=round(candle_body, 2),
+                        rsi=round(m1_rsi_now, 1), body=round(candle_body, 2),
                         level=round(last_swing_high, 5), ema50=round(m1_ema50, 5))
                 elif signal == "PUT":
                     await self.execute_trade("PUT", symbol,
-                        rsi=round(m1_rsi, 1), body=round(candle_body, 2),
+                        rsi=round(m1_rsi_now, 1), body=round(candle_body, 2),
                         level=round(last_swing_low, 5), ema50=round(m1_ema50, 5))
 
             except Exception as e:
@@ -741,34 +772,39 @@ def main_keyboard():
     ])
 
 def format_market_detail(sym, d):
-    if not d: return f"📍 {sym.replace('frx','')}\n⏳ No scan data yet"
+    if not d: return f"\U0001f4cd {sym.replace('frx','')}\n\u23f3 No scan data yet"
     age = int(time.time() - d.get("time", time.time()))
-    signal = d.get("signal") or "—"
+    signal = d.get("signal") or "\u2014"
     why = d.get("why", [])
     vol_ok = d.get("vol_ok", False)
-    body = d.get("body", "—"); body_ok = d.get("body_ok", False)
-    m1_rsi = d.get("m1_rsi", "—")
-    swing_high = d.get("swing_high", "—"); swing_low = d.get("swing_low", "—")
-    ema50 = d.get("m1_ema50", "—")
+    body = d.get("body", "\u2014"); body_ok = d.get("body_ok", False)
+    m1_rsi = d.get("m1_rsi", "\u2014"); m1_rsi_prev = d.get("m1_rsi_prev", "\u2014")
+    rsi_bull = d.get("rsi_bull_cross", False); rsi_bear = d.get("rsi_bear_cross", False)
+    swing_high = d.get("swing_high", "\u2014"); swing_low = d.get("swing_low", "\u2014")
+    ema50 = d.get("m1_ema50", "\u2014")
     bullish = d.get("bullish_break", False); bearish = d.get("bearish_break", False)
     ema50_bull = d.get("ema50_bull_cross", False); ema50_bear = d.get("ema50_bear_cross", False)
+    m1_bull = d.get("m1_bullish", False); m1_bear = d.get("m1_bearish", False)
     mkt_losses = d.get("mkt_losses", 0); mkt_trades = d.get("mkt_trades", 0)
     last_m5 = d.get("last_m5", 0)
-    ema50_cross_str = "📈 Crossed UP ✅" if ema50_bull else ("📉 Crossed DOWN ✅" if ema50_bear else "— No cross yet")
-    break_str = "📈 BULLISH BREAK" if bullish else ("📉 BEARISH BREAK" if bearish else "— No break")
+    ema50_str = "UP ✅" if ema50_bull else ("DOWN ✅" if ema50_bear else "\u2014 No cross")
+    rsi_str = f"crossed {'UP' if rsi_bull else 'DOWN'} ✅" if (rsi_bull or rsi_bear) else f"\u2014 {m1_rsi_prev}\u2192{m1_rsi}"
+    break_str = "BULLISH BREAK" if bullish else ("BEARISH BREAK" if bearish else "\u2014 No break")
+    m1_str = "Bullish ✅" if m1_bull else ("Bearish ✅" if m1_bear else "\u2014 Doji")
     return (
-        f"📍 {sym.replace('frx','')} ({age}s ago)\n"
+        f"\U0001f4cd {sym.replace('frx','')} ({age}s ago)\n"
         f"Market: {d.get('mkt_msg','OK')} | {mkt_trades}/{MAX_TRADES_PER_MARKET} | {mkt_losses}/{MAX_LOSSES_PER_MARKET} losses\n"
         f"Last M5: {fmt_time_hhmmss(last_m5)}\n"
-        f"────────────────\n"
-        f"🏗 Structure: High {swing_high} | Low {swing_low}\n"
-        f"📊 EMA50: {ema50} | Cross: {ema50_cross_str}\n"
-        f"📊 Volatility: {'✅ OK' if vol_ok else '❌ Low'}\n"
-        f"🕯 Body: {body} {'✅' if body_ok else '❌'}\n"
-        f"📉 RSI: {m1_rsi}\n"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"Structure: High {swing_high} | Low {swing_low}\n"
+        f"M5 EMA50: {ema50} | Cross: {ema50_str}\n"
+        f"M5 Volatility: {'OK' if vol_ok else 'Low'}\n"
+        f"M5 Body: {body} {'OK' if body_ok else 'weak'}\n"
+        f"M1 RSI cross: {rsi_str}\n"
+        f"M1 candle: {m1_str}\n"
         f"{break_str}\n"
         f"Signal: {signal}\n"
-        f"Why: {why[0] if why else '—'}\n"
+        f"Why: {why[0] if why else '\u2014'}\n"
     )
 
 async def _safe_answer(q, text=None, show_alert=False):
@@ -803,12 +839,14 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data == "START_SCAN":
         if not bot_logic.api:
             await _safe_edit(q, "❌ Connect first — press DEMO or LIVE.", reply_markup=main_keyboard()); return
+        if bot_logic.is_scanning:
+            await _safe_edit(q, "⚠️ Already scanning. Press STOP first to restart.", reply_markup=main_keyboard()); return
         bot_logic.is_scanning = True
         for sym in MARKETS:
             asyncio.create_task(bot_logic.scan_market(sym))
         await _safe_edit(q,
             "🔍 SCANNER ACTIVE\n"
-            "✅ Structure Break strategy running\n"
+            "✅ Structure Break | M5 + M1 | EMA50 cross window 3\n"
             "📡 EURUSD GBPUSD USDJPY AUDUSD GBPJPY",
             reply_markup=main_keyboard())
 
@@ -826,7 +864,7 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif q.data == "PAUSE":
         bot_logic.pause_until = time.time() + 86400
-        await _safe_edit(q, "⏸ Bot paused until midnight WAT.", reply_markup=main_keyboard())
+        await _safe_edit(q, "⏸ Bot paused for 24 hours.", reply_markup=main_keyboard())
 
     elif q.data == "RESUME":
         bot_logic.pause_until = 0
@@ -884,7 +922,7 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 Equity: {eq_ratio:.0%} | 🔒 Lock: {'ON +${:.2f}'.format(PROFIT_LOCK_FLOOR) if bot_logic.profit_lock_active else 'OFF'}\n"
             f"🎯 Target: +${DAILY_PROFIT_TARGET:.2f} | Limit: ${DAILY_LOSS_LIMIT:.2f}\n"
             f"📡 Pairs: EURUSD GBPUSD USDJPY AUDUSD GBPJPY\n"
-            f"🧭 Structure Break + EMA50 Cross | M1 | {EXPIRY_MIN}m expiry\n"
+            f"🧭 M5 structure levels | M1 EMA50 cross + RSI + confirm | {EXPIRY_MIN}m expiry\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
             f"{stats_block}{mkt_block}"
             f"💵 PnL: {bot_logic.total_profit_today:+.2f} | Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY}\n"
@@ -903,7 +941,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_logic._known_chat_ids.add(update.message.chat_id)
     await update.message.reply_text(
         "💎 Deriv Forex Structure Break Bot\n"
-        f"🧭 Strategy: Structure Break + EMA50 Cross Confirmation\n"
+        f"🧭 Strategy: M5 Structure Break + M1 Entry Confirmation\n"
         f"🏗 Detects swing highs/lows → price must break AND cross EMA50 same candle\n"
         f"📊 ATR volatility | RSI momentum | Body ratio | M1 confirmation\n"
         f"🌍 Pairs: EURUSD | GBPUSD | USDJPY | AUDUSD | GBPJPY\n"
@@ -916,7 +954,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_logic.pause_until = time.time() + 86400
-    await update.message.reply_text("⏸ Bot paused.", reply_markup=main_keyboard())
+    await update.message.reply_text("⏸ Bot paused for 24 hours.", reply_markup=main_keyboard())
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_logic.pause_until = 0
