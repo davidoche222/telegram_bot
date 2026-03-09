@@ -1,15 +1,12 @@
 """
 Deriv Forex Binary Options Bot
-Strategy: Structure Break + EMA50 Confirmation
+Strategy: 1-Minute Bollinger Band Pullback
 Markets: EURUSD, GBPUSD, USDJPY, AUDUSD, GBPJPY
 
 Entry Logic:
-- M5: detect swing highs/lows (structure levels)
-- M5: price closes beyond structure AND crosses EMA50 same candle
-- M1: RSI genuinely crosses 50 in break direction (prev below, now above)
-- M1: next candle body confirms direction
-- ATR expansion confirms real momentum
-- Body ratio blocks spike candles
+CALL: Price above EMA100 + price touches lower BB + RSI < 40 turning up + bullish candle
+PUT:  Price below EMA100 + price touches upper BB + RSI > 60 turning down + bearish candle
+Expiry: 2 minutes | Stop after 5 consecutive losses
 """
 
 import asyncio, time, logging, json, os
@@ -41,15 +38,15 @@ MAX_CONSEC_LOSSES       = 5      # global stop
 COOLDOWN_SEC            = 180    # 3 min after every trade
 
 # ===== STRATEGY =====
-TF_M1_SEC           = 60         # M1 only — all logic on 1 min candles
-CANDLES_M1          = 150        # enough for swing detection + EMA50 + RSI
-EXPIRY_MIN          = 5          # 5 min expiry — aligned with M5 structure
-EMA_PERIOD          = 50         # EMA50 on M1 (cross detection)
-ATR_PERIOD          = 14         # ATR on M5
-ATR_SMA_PERIOD      = 20         # ATR average for volatility filter
-RSI_PERIOD          = 14         # RSI on M1
-SWING_LOOKBACK      = 5          # candles each side to confirm swing point
-BODY_RATIO_MIN      = 0.35       # M5 break candle minimum body strength
+TF_M1_SEC           = 60         # M1 only
+CANDLES_M1          = 120        # enough for EMA100 + BB + RSI
+EXPIRY_MIN          = 2          # 2 min expiry
+EMA_PERIOD          = 100        # EMA100 trend filter
+BB_PERIOD           = 20         # Bollinger Bands period
+BB_STD              = 2.0        # Bollinger Bands standard deviation
+RSI_PERIOD          = 14         # RSI momentum
+RSI_OVERSOLD        = 40         # RSI below this = oversold = CALL zone
+RSI_OVERBOUGHT      = 60         # RSI above this = overbought = PUT zone
 
 # Weekend block only — trading all sessions to collect data
 FOREX_WEEKEND_BLOCK = False  # trading all days including weekends
@@ -127,6 +124,28 @@ def calculate_atr(highs, lows, closes, period=14):
         atrs.append((atrs[-1] * (period - 1) + t) / period)
     return atrs
 
+
+
+def calculate_bollinger_bands(closes, period=20, std_dev=2.0):
+    """Returns (upper, middle, lower) for last candle"""
+    closes = [float(c) for c in closes]
+    if len(closes) < period: return None, None, None
+    window = closes[-period:]
+    mid = sum(window) / period
+    variance = sum((x - mid) ** 2 for x in window) / period
+    std = variance ** 0.5
+    return mid + std_dev * std, mid, mid - std_dev * std
+
+def calculate_ema100(closes, period=100):
+    """EMA100 for trend filter"""
+    import numpy as np
+    closes = np.array(closes, dtype=float)
+    if len(closes) < period: return None
+    k = 2.0 / (period + 1)
+    ema = float(np.mean(closes[:period]))
+    for c in closes[period:]:
+        ema = c * k + ema * (1 - k)
+    return ema
 
 def find_swing_highs(highs, lookback=5):
     """Returns list of (index, value) for swing highs"""
@@ -439,9 +458,9 @@ class StructureBreakBot:
                 f"Step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
                 f"Expiry: {EXPIRY_MIN}m\n"
                 f"Session: {session_bucket(time.time())}\n"
-                f"RSI: {kwargs.get('rsi','?')} | Body: {kwargs.get('body','?')}\n"
-                f"Structure level: {kwargs.get('level','?')}\n"
-                f"EMA50: {kwargs.get('ema50','?')}"
+                f"RSI: {kwargs.get('rsi','?')}\n"
+                f"BB level: {kwargs.get('bb','?')}\n"
+                f"EMA100: {kwargs.get('ema','?')}"
             )
             # wait for result
             await asyncio.sleep(EXPIRY_MIN * 60 + 10)
@@ -532,157 +551,118 @@ class StructureBreakBot:
                 ok_gate, gate = self.can_auto_trade()
                 mkt_ok, mkt_msg = self._is_market_available(symbol)
 
-                # ── FETCH M1 CANDLES ONLY ────────────────────────────
-                candles_m1 = await self.fetch_candles_with_timeout(symbol, TF_M1_SEC, CANDLES_M1)
+                # ── FETCH M1 CANDLES ─────────────────────────────────
+                candles_m1 = await self.fetch_candles_with_timeout(
+                    symbol, TF_M1_SEC, CANDLES_M1)
 
-                if len(candles_m1) < EMA_PERIOD + SWING_LOOKBACK + 10:
+                if len(candles_m1) < EMA_PERIOD + 10:
                     self.market_debug[symbol] = {"time": time.time(), "gate": gate,
-                        "why": [f"Warming up M1:{len(candles_m1)}"]}
+                        "why": [f"Warming up — {len(candles_m1)} M1 candles"]}
                     continue
 
-                # Confirmed closed candles only
+                # Use confirmed closed candles only
                 m1_confirmed = candles_m1[:-1] if len(candles_m1) > 1 else []
-
-                if len(m1_confirmed) < EMA_PERIOD + SWING_LOOKBACK + 5:
+                if len(m1_confirmed) < EMA_PERIOD + 5:
                     continue
 
                 # ── M1 OHLC ──────────────────────────────────────────
+                m1_closes = [c["close"] for c in m1_confirmed]
                 m1_highs  = [c["high"]  for c in m1_confirmed]
                 m1_lows   = [c["low"]   for c in m1_confirmed]
                 m1_opens  = [c["open"]  for c in m1_confirmed]
-                m1_closes = [c["close"] for c in m1_confirmed]
 
-                # ── ALL INDICATORS ON M1 ──────────────────────────────
-                m1_atrs    = calculate_atr(m1_highs, m1_lows, m1_closes, ATR_PERIOD)
-                m1_atr     = float(m1_atrs[-1]) if m1_atrs else None
-                m1_atr_sma = float(np.mean([x for x in m1_atrs[-ATR_SMA_PERIOD-1:-1] if x])) if m1_atrs else None
+                # ── INDICATORS ────────────────────────────────────────
+                ema100      = calculate_ema100(m1_closes, EMA_PERIOD)
+                bb_upper, bb_mid, bb_lower = calculate_bollinger_bands(
+                    m1_closes, BB_PERIOD, BB_STD)
+                rsi_now     = calculate_rsi(m1_closes, RSI_PERIOD)
+                rsi_prev    = calculate_rsi(m1_closes[:-1], RSI_PERIOD)
 
-                m1_ema50_series = calculate_ema_series(m1_closes, EMA_PERIOD)
-                m1_ema50        = m1_ema50_series[-1] if m1_ema50_series else None
-
-                m1_rsi_now  = calculate_rsi(m1_closes, RSI_PERIOD)
-                m1_rsi_prev = calculate_rsi(m1_closes[:-1], RSI_PERIOD)
-
-                if any(v is None for v in [m1_ema50, m1_atr, m1_atr_sma,
-                                           m1_rsi_now, m1_rsi_prev]):
+                if any(v is None for v in [ema100, bb_upper, bb_lower,
+                                           rsi_now, rsi_prev]):
                     self.market_debug[symbol] = {"time": time.time(), "gate": gate,
                         "why": ["Indicators warming up"]}
                     continue
 
-                # ── STRUCTURE LEVELS (M1) ─────────────────────────────
-                last_swing_high, last_swing_low = get_structure_levels(
-                    m1_highs, m1_lows, SWING_LOOKBACK)
+                # ── LAST TWO CANDLES ──────────────────────────────────
+                cur  = m1_confirmed[-1]   # signal candle
+                cur_close = cur["close"]
+                cur_open  = cur["open"]
+                cur_high  = cur["high"]
+                cur_low   = cur["low"]
 
-                if last_swing_high is None or last_swing_low is None:
-                    self.market_debug[symbol] = {"time": time.time(), "gate": gate,
-                        "why": ["Not enough M1 swing points yet"]}
-                    continue
+                # ── TREND FILTER (EMA100) ─────────────────────────────
+                above_ema = cur_close > ema100   # uptrend
+                below_ema = cur_close < ema100   # downtrend
 
-                # Current M1 candle (last confirmed)
-                cur_open  = m1_opens[-1]
-                cur_close = m1_closes[-1]
-                cur_high  = m1_highs[-1]
-                cur_low   = m1_lows[-1]
+                # ── BOLLINGER BAND TOUCH ──────────────────────────────
+                # Touch = candle low pierces or touches lower band (CALL)
+                # Touch = candle high pierces or touches upper band (PUT)
+                touches_lower_bb = cur_low <= bb_lower
+                touches_upper_bb = cur_high >= bb_upper
 
-                # ── VOLATILITY (M1) ───────────────────────────────────
-                vol_ok = m1_atr > m1_atr_sma
+                # ── RSI CONDITIONS ────────────────────────────────────
+                rsi_oversold   = rsi_now < RSI_OVERSOLD   and rsi_now > rsi_prev   # < 40 turning up
+                rsi_overbought = rsi_now > RSI_OVERBOUGHT and rsi_now < rsi_prev   # > 60 turning down
 
-                # ── BODY RATIO (M1 break candle) ─────────────────────
-                candle_body = body_ratio(cur_open, cur_close, cur_high, cur_low)
-                body_ok = candle_body >= BODY_RATIO_MIN
-
-                # ── EMA50 CROSS WITHIN 3 M1 CANDLES ──────────────────
-                EMA_CROSS_WINDOW = 3
-                ema50_bull_cross = False
-                ema50_bear_cross = False
-                ema50_cross_candle = None
-
-                for lookback_i in range(min(EMA_CROSS_WINDOW + 1, len(m1_closes) - 1)):
-                    idx_cur  = -(1 + lookback_i)
-                    idx_prev = -(2 + lookback_i)
-                    if abs(idx_prev) > len(m1_closes) or abs(idx_prev) > len(m1_ema50_series): break
-                    c_cur  = m1_closes[idx_cur]
-                    c_prev = m1_closes[idx_prev]
-                    e_cur  = m1_ema50_series[idx_cur]
-                    e_prev = m1_ema50_series[idx_prev]
-                    if e_cur is None or e_prev is None: break
-                    if c_prev < e_prev and c_cur > e_cur:
-                        ema50_bull_cross = True
-                        ema50_cross_candle = lookback_i
-                        break
-                    if c_prev > e_prev and c_cur < e_cur:
-                        ema50_bear_cross = True
-                        ema50_cross_candle = lookback_i
-                        break
-
-                # ── STRUCTURE BREAK (M1) ──────────────────────────────
-                bullish_break = (
-                    cur_close > last_swing_high and
-                    cur_open  < last_swing_high and
-                    ema50_bull_cross
-                )
-                bearish_break = (
-                    cur_close < last_swing_low and
-                    cur_open  > last_swing_low and
-                    ema50_bear_cross
-                )
-
-                # ── RSI GENUINE CROSS (M1) ────────────────────────────
-                rsi_bull_cross = m1_rsi_prev < 50 and m1_rsi_now >= 50
-                rsi_bear_cross = m1_rsi_prev > 50 and m1_rsi_now <= 50
-
-                # ── NEXT M1 CANDLE CONFIRMATION ───────────────────────
-                m1_last = m1_confirmed[-1]
-                m1_bullish = m1_last["close"] > m1_last["open"]
-                m1_bearish = m1_last["close"] < m1_last["open"]
+                # ── CANDLE CONFIRMATION ───────────────────────────────
+                candle_bullish = cur_close > cur_open
+                candle_bearish = cur_close < cur_open
 
                 # ── SIGNAL ────────────────────────────────────────────
                 signal = None
                 reason = "Scanning..."
 
-                if not vol_ok:
-                    reason = f"Volatility low — M1 ATR({m1_atr:.5f}) < avg({m1_atr_sma:.5f})"
-                elif bullish_break:
-                    if not body_ok:
-                        reason = f"Weak candle — body {candle_body:.2f} < {BODY_RATIO_MIN}"
-                    elif not rsi_bull_cross:
-                        reason = f"RSI no cross — prev {m1_rsi_prev:.1f} now {m1_rsi_now:.1f} (need cross above 50)"
-                    elif not m1_bullish:
-                        reason = "M1 candle not bullish — waiting"
-                    else:
-                        signal = "CALL"
-                        reason = f"Bullish break above {last_swing_high:.5f} | EMA50 cross {ema50_cross_candle} M1 ago | RSI cross | confirmed"
-                elif bearish_break:
-                    if not body_ok:
-                        reason = f"Weak candle — body {candle_body:.2f} < {BODY_RATIO_MIN}"
-                    elif not rsi_bear_cross:
-                        reason = f"RSI no cross — prev {m1_rsi_prev:.1f} now {m1_rsi_now:.1f} (need cross below 50)"
-                    elif not m1_bearish:
-                        reason = "M1 candle not bearish — waiting"
-                    else:
-                        signal = "PUT"
-                        reason = f"Bearish break below {last_swing_low:.5f} | EMA50 cross {ema50_cross_candle} M1 ago | RSI cross | confirmed"
+                call_setup = (
+                    above_ema        and   # uptrend
+                    touches_lower_bb and   # price at lower band
+                    rsi_oversold     and   # RSI < 40 turning up
+                    candle_bullish         # bullish confirmation candle
+                )
+                put_setup = (
+                    below_ema        and   # downtrend
+                    touches_upper_bb and   # price at upper band
+                    rsi_overbought   and   # RSI > 60 turning down
+                    candle_bearish         # bearish confirmation candle
+                )
+
+                if call_setup:
+                    signal = "CALL"
+                    reason = f"CALL: Above EMA100({ema100:.5f}) | Lower BB touch({bb_lower:.5f}) | RSI {rsi_now:.1f} up | Bullish candle"
+                elif put_setup:
+                    signal = "PUT"
+                    reason = f"PUT: Below EMA100({ema100:.5f}) | Upper BB touch({bb_upper:.5f}) | RSI {rsi_now:.1f} down | Bearish candle"
                 else:
-                    reason = f"No break — watching High:{last_swing_high:.5f} Low:{last_swing_low:.5f}"
+                    # Show what's missing
+                    parts = []
+                    if not above_ema and not below_ema:
+                        parts.append("Price at EMA100 — no trend")
+                    elif above_ema and not touches_lower_bb:
+                        parts.append(f"Uptrend — waiting for lower BB touch (BB:{bb_lower:.5f} Low:{cur_low:.5f})")
+                    elif below_ema and not touches_upper_bb:
+                        parts.append(f"Downtrend — waiting for upper BB touch (BB:{bb_upper:.5f} High:{cur_high:.5f})")
+                    elif not rsi_oversold and not rsi_overbought:
+                        parts.append(f"RSI neutral ({rsi_now:.1f}) — need <{RSI_OVERSOLD} or >{RSI_OVERBOUGHT}")
+                    reason = parts[0] if parts else f"No setup — RSI:{rsi_now:.1f} EMA:{ema100:.5f}"
 
                 # ── DEBUG ─────────────────────────────────────────────
                 self.market_debug[symbol] = {
                     "time": time.time(), "gate": gate, "mkt_msg": mkt_msg,
-                    "last_m5": m1_confirmed[-1]["epoch"], "signal": signal,
-                    "m1_ema50": round(m1_ema50, 5) if m1_ema50 else None,
-                    "swing_high": round(last_swing_high, 5),
-                    "swing_low": round(last_swing_low, 5),
-                    "vol_ok": vol_ok,
-                    "ema50_bull_cross": ema50_bull_cross,
-                    "ema50_bear_cross": ema50_bear_cross,
-                    "ema50_cross_candle": ema50_cross_candle,
-                    "body": round(candle_body, 2), "body_ok": body_ok,
-                    "m1_rsi": round(m1_rsi_now, 1),
-                    "m1_rsi_prev": round(m1_rsi_prev, 1),
-                    "rsi_bull_cross": rsi_bull_cross,
-                    "rsi_bear_cross": rsi_bear_cross,
-                    "bullish_break": bullish_break, "bearish_break": bearish_break,
-                    "m1_bullish": m1_bullish, "m1_bearish": m1_bearish,
+                    "last_m5": m1_confirmed[-1]["epoch"],
+                    "signal": signal,
+                    "ema100": round(ema100, 5),
+                    "bb_upper": round(bb_upper, 5),
+                    "bb_lower": round(bb_lower, 5),
+                    "bb_mid": round(bb_mid, 5),
+                    "above_ema": above_ema, "below_ema": below_ema,
+                    "touches_lower_bb": touches_lower_bb,
+                    "touches_upper_bb": touches_upper_bb,
+                    "rsi_now": round(rsi_now, 1),
+                    "rsi_prev": round(rsi_prev, 1),
+                    "rsi_oversold": rsi_oversold,
+                    "rsi_overbought": rsi_overbought,
+                    "candle_bullish": candle_bullish,
+                    "candle_bearish": candle_bearish,
                     "mkt_losses": self.market_losses_today.get(symbol, 0),
                     "mkt_trades": self.market_trades_today.get(symbol, 0),
                     "why": [reason]
@@ -693,12 +673,10 @@ class StructureBreakBot:
 
                 if signal == "CALL":
                     await self.execute_trade("CALL", symbol,
-                        rsi=round(m1_rsi_now, 1), body=round(candle_body, 2),
-                        level=round(last_swing_high, 5), ema50=round(m1_ema50, 5))
+                        rsi=round(rsi_now, 1), bb=round(bb_lower, 5), ema=round(ema100, 5))
                 elif signal == "PUT":
                     await self.execute_trade("PUT", symbol,
-                        rsi=round(m1_rsi_now, 1), body=round(candle_body, 2),
-                        level=round(last_swing_low, 5), ema50=round(m1_ema50, 5))
+                        rsi=round(rsi_now, 1), bb=round(bb_upper, 5), ema=round(ema100, 5))
 
             except Exception as e:
                 logger.error(f"Scan error {symbol}: {e}")
@@ -736,38 +714,38 @@ def format_market_detail(sym, d):
     age = int(time.time() - d.get("time", time.time()))
     signal = d.get("signal") or "\u2014"
     why = d.get("why", [])
-    vol_ok = d.get("vol_ok", False)
-    body = d.get("body", "\u2014"); body_ok = d.get("body_ok", False)
-    m1_rsi = d.get("m1_rsi", "\u2014"); m1_rsi_prev = d.get("m1_rsi_prev", "\u2014")
-    rsi_bull = d.get("rsi_bull_cross", False); rsi_bear = d.get("rsi_bear_cross", False)
-    swing_high = d.get("swing_high", "\u2014"); swing_low = d.get("swing_low", "\u2014")
-    ema50 = d.get("m1_ema50", "\u2014")
-    bullish = d.get("bullish_break", False); bearish = d.get("bearish_break", False)
-    ema50_bull = d.get("ema50_bull_cross", False); ema50_bear = d.get("ema50_bear_cross", False)
-    m1_bull = d.get("m1_bullish", False); m1_bear = d.get("m1_bearish", False)
     mkt_losses = d.get("mkt_losses", 0); mkt_trades = d.get("mkt_trades", 0)
-    last_m5 = d.get("last_m5", 0)
-    vol_str = "OK" if vol_ok else "Low"
-    body_str = "OK" if body_ok else "weak"
-    ema50_str = "UP OK" if ema50_bull else ("DOWN OK" if ema50_bear else "-- No cross")
-    rsi_dir = "UP" if rsi_bull else "DOWN"
-    rsi_str = ("crossed " + rsi_dir + " OK") if (rsi_bull or rsi_bear) else ("-- " + str(m1_rsi_prev) + "->" + str(m1_rsi))
-    break_str = "BULLISH BREAK" if bullish else ("BEARISH BREAK" if bearish else "-- No break")
-    m1_str = "Bullish OK" if m1_bull else ("Bearish OK" if m1_bear else "-- Doji")
+    last_m1    = d.get("last_m5", 0)
+    ema100     = d.get("ema100", "\u2014")
+    bb_upper   = d.get("bb_upper", "\u2014")
+    bb_lower   = d.get("bb_lower", "\u2014")
+    bb_mid     = d.get("bb_mid", "\u2014")
+    above_ema  = d.get("above_ema", False)
+    below_ema  = d.get("below_ema", False)
+    touch_low  = d.get("touches_lower_bb", False)
+    touch_high = d.get("touches_upper_bb", False)
+    rsi_now    = d.get("rsi_now", "\u2014")
+    rsi_prev   = d.get("rsi_prev", "\u2014")
+    rsi_os     = d.get("rsi_oversold", False)
+    rsi_ob     = d.get("rsi_overbought", False)
+    c_bull     = d.get("candle_bullish", False)
+    c_bear     = d.get("candle_bearish", False)
+    trend_str  = "UPTREND" if above_ema else ("DOWNTREND" if below_ema else "SIDEWAYS")
+    bb_touch   = "Lower BB OK" if touch_low else ("Upper BB OK" if touch_high else "No BB touch")
+    rsi_str    = f"Oversold {rsi_now} up OK" if rsi_os else (f"Overbought {rsi_now} down OK" if rsi_ob else f"Neutral {rsi_prev}->{rsi_now}")
+    candle_str = "Bullish OK" if c_bull else ("Bearish OK" if c_bear else "Doji")
     return (
         f"\U0001f4cd {sym.replace('frx','')} ({age}s ago)\n"
         f"Market: {d.get('mkt_msg','OK')} | {mkt_trades}/{MAX_TRADES_PER_MARKET} | {mkt_losses}/{MAX_LOSSES_PER_MARKET} losses\n"
-        f"Last M1: {fmt_time_hhmmss(last_m5)}\n"
+        f"Last M1: {fmt_time_hhmmss(last_m1)}\n"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"Structure: High {swing_high} | Low {swing_low}\n"
-        f"M1 EMA50: {ema50} | Cross: {ema50_str}\n"
-        f"M1 Volatility: {vol_str}\n"
-        f"M1 Body: {body} {body_str}\n"
-        f"M1 RSI cross: {rsi_str}\n"
-        f"M1 candle: {m1_str}\n"
-        f"{break_str}\n"
+        f"Trend (EMA100): {trend_str} | EMA: {ema100}\n"
+        f"BB Upper: {bb_upper} | Mid: {bb_mid} | Lower: {bb_lower}\n"
+        f"BB Touch: {bb_touch}\n"
+        f"RSI: {rsi_str}\n"
+        f"Candle: {candle_str}\n"
         f"Signal: {signal}\n"
-        f"Why: {why[0] if why else '--'}\n"
+        f"Why: {why[0] if why else chr(8212)}\n"
     )
 
 async def _safe_answer(q, text=None, show_alert=False):
@@ -911,7 +889,7 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💰 Equity: {eq_ratio:.0%} | 🔒 Lock: {lock_str}\n"
                 f"🎯 Target: +${DAILY_PROFIT_TARGET:.2f} | Limit: ${DAILY_LOSS_LIMIT:.2f}\n"
                 f"📡 Pairs: EURUSD GBPUSD USDJPY AUDUSD GBPJPY\n"
-                f"🧭 M1 only | Structure + EMA50 cross + RSI + confirm | {EXPIRY_MIN}m expiry\n"
+                f"🧭 BB Pullback | EMA100 trend + BB touch + RSI + candle | {EXPIRY_MIN}m expiry\n"
                 f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
                 f"{stats_block}{mkt_block}"
                 f"💵 PnL: {bot_logic.total_profit_today:+.2f} | Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY}\n"
@@ -936,10 +914,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_logic._known_chat_ids = getattr(bot_logic, "_known_chat_ids", set())
     bot_logic._known_chat_ids.add(update.message.chat_id)
     await update.message.reply_text(
-        "💎 Deriv Forex Structure Break Bot\n"
-        f"🧭 Strategy: M5 Structure Break + M1 Entry Confirmation\n"
-        f"🏗 M1 only — swing levels, EMA50 cross, RSI, body all on 1min candles\n"
-        f"📊 ATR volatility | RSI momentum | Body ratio | M1 confirmation\n"
+        "💎 Deriv Forex BB Pullback Bot\n"
+        f"🧭 Strategy: Bollinger Band Pullback | EMA100 + BB + RSI\n"
+        f"📊 CALL: Above EMA100 + Lower BB touch + RSI<40 up + Bullish candle\n"
+        f"📊 PUT: Below EMA100 + Upper BB touch + RSI>60 down + Bearish candle\n"
         f"🌍 Pairs: EURUSD | GBPUSD | USDJPY | AUDUSD | GBPJPY\n"
         f"📅 Trades Mon-Fri all sessions (data collection mode)\n"
         f"🎲 Martingale: {MARTINGALE_MAX_STEPS} steps × {MARTINGALE_MULT}x\n"
